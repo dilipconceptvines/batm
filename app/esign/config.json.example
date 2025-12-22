@@ -1,0 +1,21 @@
+{
+    "client_id": "YOUR_INTEGRATION_KEY_HERE",
+    "client_secret": "YOUR_CLIENT_SECRET_HERE",
+    "account_id": "YOUR_ACCOUNT_ID_HERE",
+    "user_id": "YOUR_USER_ID_HERE",
+    "auth_server": "account-d.docusign.com",
+    "base_path": "https://demo.docusign.net/restapi",
+    "private_key_file": "private.key",
+    "webhook_uri": "https://localhost:8000/docusign/webhook",
+    "redirect_uri": "http://localhost:8000/esign/callback",
+    "consent_uri": "https://account-d.docusign.com/oauth/token",
+    "storage": {
+        "type": "file",
+        "path": "envelopes.json"
+    },
+    "tracking": {
+        "enabled": true,
+        "interval": 60,
+        "auto_start": true
+    }
+}

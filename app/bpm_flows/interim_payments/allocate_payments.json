@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Interim Payment - Allocate Payments",
+  "description": "Schema for validating payment allocation submission in Step 211 (Process). Payment details were already captured in Step 210.",
+  "type": "object",
+  "required": ["allocations"],
+  "properties": {
+    "allocations": {
+      "type": "array",
+      "description": "List of balance allocations - how the payment (entered in Step 210) is distributed across outstanding obligations",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "required": ["balance_id", "amount", "category", "reference_id"],
+        "properties": {
+          "balance_id": {
+            "type": ["string", "integer"],
+            "description": "The unique ledger balance ID to apply payment to",
+            "examples": ["123", 456, "789"]
+          },
+          "amount": {
+            "type": "number",
+            "description": "Amount to allocate to this specific balance",
+            "minimum": 0.01,
+            "maximum": 999999.99,
+            "multipleOf": 0.01,
+            "examples": [265.00, 335.00, 50.50]
+          },
+          "category": {
+            "type": "string",
+            "description": "Category of the obligation being paid",
+            "enum": [
+              "LEASE", 
+              "REPAIRS", 
+              "LOANS", 
+              "EZPASS", 
+              "PVB", 
+              "TLC", 
+              "TAXES", 
+              "MISC"
+            ],
+            "examples": ["LEASE", "REPAIRS", "EZPASS", "PVB"]
+          },
+          "reference_id": {
+            "type": "string",
+            "description": "Reference ID of the original obligation (e.g., lease ID, invoice number, loan number)",
+            "minLength": 1,
+            "maxLength": 100,
+            "examples": [
+              "MED-102-LS-08", 
+              "INV-2457", 
+              "LN-3001",
+              "EZ-6789",
+              "PVB-12345"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "allocations": [
+        {
+          "balance_id": 123,
+          "amount": 265.00,
+          "category": "LEASE",
+          "reference_id": "MED-102-LS-08"
+        },
+        {
+          "balance_id": 124,
+          "amount": 335.00,
+          "category": "REPAIRS",
+          "reference_id": "INV-2457"
+        }
+      ]
+    },
+    {
+      "allocations": [
+        {
+          "balance_id": "456",
+          "amount": 450.00,
+          "category": "EZPASS",
+          "reference_id": "EZ-6789"
+        },
+        {
+          "balance_id": "457",
+          "amount": 500.50,
+          "category": "PVB",
+          "reference_id": "PVB-12345"
+        },
+        {
+          "balance_id": "458",
+          "amount": 300.00,
+          "category": "LOANS",
+          "reference_id": "LN-3001"
+        }
+      ]
+    }
+  ]
+}

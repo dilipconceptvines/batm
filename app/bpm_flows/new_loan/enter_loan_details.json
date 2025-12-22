@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Create Driver Loan Details",
+  "description": "Schema for validating the manual creation of a driver loan with installment schedule.",
+  "type": "object",
+  "properties": {
+    "driver_id": {
+      "description": "The primary key of the selected driver from the 'drivers' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "lease_id": {
+      "description": "The primary key of the selected active lease from the 'leases' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "vehicle_id": {
+      "description": "The primary key of the associated vehicle from the 'vehicles' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "medallion_id": {
+      "description": "The primary key of the associated medallion from the 'medallions' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "loan_amount": {
+      "description": "The total principal amount of the loan in dollars.",
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 999999.99,
+      "examples": [600.00, 1500.00, 3000.00]
+    },
+    "interest_rate": {
+      "description": "The annual interest rate for the loan as a percentage (e.g., 10 for 10%). Defaults to 0 if not provided.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "default": 0,
+      "examples": [0, 10, 12]
+    },
+    "start_week": {
+      "description": "The Sunday date when the first installment is due. Must be a Sunday in YYYY-MM-DD format.",
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "examples": ["2025-10-26", "2025-11-02"]
+    },
+    "notes": {
+      "description": "Optional notes or purpose for the loan.",
+      "type": ["string", "null"],
+      "maxLength": 1000,
+      "examples": ["Emergency vehicle repair", "Driver advance for personal emergency"]
+    }
+  },
+  "required": [
+    "driver_id",
+    "lease_id",
+    "vehicle_id",
+    "medallion_id",
+    "loan_amount",
+    "start_week"
+  ],
+  "additionalProperties": false
+}

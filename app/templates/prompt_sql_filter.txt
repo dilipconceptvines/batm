@@ -1,0 +1,105 @@
+You are a MySQL expert. Append the provided filters to the existing SQL query while maintaining query safety and validity. If the query already contains WHERE conditions, properly combine them with the new filters.
+
+## Original Query:
+{{original_query}}
+
+## Filters (JSON format):
+{{filters}}
+
+## Rules:
+- Analyze the original query for existing WHERE conditions
+- If WHERE exists, combine new filters using AND
+- If no WHERE exists, add WHERE clause
+- Maintain query safety - no SQL injection risks
+- Handle NULL values appropriately
+- Support common operators: =, !=, >, <, >=, <=, LIKE, IN, NOT IN
+- Support date range filters
+- Support numeric range filters
+- Support text search with LIKE
+- Support boolean filters
+- Validate the final query for:
+  * Proper SQL syntax
+  * Valid table and column names
+  * Correct operator usage
+  * Balanced parentheses
+  * Valid JOIN conditions
+  * No duplicate WHERE clauses
+  * Proper clause ordering (WHERE before ORDER BY)
+  * No trailing WHERE clauses
+  * No duplicate filter conditions
+- Return only raw SQL. No explanations, markdown, or comments.
+
+## Examples:
+
+Original Query: SELECT * FROM drivers WHERE license_type = 'commercial'
+Filters: {"tlc_status": "active", "license_expiry": {"$gt": "2024-12-31"}}
+SQL: SELECT * FROM drivers WHERE license_type = 'commercial' AND tlc_status = 'active' AND license_expiry > '2024-12-31';
+
+Original Query: SELECT m.* FROM medallions m 
+JOIN leases l ON l.medallion_id = m.id 
+WHERE l.status = 'active' AND m.vehicle_type = 'sedan'
+Filters: {"lease_status": "active", "start_date": {"$gte": "2024-01-01", "$lte": "2024-12-31"}}
+SQL: SELECT m.* FROM medallions m 
+JOIN leases l ON l.medallion_id = m.id 
+WHERE l.status = 'active' AND m.vehicle_type = 'sedan' 
+AND lease_status = 'active' AND start_date >= '2024-01-01' AND start_date <= '2024-12-31';
+
+Original Query: SELECT * FROM vehicles WHERE make = 'Toyota'
+Filters: {"model": {"$like": "Camry%"}}
+SQL: SELECT * FROM vehicles WHERE make = 'Toyota' AND model LIKE 'Camry%';
+
+Original Query: SELECT v.*, m.medallion_type FROM vehicles v 
+JOIN medallions m ON v.medallion_id = m.id 
+ORDER BY m.medallion_number
+Filters: {"medallion_type": "WAV"}
+SQL: SELECT v.*, m.medallion_type FROM vehicles v 
+JOIN medallions m ON v.medallion_id = m.id 
+WHERE m.medallion_type = 'WAV'
+ORDER BY m.medallion_number;
+
+Original Query: SELECT 
+    v.id AS vehicle_id,
+    v.vin,
+    v.make,
+    v.model,
+    v.year,
+    v.color,
+    v.vehicle_type,
+    m.medallion_number,
+    m.medallion_type,
+    m.medallion_status
+FROM 
+    vehicles v
+JOIN 
+    medallions m ON v.medallion_id = m.id
+WHERE 
+    v.is_medallion_assigned = 1
+    AND v.is_active = 1
+    AND v.is_archived = 0
+ORDER BY 
+    m.medallion_number
+Filters: {"medallion_type": "WAV"}
+SQL: SELECT 
+    v.id AS vehicle_id,
+    v.vin,
+    v.make,
+    v.model,
+    v.year,
+    v.color,
+    v.vehicle_type,
+    m.medallion_number,
+    m.medallion_type,
+    m.medallion_status
+FROM 
+    vehicles v
+JOIN 
+    medallions m ON v.medallion_id = m.id
+WHERE 
+    v.is_medallion_assigned = 1
+    AND v.is_active = 1
+    AND v.is_archived = 0
+    AND m.medallion_type = 'WAV'
+ORDER BY 
+    m.medallion_number;
+
+## SQL: 

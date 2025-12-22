@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Interim Payment - Enter Payment Details",
+  "description": "Schema for validating Step 210 (Process) - Driver, Lease, and Payment Details",
+  "type": "object",
+  "required": ["driver_id", "lease_id", "payment_amount", "payment_method", "payment_date"],
+  "properties": {
+    "driver_id": {
+      "type": "integer",
+      "description": "Primary key of the selected driver from the 'drivers' table",
+      "minimum": 1,
+      "examples": [101, 205, 387]
+    },
+    "lease_id": {
+      "type": "integer",
+      "description": "Primary key of the selected active lease from the 'leases' table",
+      "minimum": 1,
+      "examples": [2054, 3021, 4156]
+    },
+    "payment_amount": {
+      "type": "number",
+      "description": "Total payment amount in dollars",
+      "minimum": 0.01,
+      "maximum": 999999.99,
+      "multipleOf": 0.01,
+      "examples": [600.00, 1250.50, 2156.50]
+    },
+    "payment_method": {
+      "type": "string",
+      "description": "Method of payment",
+      "enum": ["Cash", "Check", "ACH"],
+      "examples": ["ACH", "Cash", "Check"]
+    },
+    "payment_date": {
+      "type": "string",
+      "description": "Date when payment was received (ISO 8601 format: YYYY-MM-DD)",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "examples": ["2025-10-21", "2025-11-04", "2024-12-15"]
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "description": "Optional notes about the payment",
+      "maxLength": 1000,
+      "examples": [
+        "Driver paid cash at front desk", 
+        "Check #12345", 
+        null
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "driver_id": 101,
+      "lease_id": 2054,
+      "payment_amount": 600.00,
+      "payment_method": "ACH",
+      "payment_date": "2025-10-21",
+      "notes": "Partial payment for outstanding balances"
+    },
+    {
+      "driver_id": 205,
+      "lease_id": 3021,
+      "payment_amount": 1250.50,
+      "payment_method": "Cash",
+      "payment_date": "2025-11-04",
+      "notes": null
+    }
+  ]
+}

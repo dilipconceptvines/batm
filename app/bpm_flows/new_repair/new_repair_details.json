@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Create Repair Invoice",
+  "description": "Schema for validating repair invoice creation with automatic payment schedule generation.",
+  "type": "object",
+  "properties": {
+    "driver_id": {
+      "description": "The primary key (ID) of the driver from the 'drivers' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "lease_id": {
+      "description": "The primary key (ID) of the active lease from the 'leases' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "vehicle_id": {
+      "description": "The primary key (ID) of the vehicle from the 'vehicles' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "medallion_id": {
+      "description": "The primary key (ID) of the medallion from the 'medallions' table.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "total_amount": {
+      "description": "Total repair cost/invoice amount (must be positive).",
+      "type": "number",
+      "minimum": 0,
+      "exclusiveMinimum": 0
+    },
+    "invoice_number": {
+      "description": "Invoice number from the repair vendor/workshop.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "invoice_date": {
+      "description": "Date when the repair invoice was issued (ISO format: YYYY-MM-DD).",
+      "type": "string",
+      "format": "date"
+    },
+    "workshop_type": {
+      "description": "Type of workshop that performed the repair.",
+      "type": "string",
+      "enum": ["Big Apple Workshop", "External Workshop"]
+    },
+    "start_week": {
+      "description": "Start date for the repayment schedule (must be a Sunday in ISO format). Options: Current Payment Period or Next Payment Period.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "notes": {
+      "description": "Optional repair description or notes.",
+      "type": ["string", "null"],
+      "maxLength": 500
+    },
+    "preview_only": {
+      "description": "If true, only generates payment schedule preview without creating the invoice.",
+      "type": ["boolean", "null"],
+      "default": false
+    },
+    "document_id": {
+      "description": "Optional ID of the uploaded repair invoice document.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    }
+  },
+  "required": [
+    "driver_id",
+    "lease_id",
+    "vehicle_id",
+    "medallion_id",
+    "total_amount",
+    "invoice_number",
+    "invoice_date",
+    "workshop_type",
+    "start_week"
+  ],
+  "additionalProperties": true
+}

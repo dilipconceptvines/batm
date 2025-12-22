@@ -1,0 +1,137 @@
+<!-- app/templates/emails/weekly_dtr.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weekly DTR</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background-color: #1a73e8;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            border-radius: 5px 5px 0 0;
+        }
+        .content {
+            background-color: #f9f9f9;
+            padding: 30px;
+            border: 1px solid #e0e0e0;
+            border-top: none;
+        }
+        .info-box {
+            background-color: white;
+            padding: 15px;
+            margin: 20px 0;
+            border-left: 4px solid #1a73e8;
+            border-radius: 3px;
+        }
+        .info-label {
+            font-weight: bold;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .info-value {
+            color: #333;
+            font-size: 16px;
+        }
+        .footer {
+            background-color: #f0f0f0;
+            padding: 20px;
+            text-align: center;
+            font-size: 14px;
+            color: #666;
+            border-radius: 0 0 5px 5px;
+        }
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background-color: #1a73e8;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .attachments {
+            background-color: #fff3cd;
+            border: 1px solid #ffc107;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        .attachments ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .attachments li {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Your Weekly Driver Trip Receipt (DTR)</h1>
+    </div>
+    
+    <div class="content">
+        <p>Dear {{ driver_name }},</p>
+        
+        <p>Your Driver Trip Receipt (DTR) for the period <strong>{{ week_start_date }}</strong> to <strong>{{ week_end_date }}</strong> has been generated for the following:</p>
+        
+        <div class="info-box">
+            <div class="info-label">Lease ID:</div>
+            <div class="info-value">{{ lease_id }}</div>
+        </div>
+        
+        <div class="info-box">
+            <div class="info-label">Medallion Number:</div>
+            <div class="info-value">{{ medallion_number }}</div>
+        </div>
+        
+        <div class="info-box">
+            <div class="info-label">Period:</div>
+            <div class="info-value">{{ week_start_date }} to {{ week_end_date }}</div>
+        </div>
+        
+        <div class="attachments">
+            <h3 style="margin-top: 0;">📎 Attached Documents</h3>
+            <p>Please find the following documents attached to this email:</p>
+            <ul>
+                <li><strong>DTR PDF</strong> - Your complete Driver Trip Receipt</li>
+                {% if has_pvb_violations %}
+                <li><strong>PVB Violations Report</strong> - Parking violations for this period</li>
+                {% endif %}
+                {% if has_tlc_violations %}
+                <li><strong>TLC Violations Report</strong> - TLC tickets for this period</li>
+                {% endif %}
+            </ul>
+        </div>
+        
+        <p>If you have any questions regarding your receipt or the attached violation reports, please contact the Big Apple Taxi Management LLC support team.</p>
+        
+        <p>Thank you for driving with Big Apple Taxi Management LLC.</p>
+        
+        <p style="margin-top: 30px;">
+            <strong>Best regards,</strong><br>
+            Big Apple Taxi Management LLC Operations Team
+        </p>
+    </div>
+    
+    <div class="footer">
+        <p><strong>Big Apple Taxi Management LLC</strong></p>
+        <p>34-11 Queens Boulevard, Woodside, NY 11377</p>
+        <p>Phone: (718) 779-3000</p>
+        <p style="font-size: 12px; margin-top: 15px;">
+            This is an automated email. Please do not reply directly to this message.
+        </p>
+    </div>
+</body>
+</html>

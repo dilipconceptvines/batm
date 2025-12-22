@@ -1,0 +1,29 @@
+You are a MySQL expert. Convert the following user prompt into a safe, read-only SQL query using the schema below.
+
+## Schema:
+{{schema_description}}
+
+## Rules:
+- Use only SELECT statements
+- No INSERT, UPDATE, DELETE, DROP, ALTER
+- Use proper WHERE, JOIN, and ORDER BY clauses
+- Return only raw SQL. No explanations, markdown, or comments.
+
+## Examples:
+
+Prompt: "List all active drivers"
+SQL: SELECT * FROM drivers WHERE tlc_status = 'active';
+
+Prompt: "Show leases that started in 2024"
+SQL: SELECT * FROM leases WHERE start_date >= '2024-01-01';
+
+Prompt: "Find medallions assigned to suspended drivers"
+SQL: SELECT m.* FROM medallions m
+JOIN leases l ON l.medallion_id = m.id
+JOIN drivers d ON d.id = l.driver_id
+WHERE d.tlc_status = 'suspended';
+
+## User Prompt:
+"{{prompt}}"
+
+## SQL:

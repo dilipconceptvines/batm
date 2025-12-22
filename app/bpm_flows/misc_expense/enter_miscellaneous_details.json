@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Miscellaneous Expense Creation Schema",
+  "description": "JSON Schema for validating miscellaneous expense creation data from the BPM workflow",
+  "type": "object",
+  "required": [
+    "driver_id",
+    "lease_id",
+    "vehicle_id",
+    "medallion_id",
+    "category",
+    "amount",
+    "expense_date"
+  ],
+  "properties": {
+    "driver_id": {
+      "type": "integer",
+      "description": "Unique identifier for the driver",
+      "minimum": 1
+    },
+    "lease_id": {
+      "type": "integer",
+      "description": "Unique identifier for the lease",
+      "minimum": 1
+    },
+    "vehicle_id": {
+      "type": "integer",
+      "description": "Unique identifier for the vehicle",
+      "minimum": 1
+    },
+    "medallion_id": {
+      "type": "integer",
+      "description": "Unique identifier for the medallion",
+      "minimum": 1
+    },
+    "category": {
+      "type": "string",
+      "description": "Category of the miscellaneous expense",
+      "minLength": 1,
+      "maxLength": 100,
+      "enum": [
+        "Cleaning",
+        "Lost Key",
+        "Damage Fee",
+        "Late Fee",
+        "Documentation Fee",
+        "Towing",
+        "Maintenance",
+        "Other"
+      ]
+    },
+    "amount": {
+      "type": "number",
+      "description": "Total amount of the expense in dollars",
+      "minimum": 0.01,
+      "maximum": 99999.99,
+      "multipleOf": 0.01
+    },
+    "expense_date": {
+      "type": "string",
+      "description": "Date when the expense was incurred (YYYY-MM-DD format)",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "reference_number": {
+      "type": ["string", "null"],
+      "description": "Optional reference number for the expense",
+      "maxLength": 255
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "description": "Optional notes or additional details about the expense",
+      "maxLength": 1000
+    },
+    "document_id": {
+      "type": ["integer", "null"],
+      "description": "Optional ID of an uploaded supporting document",
+      "minimum": 1
+    }
+  },
+  "additionalProperties": false
+}
