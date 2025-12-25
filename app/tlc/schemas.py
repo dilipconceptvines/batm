@@ -22,13 +22,14 @@ class TLCViolationListResponse(BaseModel):
     issue_date: date
     issue_time: Optional[time] = None
     due_date: Optional[date] = None
-    description : Optional[str] = None
+    ea_reason : Optional[str] = None
     penalty_amount: Optional[Decimal] = 0
     service_fee : Optional[Decimal] = 0
     total_payable : Optional[Decimal] = 0
     driver_payable : Optional[Decimal] = 0
     disposition : Optional[TLCDisposition] = None
     note : Optional[str] = None
+    disposition_change_date : Optional[date] = None
     
     # Fields populated after association
     driver_id: Optional[str] = None
@@ -85,7 +86,7 @@ class TLCViolationCreateRequest(BaseModel):
     summons: str
     issue_date: date
     issue_time: Optional[str] = Field(None, pattern=r"^\d{4}[AP]$") # e.g., "0550P"
-    description: Optional[str] = None
+    ea_reason: Optional[str] = None
     amount: Decimal = Field(..., gt=0)
     service_fee: Optional[Decimal] = Field(0, ge=0)
     disposition: TLCDisposition = TLCDisposition.PAID

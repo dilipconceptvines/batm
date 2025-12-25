@@ -1,58 +1,136 @@
-### app/curb/tasks.py
+# app/curb/tasks.py
 
 """
-Celery Task Definitions for the CURB Module.
+CURB Celery Tasks
 
-This file ensures that tasks defined in other parts of the curb module,
-such as services, are discoverable by the Celery worker.
-
-By importing them here, we provide a single, clear entry point for Celery's
-autodiscovery mechanism as configured in `app/core/celery_app.py`.
+Scheduled background tasks for automated CURB operations.
 """
 
-# Local imports
-# from app.curb.services import (
-#     fetch_and_import_curb_trips_task,
-#     post_earnings_to_ledger_task,
-#     import_driver_data_task,
-#     import_medallion_data_task,
-#     import_filtered_data_task,
-# )
+from datetime import datetime, timedelta, timezone
 
-# from app.curb.import_raw_curb_data import (
-#     import_raw_curb_data_task,
-#     import_and_process_from_s3_task,
-#     fetch_and_process_chained,
-#     test_import,
-#     map_reconciled_trips_task,
-# )
-from app.curb.curb_sync_tasks import (
-    fetch_trips_to_s3_task,
-    parse_and_map_trips_task,
-    fetch_transactions_to_s3_task,
-    parse_and_map_transactions_task,
-    curb_full_sync_chain_task
-)
+from app.worker.app import app
+from app.core.db import SessionLocal
+from app.curb.services import CurbService
+from app.utils.logger import get_logger
 
-from app.curb.services import (
-    post_earnings_to_ledger_task,
-)
+logger = get_logger(__name__)
 
-# The tasks are defined in the services module using the @app.task decorator.
-# We simply import them here to make them available to Celery.
-# This keeps the task logic co-located with the service that performs the work.
 
-__all__ = [
-    # "import_raw_curb_data_task",
-    # "import_and_process_from_s3_task",
-    # "fetch_and_process_chained",
-    # "test_import",
-    # "map_reconciled_trips_task",
+@app.task(name="curb.import_trips_task", bind=True, max_retries=3)
+def import_trips_task(self):
+    """
+    Import CURB trips for all active accounts
+    
+    Scheduled to run every 3 hours.
+    Imports CASH trips from the last 3-hour window.
+    
+    Schedule: crontab(minute=0, hour='*/3')
+    """
+    db = SessionLocal()
+    
+    try:
+        logger.info("Starting scheduled CURB trip import (3-hour window)")
+        
+        service = CurbService(db)
+        
+        # Import last 3 hours
+        to_datetime = datetime.now(timezone.utc)
+        from_datetime = to_datetime - timedelta(hours=3)
+        
+        result = service.import_trips_from_accounts(
+            account_ids=None,  # All active accounts
+            from_datetime=from_datetime,
+            to_datetime=to_datetime,
+        )
+        
+        logger.info(
+            f"CURB import completed: {result['trips_imported']} new trips, "
+            f"{result['trips_updated']} updated from {len(result['accounts_processed'])} account(s)"
+        )
+        
+        # Chain: Post imported trips to ledger immediately
+        if result['trips_imported'] > 0:
+            logger.info("Triggering ledger posting for newly imported trips")
+            post_trips_to_ledger_task.apply_async(
+                kwargs={
+                    'start_date': from_datetime,
+                    'end_date': to_datetime
+                }
+            )
+        
+        return {
+            "status": "success",
+            "trips_imported": result["trips_imported"],
+            "trips_updated": result["trips_updated"],
+            "accounts_processed": len(result["accounts_processed"]),
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"CURB import task failed: {e}", exc_info=True)
+        
+        # Retry up to 3 times with exponential backoff
+        try:
+            raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+        except self.MaxRetriesExceededError:
+            logger.error("Max retries exceeded for CURB import task")
+            return {"status": "failed", "error": str(e)}
+        
+    finally:
+        db.close()
 
-    "fetch_trips_to_s3_task",
-    "parse_and_map_trips_task",
-    "fetch_transactions_to_s3_task",
-    "parse_and_map_transactions_task",
-    "curb_full_sync_chain_task",
-    "post_earnings_to_ledger_task",
-]
+
+@app.task(name="curb.post_trips_to_ledger_task", bind=True)
+def post_trips_to_ledger_task(self, start_date=None, end_date=None):
+    """
+    Post CURB trips to ledger
+    
+    Can be triggered:
+    1. Automatically after trip import (chained task)
+    2. Scheduled every Sunday at 3:30 AM as catchall (crontab(hour=3, minute=30, day_of_week=0))
+    
+    Posts all IMPORTED trips from the specified date range as individual
+    CREDIT entries to the ledger.
+    
+    Args:
+        start_date: Start of date range (defaults to 7 days ago)
+        end_date: End of date range (defaults to now)
+    """
+    db = SessionLocal()
+    
+    try:
+        logger.info("Starting CURB ledger posting")
+        
+        service = CurbService(db)
+        
+        # Use provided dates or default to past week
+        if end_date is None:
+            end_date = datetime.now(timezone.utc)
+        if start_date is None:
+            start_date = end_date - timedelta(days=7)
+        
+        result = service.post_trips_to_ledger(
+            start_date=start_date,
+            end_date=end_date,
+            driver_ids=None,  # All drivers
+            lease_ids=None,   # All leases
+        )
+        
+        logger.info(
+            f"CURB ledger posting completed: {result['trips_posted_to_ledger']} trips posted, "
+            f"total amount: ${result['total_amount_posted']}"
+        )
+        
+        return {
+            "status": "success",
+            "trips_posted": result["trips_posted_to_ledger"],
+            "total_amount": float(result["total_amount_posted"]),
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"CURB ledger posting task failed: {e}", exc_info=True)
+        return {"status": "failed", "error": str(e)}
+        
+    finally:
+        db.close()

@@ -6,7 +6,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.pvb.models import PVBViolationStatus , PVBSource
+from app.pvb.models import PVBViolationStatus , PVBSource , PVBDisposition
 
 
 class PVBViolationResponse(BaseModel):
@@ -40,6 +40,10 @@ class PVBViolationResponse(BaseModel):
     violation_code: Optional[str] = None
     violation_country: Optional[str] = None
     street_name: Optional[str] = None
+    disposition: Optional[str] = None
+    disposition_change_date: Optional[date] = None
+    note: Optional[str] = None
+    reduce_by: Optional[Decimal] = None
 
     class Config:
         from_attributes = True
@@ -61,6 +65,9 @@ class PaginatedPVBViolationResponse(BaseModel):
     source_list: List[PVBSource] = Field(
         default_factory=lambda: list(PVBSource)
     )
+    dispositions: List[str] = Field(
+        default_factory=lambda: list(PVBDisposition)
+        )
     states : Optional[List[str]] = None
     types : Optional[List[str]] = None
 
@@ -195,4 +202,5 @@ class EditPVBViolationRequest(BaseModel):
     violation_country: Optional[str] = None
 
     class Config:
-        orm_mode = True
+        """Pydantic configuration"""
+        from_attributes = True

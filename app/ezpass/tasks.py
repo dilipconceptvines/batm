@@ -11,12 +11,13 @@ for Celery's autodiscovery mechanism.
 from celery import shared_task
 from sqlalchemy.orm import Session
 
+from app.worker.app import app as celery_app
 from app.core.db import SessionLocal
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-@shared_task(name="ezpass.associate_and_post_transactions")
+@celery_app.task(name="ezpass.associate_and_post_transactions")
 def associate_and_post_ezpass_transactions_task():
     """
     Background task to associate EZPass transactions and immediately post to ledger.

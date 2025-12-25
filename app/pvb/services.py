@@ -25,6 +25,7 @@ from app.pvb.models import (
     PVBSource,
     PVBViolation,
     PVBViolationStatus,
+    PVBDisposition
 )
 from app.pvb.repository import PVBRepository
 from app.ledger.models import PostingCategory
@@ -153,6 +154,7 @@ class PVBService:
                         "ng_pmt": clean_value(row[19] , True),
                         "processing_fee": processing_fee,
                         "amount_due": amount_due,
+                        "disposition": PVBDisposition.PAID.value,
                         "violation_country": clean_value(row[21]),
                         "front_or_opp": clean_value(row[22]),
                         "house_number": clean_value(row[23]),
@@ -181,8 +183,11 @@ class PVBService:
             self.db.commit()
 
             logger.info(f"Imported {len(violations_to_insert)} records from {file_name}. Triggering association task.")
-            self.associate_violations()
 
+            ledger_service = LedgerService(self.db)
+            self.associate_violations()
+            self.post_violations_to_ledger(ledger_service)
+            
             return {
                 "message": "File uploaded and import process initiated.",
                 "import_id": import_record.id,

@@ -1271,8 +1271,9 @@ class EZPassService:
     
 
 # --- Celery Tasks ---
+from app.worker.app import app as celery_app
 
-@shared_task(name="ezpass.associate_transactions")
+@celery_app.task(name="ezpass.associate_transactions")
 def associate_ezpass_transactions_task():
     """
     Background task to find the correct driver/lease for imported EZPass transactions.
@@ -1292,7 +1293,7 @@ def associate_ezpass_transactions_task():
 
     
 
-@shared_task(name="ezpass.post_tolls_to_ledger")
+@celery_app.task(name="ezpass.post_tolls_to_ledger")
 def post_ezpass_tolls_to_ledger_task():
     """
     Background task to post successfully associated EZPass tolls to the ledger.

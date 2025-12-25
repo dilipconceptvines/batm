@@ -15,11 +15,12 @@ from app.drivers.services import driver_service
 from app.vehicles.services import vehicle_service
 from app.medallions.services import medallion_service
 from app.tlc.services import TLCService
-from app.tlc.models import TLCViolation , TLCViolationType
+from app.tlc.models import TLCViolation , TLCViolationType , EAReason
 from app.uploads.services import upload_service
 from app.utils.logger import get_logger
 from app.medallions.utils import format_medallion_response
 from app.core.config import settings
+from app.utils.s3_utils import s3_utils
 
 
 logger = get_logger(__name__)
@@ -41,6 +42,19 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
         driver_name = case_params.get("driver_name")
         tlc_license_no = case_params.get("tlc_license_no")
         medallion_no = case_params.get("medallion_no")
+
+        tlc_ticket = upload_service.get_documents(
+            db=db,
+            object_type="tlc",
+            object_id=case_no,
+            document_type="tlc_ticket"
+        )
+
+        if tlc_ticket and tlc_ticket.get("document_path"):
+            metadata = s3_utils.get_file_metadata(tlc_ticket["document_path"])
+            metadata = metadata if metadata else {}
+            metadata = metadata.get("extracted_data" , {})
+            logger.info(f"##$#### TLC Data OCR: {metadata}")
 
         if not any([medallion_no, tlc_license_no, driver_name]):
             return {"search_results": []}
@@ -148,34 +162,18 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
             "phone": driver.phone_number_1 or "N/A",
             "email": driver.email_address or "N/A",
         }
-
-        tlc_ticket = upload_service.get_documents(
-            db=db,
-            object_type="tlc",
-            object_id=case_no,
-            document_type="tlc_ticket"
-        )
         
         logger.info("Successfully fetched driver and lease details for PVB", case_no=case_no, driver_id=driver.id)
 
-        violation_tyeps = {
-            TLCViolationType.FI.value : "Failure to Inspect Vehicle",
-            TLCViolationType.FN.value : "Failure to Comply with Notice",
-            TLCViolationType.RF.value : "Reinspection Fee",
-            TLCViolationType.EA.value : [
-                "Air Bag Light",
-                "Defective Light",
-                "Dirty Cab",
-                "Meter Mile Run",
-                "Windshield"
-            ]
-        }
+        violation_tyeps = [vt.value for vt in TLCViolationType],
+        ea_reason_types = [vt.value for vt in EAReason]
         
         return {
             "driver": driver_data,
             "leases": formatted_leases,
             "tlc_ticket": tlc_ticket,
             "violation_types": violation_tyeps,
+            "ea_reason_types": ea_reason_types,
             "service_fee": settings.tlc_service_fee
         }
         
@@ -285,7 +283,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: dict):
             violation.issue_time = datetime.now().time()
             violation.plate = vehicle_plate_no
             violation.violation_type = step_data.get("ticket_type")
-            violation.description = step_data.get("description")
+            violation.ea_reason = step_data.get("ea_reason")
             violation.amount = Decimal(step_data.get("penalty_amount"))
             violation.service_fee = settings.tlc_inspection_fees
             violation.total_payable = Decimal(step_data.get("penalty_amount"))+Decimal(settings.tlc_inspection_fees)
@@ -309,7 +307,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: dict):
                 "plate": vehicle_plate_no,
                 "state": "NY",
                 "violation_type": step_data.get("ticket_type"),
-                "description": step_data.get("description"),
+                "ea_reason": step_data.get("ea_reason"),
                 "amount": Decimal(step_data.get("penalty_amount")),
                 "disposition": step_data.get("disposition"),
                 "due_date": step_data.get("due_date"),

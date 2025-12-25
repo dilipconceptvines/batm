@@ -50,6 +50,12 @@ class PVBSource(str, PyEnum):
     CSV_IMPORT = "CSV_IMPORT"
     MANUAL_ENTRY = "MANUAL_ENTRY"
 
+class PVBDisposition(str, PyEnum):
+    """Enumeration for the disposition of a TLC Violation."""
+    PAID = "Paid"
+    REDUCED = "Reduced"
+    DISMISSED = "Dismissed"
+
 
 class PVBImport(Base, AuditMixin):
     """
@@ -118,7 +124,8 @@ class PVBViolation(Base, AuditMixin):
     processing_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), default=0)
     amount_due: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     driver_payment_amount : Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2) , default=0)
-
+    disposition : Mapped[Optional[PVBDisposition]] = mapped_column(Enum(PVBDisposition), nullable=True)
+    reduce_to: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), default=0)
     is_terminated: Mapped[bool] = mapped_column(Boolean, default=False)
     non_program : Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     system_entry_date: Mapped[Optional[date]] = mapped_column(Date , nullable=True)
@@ -145,6 +152,8 @@ class PVBViolation(Base, AuditMixin):
     violation_code : Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     violation_country : Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     street_name : Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    disposition_change_date : Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    note : Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # --- Mapped Foreign Keys ---
     driver_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("drivers.id"), index=True)

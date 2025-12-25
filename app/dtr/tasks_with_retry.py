@@ -20,6 +20,7 @@ from requests.exceptions import RequestException
 from botocore.exceptions import ClientError
 from celery import shared_task
 
+from app.worker.app import app as celery_app
 from app.core.db import SessionLocal
 from app.dtr.models import DTR
 from app.dtr.email_service import get_dtr_email_service
@@ -28,7 +29,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@shared_task(
+@celery_app.task(
     name="dtr.send_weekly_dtr_emails",
     bind=True,
     autoretry_for=(RequestException, ClientError, ConnectionError),
@@ -241,7 +242,7 @@ def send_weekly_dtr_emails_task(self):
         db.close()
 
 
-@shared_task(
+@celery_app.task(
     name="dtr.send_dtr_email_on_demand",
     bind=True,
     autoretry_for=(RequestException, ClientError, ConnectionError),

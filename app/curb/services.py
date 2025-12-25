@@ -1,1089 +1,860 @@
 # app/curb/services.py
 
+"""
+CURB Service Layer - Business Logic
+
+Handles all CURB business operations including:
+- Multi-account data import from CURB API
+- S3 data lake integration
+- Driver/Lease/Vehicle mapping
+- Individual trip ledger posting
+- Reconciliation (server or local per account)
+"""
+
 import xml.etree.ElementTree as ET
-import datetime as dt
-from datetime import timedelta, date, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional, Any
 from io import BytesIO
+from typing import Dict, List, Optional
 
 import requests
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import and_
 
-from app.core.config import settings
 from app.curb.exceptions import (
-    CurbApiError, DataMappingError, TripProcessingError
+    CurbApiError, CurbDataParsingError, CurbReconciliationError,
 )
-from app.curb.models import (
-    CurbTrip, CurbTripStatus, PaymentType
-)
+from app.curb.models import CurbAccount, CurbTrip, CurbTripStatus, PaymentType, ReconciliationMode
 from app.curb.repository import CurbRepository
-from app.medallions.models import Medallion
-from app.medallions.schemas import MedallionStatus
-from app.drivers.services import driver_service
+from app.drivers.models import Driver
 from app.leases.services import lease_service
-from app.medallions.services import medallion_service
+from app.ledger.models import PostingCategory, EntryType
 from app.ledger.services import LedgerService
-from app.ledger.repository import LedgerRepository
-from app.worker.app import app
-from app.utils.s3_utils import s3_utils
 from app.utils.logger import get_logger
+from app.utils.s3_utils import s3_utils
 
 logger = get_logger(__name__)
 
 
 class CurbApiService:
     """
-    Handles low level communication with the CURB SOAP API.
+    Low-level CURB API client
+    
+    Handles SOAP requests to CURB API endpoints.
     """
+    
+    def __init__(self, account: CurbAccount):
+        self.account = account
+        self.base_url = account.api_url
+        self.merchant = account.merchant_id
+        self.username = account.username
+        self.password = account.password
 
-    def __init__(self):
-        self.base_url = settings.curb_url
-        self.username = settings.curb_username
-        self.password = settings.curb_password
-        self.merchant = settings.curb_merchant
-        self.headers = {"Content-Type": "text/xml; charset=utf-8"}
-
-    def _make_soap_request(self, soap_action: str, payload: str) -> str:
-        """
-        Makes a SOAP request to the CURB API and returns the response XML.
-        """
+    def _build_soap_envelope(self, method: str, params: dict) -> str:
+        """Build SOAP envelope for CURB API calls"""
+        params_xml = "".join([f"<{k}>{v}</{k}>" for k, v in params.items()])
+        
+        envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+        <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+                    xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
+                    xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+            <soap:Body>
+                <{method} xmlns="https://www.taxitronic.org/VTS_SERVICE/">
+                <UserId>{self.username}</UserId>
+                <Password>{self.password}</Password>
+                <Merchant>{self.merchant}</Merchant>
+                {params_xml}
+                </{method}>
+            </soap:Body>
+        </soap:Envelope>"""
+        
+        return envelope
+    
+    def _make_request(self, method: str, params: dict) -> str:
+        """Make SOAP request to CURB API"""
+        envelope = self._build_soap_envelope(method, params)
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": f"https://www.taxitronic.org/VTS_SERVICE/{method}"
+        }
+        
         try:
-            full_action = f"https://www.taxitronic.org/VTS_SERVICE/{soap_action}"
-            self.headers["SOAPAction"] = full_action
             response = requests.post(
-                self.base_url, data=payload.encode("utf-8"), headers=self.headers, timeout=120
+                self.base_url,
+                data=envelope,
+                headers=headers,
+                timeout=60
             )
             response.raise_for_status()
-
-            root = ET.fromstring(response.content)
-            namespace = "https://www.taxitronic.org/VTS_SERVICE/"
-            result_tag = f"{{{namespace}}}{soap_action}Result"
-            result_element = root.find(f".//{result_tag}")
-
-            if result_element is None:
-                raise CurbApiError(f"'{soap_action}Result' tag not found in SOAP response.")
-            
-            return result_element.text
+            return response.text
+        except requests.RequestException as e:
+            logger.error(f"CURB API request failed for account {self.account.account_name}: {e}")
+            raise CurbApiError(f"CURB API request failed: {e}")
         
-        except requests.exceptions.RequestException as e:
-            logger.error("CURB API request failed: %s", e, exc_info=True)
-            raise CurbApiError(f"Network error communicating with CURB API: {e}") from e
-        except ET.ParseError as e:
-            logger.error("Failed to parse CURB API SOAP response: %s", e, exc_info=True)
-            raise CurbApiError("Invalid XML response from CURB API.") from e
+    def get_trips_log10(
+        self, from_datetime: str, to_datetime: str, recon_stat: int = 0
+    ) -> str:
+        """
+        Call GET_TRIPS_LOG10 endpoint
         
-    def get_trips_log10(self, from_date: str, to_date: str, cab_number: str = None) -> str:
-        """Fetches trip data from the GET_TRIPS_LOG10 endpoint."""
-        if cab_number:
-            payload = f"""<?xml version="1.0" encoding="utf-8"?>
-            <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-            <soap:Body>
-                <GET_TRIPS_LOG10 xmlns="https://www.taxitronic.org/VTS_SERVICE/">
-                <UserId>{self.username}</UserId>
-                <Password>{self.password}</Password>
-                <Merchant>{self.merchant}</Merchant>
-                <DRIVERID></DRIVERID>
-                <CABNUMBER>{cab_number}</CABNUMBER>
-                <DATE_FROM>{from_date}</DATE_FROM>
-                <DATE_TO>{to_date}</DATE_TO>
-                <RECON_STAT>-1</RECON_STAT>
-                </GET_TRIPS_LOG10>
-            </soap:Body>
-            </soap:Envelope>"""
-        else:
-            payload = f"""<?xml version="1.0" encoding="utf-8"?>
-            <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-            <soap:Body>
-                <GET_TRIPS_LOG10 xmlns="https://www.taxitronic.org/VTS_SERVICE/">
-                <UserId>{self.username}</UserId>
-                <Password>{self.password}</Password>
-                <Merchant>{self.merchant}</Merchant>
-                <DRIVERID></DRIVERID>
-                <CABNUMBER></CABNUMBER>
-                <DATE_FROM>{from_date}</DATE_FROM>
-                <DATE_TO>{to_date}</DATE_TO>
-                <RECON_STAT>-1</RECON_STAT>
-                </GET_TRIPS_LOG10>
-            </soap:Body>
-            </soap:Envelope>"""
-        return self._make_soap_request("GET_TRIPS_LOG10", payload)
+        Args:
+            from_datetime: Start datetime (MM/DD/YYYY HH:MM:SS)
+            to_datetime: End datetime (MM/DD/YYYY HH:MM:SS)
+            recon_stat: Reconciliation status filter
+                       0 = only unreconciled (default)
+                       <0 = all records
+                       >0 = specific reconciliation ID
+        
+        Returns:
+            Raw XML response
+        """
+        params = {
+            "DRIVERID": "",  # Blank = all drivers
+            "CABNUMBER": "",  # Blank = all cabs
+            "DATE_FROM": from_datetime,
+            "DATE_TO": to_datetime,
+            "RECON_STAT": recon_stat
+        }
+        
+        return self._make_request("GET_TRIPS_LOG10", params)
     
-    def get_trans_by_date_cab12(self, from_date: str, to_date: str, cab_number: str = "") -> str:
-        """Fetches card transaction data from the Get_Trans_By_Date_Cab12 endpoint."""
-        payload = f"""<?xml version="1.0" encoding="utf-8"?>
-        <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Body>
-            <Get_Trans_By_Date_Cab12 xmlns="https://www.taxitronic.org/VTS_SERVICE/">
-              <UserId>{self.username}</UserId>
-              <Password>{self.password}</Password>
-              <Merchant>{self.merchant}</Merchant>
-              <fromDateTime>{from_date}</fromDateTime>
-              <ToDateTime>{to_date}</ToDateTime>
-              <CabNumber>{cab_number}</CabNumber>
-              <TranType>ALL</TranType>
-            </Get_Trans_By_Date_Cab12>
-          </soap:Body>
-        </soap:Envelope>"""
-        return self._make_soap_request("Get_Trans_By_Date_Cab12", payload)
-
-    def reconcile_trips(self, trip_ids: List[str], reconciliation_id: str):
-        """Marks a list of trip IDs as reconciled in the CURB system."""
-        if not trip_ids:
-            return
-
-        list_ids = ",".join(trip_ids)
+    def get_trans_by_date_cab12(
+        self, from_datetime: str, to_datetime: str,
+        cab_number: str = "", tran_type: str = "ALL"
+    ) -> str:
+        """
+        Call Get_Trans_By_Date_Cab12 endpoint
         
-        payload = f"""<?xml version="1.0" encoding="utf-8"?>
-        <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-          <soap:Body>
-            <Reconciliation_TRIP_LOG xmlns="https://www.taxitronic.org/VTS_SERVICE/">
-              <UserId>{self.username}</UserId>
-              <Password>{self.password}</Password>
-              <Merchant>{self.merchant}</Merchant>
-              <RECON_STAT>{reconciliation_id}</RECON_STAT>
-              <ListIDs>{list_ids}</ListIDs>
-            </Reconciliation_TRIP_LOG>
-          </soap:Body>
-        </soap:Envelope>"""
-        self._make_soap_request("Reconciliation_TRIP_LOG", payload)
-
+        Returns all card transactions (credit card, mobile payments, etc.)
+        
+        Args:
+            from_datetime: Start datetime (MM/DD/YYYY HH:MM:SS)
+            to_datetime: End datetime (MM/DD/YYYY HH:MM:SS)
+            cab_number: Specific cab/medallion (blank = all)
+            tran_type: Transaction type filter:
+                      - "AP" = approved transactions only
+                      - "DC" = failed transactions only
+                      - "DUP" = duplicates only
+                      - "ALL" = all transactions (default)
+        
+        Returns:
+            Raw XML response
+        """
+        params = {
+            "fromDateTime": from_datetime,
+            "ToDateTime": to_datetime,
+            "CabNumber": cab_number,
+            "TranType": tran_type
+        }
+        
+        return self._make_request("Get_Trans_By_Date_Cab12", params)
+    
+    def reconcile_trips(self, trip_ids: List[str], reconciliation_id: str) -> str:
+        """
+        Call Reconciliation_TRIP_LOG endpoint
+        
+        Marks trips as reconciled on CURB server.
+        """
+        params = {
+            "DATE_FROM": datetime.now(timezone.utc).strftime("%m/%d/%Y"),
+            "RECON_STAT": reconciliation_id,
+            "ListIDs": ",".join(trip_ids)
+        }
+        
+        return self._make_request("Reconciliation_TRIP_LOG", params)
+    
 
 class CurbService:
     """
-    Main service for orchestrating CURB data import, processing, and reconciliation.
+    Main CURB service orchestrator
+    
+    Coordinates data import, mapping, reconciliation, and ledger posting.
     """
-
+    
     def __init__(self, db: Session):
         self.db = db
-        self.api_service = CurbApiService()
         self.repo = CurbRepository(db)
-        self.ledger_repo = LedgerRepository(db)
-        self.ledger_service = LedgerService(self.ledger_repo)
+        self.ledger_service = LedgerService(db)
 
-    def _parse_and_normalize_trips(self, xml_data: str, filter_cash_only: bool = False) -> List[Dict]:
-        """
-        Parses the XML response from CURB and normalizes it into a standard dictionary format.
-        Handles multiple XML structures: GET_TRIPS_LOG10, Get_Trans_By_Date_Cab12, and TRIPS/RECORD format.
-        """
-        trips = []
-        if not xml_data:
-            return trips
-        
-        try:
-            root = ET.fromstring(xml_data)
-            # Support multiple XML structures: trip, tran, and RECORD elements
-            trip_nodes = root.findall(".//RECORD") + root.findall(".//tran")
-            
-            for trip_node in trip_nodes:
-                if not isinstance(trip_node, ET.Element):
-                    continue
-                    
-                try:
-                    def get_value(element, field_name, alt_names=None):
-                        """Get value from either attribute or nested element, with alternative field names"""
-                        # List of possible field names to try
-                        field_names = [field_name]
-                        if alt_names:
-                            field_names.extend(alt_names)
-                        
-                        for fname in field_names:
-                            # Try attribute first
-                            attr_value = element.attrib.get(fname)
-                            if attr_value is not None:
-                                return attr_value
-                                
-                            # Try nested element
-                            child_elem = element.find(fname)
-                            if child_elem is not None:
-                                return child_elem.text
-                                
-                        return None
+    # --- DATA IMPORT FROM CURB API ---
 
-                    # Determine payment type with flexible parsing
-                    payment_type_str = get_value(trip_node, "PAYMENT_TYPE", ["CC_TYPE", "T"]) or ""
-                    payment_type_char = payment_type_str[0] if payment_type_str else None
-                    
-                    if payment_type_char == '$' or 'cash' in (trip_node.findtext('PAYMENT_TYPE') or '').lower():
-                        payment_type = PaymentType.CASH
-                    elif payment_type_char in ['C', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']:
-                        payment_type = PaymentType.CREDIT_CARD
-                    elif payment_type_char == 'P':
-                        payment_type = PaymentType.PRIVATE
-                    else:
-                        payment_type = PaymentType.UNKNOWN
-
-                    if filter_cash_only and payment_type == PaymentType.CREDIT_CARD:
-                        continue
-
-                    # Use ROWID for transactions, ID for RECORD elements, or a composite key for trips
-                    trip_id = trip_node.attrib.get("ROWID") or trip_node.attrib.get("RECORD ID") or trip_node.attrib.get("ID")
-                    period = trip_node.attrib.get("PERIOD")
-                    
-                    # If period is not available, generate it as MMYYYY from current date
-                    if not period:
-                        from datetime import datetime
-                        now = datetime.now()
-                        period = f"{now.month:02d}{now.year}"
-
-                    if not trip_id:
-                        continue
-                    
-                    unique_id = f"{period}-{trip_id}" if period else trip_id
-
-                    # Parse date and time with flexible approach
-                    trip_date = get_value(trip_node, "TRIPDATE") or ""
-                    trip_time_start = get_value(trip_node, "TRIPTIMESTART") or ""
-                    trip_time_end = get_value(trip_node, "TRIPTIMEEND") or ""
-                    
-                    # Try to get combined datetime first, then fall back to date+time combination
-                    start_datetime_str = get_value(trip_node, "START_DATE")
-                    end_datetime_str = get_value(trip_node, "END_DATE")
-
-                    # Try to get the transaction date if available
-                    transaction_date_str = get_value(trip_node, "DATETIME") or None
-                    
-                    # If no combined datetime, construct from separate date and time fields
-                    if not start_datetime_str and trip_date and trip_time_start:
-                        start_datetime_str = f"{trip_date} {trip_time_start}"
-                    if not end_datetime_str and trip_date and trip_time_end:
-                        end_datetime_str = f"{trip_date} {trip_time_end}"
-                        
-                    # Handle alternative datetime format (DATETIME field)
-                    if not start_datetime_str:
-                        datetime_field = get_value(trip_node, "DATETIME")
-                        if datetime_field:
-                            start_datetime_str = datetime_field
-                            # For single datetime, assume trip duration or use same for both
-                            end_datetime_str = end_datetime_str or datetime_field
-                    
-                    # Clean up the strings
-                    start_datetime_str = (start_datetime_str or "").strip()
-                    end_datetime_str = (end_datetime_str or "").strip()
-
-                    
-                    # Try parsing with seconds first, then without
-                    def parse_flexible_datetime(datetime_str: str) -> dt.datetime:
-                        """Parse datetime with flexible format handling."""
-                        if not datetime_str or datetime_str == " ":
-                            raise ValueError("Empty datetime string")
-                        
-                        # Try with seconds first
-                        try:
-                            return dt.datetime.strptime(datetime_str, "%m/%d/%Y %H:%M:%S")
-                        except ValueError:
-                            # If that fails, try without seconds
-                            try:
-                                return dt.datetime.strptime(datetime_str, "%m/%d/%Y %H:%M")
-                            except ValueError:
-                                # If both fail, log and re-raise
-                                logger.warning(f"Failed to parse datetime: '{datetime_str}'")
-                                raise
-
-                    start_time = parse_flexible_datetime(start_datetime_str)
-                    end_time = parse_flexible_datetime(end_datetime_str)
-                    if transaction_date_str:
-                        logger.info("Parsing transaction date **** ", transaction_date_str=transaction_date_str)
-                        transaction_date = parse_flexible_datetime(transaction_date_str)
-                    else:
-                        transaction_date = end_time
-
-                    # Extract CABNUMBER with flexible parsing (attributes or nested elements)
-                    cab_number = get_value(trip_node, "CABNUMBER", ["CAB_NUMBER", "CabNumber"])
-                        
-                    if not cab_number and trip_node.tag == "tran":
-                        # Debug: Log when CABNUMBER is missing from transaction records
-                        logger.warning(f"Missing CABNUMBER in transaction {unique_id}. Available attributes: {list(trip_node.attrib.keys())}")
-                        # Log child elements for debugging
-                        child_elements = [child.tag for child in trip_node]
-                        logger.warning(f"Available child elements: {child_elements}")
-                    elif cab_number:
-                        logger.debug(f"Found CABNUMBER: {cab_number} for transaction {unique_id}")
-
-                    # Generate curb_period from transaction_date if period is null/none
-                    if not period and transaction_date:
-                        # Format: MMYYYY (e.g., 032025 for March 2025)
-                        period = transaction_date.strftime("%m%Y")
-                        logger.debug(f"Generated curb_period from transaction_date: {period}")
-
-                    trip_data = {
-                        "curb_trip_id": unique_id,
-                        "curb_period": period,
-                        "status": CurbTripStatus.UNRECONCILED,
-                        "curb_driver_id": get_value(trip_node, "DRIVER", ["TRIPDRIVERID"]),
-                        "curb_cab_number": cab_number,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "fare": Decimal(get_value(trip_node, "TRIPFARE", ["TRIP"]) or "0.00"),
-                        "tips": Decimal(get_value(trip_node, "TRIPTIPS", ["TIPS"]) or "0.00"),
-                        "tolls": Decimal(get_value(trip_node, "TRIPTOLL", ["TOLLS"]) or "0.00"),
-                        "extras": Decimal(get_value(trip_node, "TRIPEXTRAS", ["EXTRAS"]) or "0.00"),
-                        "total_amount": Decimal(get_value(trip_node, "TOTAL_AMOUNT", ["AMOUNT"]) or "0.00"),
-                        "surcharge": Decimal(get_value(trip_node, "TAX") or "0.00"),
-                        "improvement_surcharge": Decimal(get_value(trip_node, "IMPTAX") or "0.00"),
-                        "congestion_fee": Decimal(get_value(trip_node, "CongFee", ["CONGFEE"]) or "0.00"),
-                        "airport_fee": Decimal(get_value(trip_node, "airportFee") or "0.00"),
-                        "cbdt_fee": Decimal(get_value(trip_node, "cbdt") or "0.00"),
-                        "start_long": Decimal(get_value(trip_node, "GPS_START_LO", ["FromLo"]) or None),
-                        "start_lat": Decimal(get_value(trip_node, "GPS_START_LA", ["FromLa"]) or None),
-                        "end_long": Decimal(get_value(trip_node, "GPS_END_LO", ["ToLo"]) or None),
-                        "end_lat": Decimal(get_value(trip_node, "GPS_END_LA", ["ToLa"]) or None),
-                        "num_service": int(get_value(trip_node, "NUM_SERVICE") or None),
-                        "payment_type": payment_type,
-                        "transaction_date": transaction_date,
-                    }
-                    logger.info("Parsed trip data: %s", trip_data)
-                    trips.append(trip_data)
-                except (ValueError, KeyError) as e:
-                    logger.warning("Skipping malformed trip record: %s. Error: %s", 
-                                ET.tostring(trip_node, 'utf-8'), e)
-                    continue
-
-        except ET.ParseError as e:
-            logger.error("Failed to parse CURB XML data: %s", e, exc_info=True)
-            raise CurbApiError("Invalid XML data received from CURB.") from e
-        
-        # Deduplicate trips by curb_trip_id - keep the last occurrence
-        seen_trip_ids = {}
-        deduplicated_trips = []
-        
-        for trip in trips:
-            trip_id = trip["curb_trip_id"]
-            if trip_id in seen_trip_ids:
-                logger.warning(f"Duplicate trip ID found in XML batch: {trip_id}. Keeping latest occurrence.")
-                # Replace the previous entry
-                deduplicated_trips = [t for t in deduplicated_trips if t["curb_trip_id"] != trip_id]
-            
-            deduplicated_trips.append(trip)
-            seen_trip_ids[trip_id] = True
-        
-        if len(deduplicated_trips) != len(trips):
-            logger.info(f"Removed {len(trips) - len(deduplicated_trips)} duplicate trips from XML batch")
-        
-        return deduplicated_trips
-    
-    def _reconcile_locally(self, trips: List[CurbTrip]) -> int:
-        """
-        Marks a list of trips as reconciled directly in the local database.
-        """
-        if not trips:
-            return 0
-        
-        for trip in trips:
-            self.repo.update_trip_status(trip.id, CurbTripStatus.RECONCILED)
-
-        self.db.commit()
-        logger.info(f"Locally marked {len(trips)} trips as RECONCILED for non-production environment.")
-
-        return len(trips)
-    
-    def import_and_reconcile_data(
-        self, from_date: Optional[date] = None, to_date: Optional[date] = None,
-        medallion_no: Optional[str] = None
+    def import_trips_from_accounts(
+        self,
+        account_ids: Optional[List[int]] = None,
+        from_datetime: Optional[datetime] = None,
+        to_datetime: Optional[datetime] = None,
     ) -> Dict:
         """
-        Fetches CURB data based on active medallions, stores it raw, and reconciles.
-        """
-        try:
-            # Step 1: Determine medallions to query
-            if medallion_no:
-                medallion_numbers = [m.strip() for m in medallion_no.split(',') if m.strip()]
-                logger.info(f"Starting CURB import for specified medallions: {medallion_numbers}")
-            else:
-                logger.info("Starting CURB import for all active medallions in the system.")
-                active_medallions = self.db.query(Medallion.medallion_number).filter(
-                    Medallion.medallion_status == MedallionStatus.ACTIVE
-                ).all()
-                medallion_numbers = [m[0] for m in active_medallions]
-                if not medallion_numbers:
-                    return {"message": "No active medallions found in the system to import data for."}
-                
-            # Step 2: Set the date range
-            to_date = to_date or date.today()
-            from_date = from_date or (to_date - timedelta(days=1))
-            date_format = "%m/%d/%Y"
-            from_date_str = from_date.strftime(date_format)
-            to_date_str = to_date.strftime(date_format)
-
-            # Step 3: Fetch data for each medallion
-            all_trips_data = {}
-            api_errors = []
-            for cab_number in medallion_numbers:
-                try:
-                    logger.debug(f"Fetching data for medallion {cab_number}...")
-                    trips_log_xml = self.api_service.get_trips_log10(from_date_str + " 00:00:00", to_date_str + " 23:59:59", cab_number=cab_number)
-                    trans_xml = self.api_service.get_trans_by_date_cab12(from_date_str + " 00:00:00", to_date_str + " 23:59:59", cab_number=cab_number)
-                    
-                    normalized_trips = self._parse_and_normalize_trips(trips_log_xml)
-                    normalized_trans = self._parse_and_normalize_trips(trans_xml)
-                    
-                    # Deduplicate using a dictionary
-                    for trip in normalized_trips + normalized_trans:
-                        all_trips_data[trip['curb_trip_id']] = trip
-
-                except CurbApiError as e:
-                    logger.error(f"Failed to fetch data for medallion {cab_number}: {e}")
-                    api_errors.append({"medallion_number": cab_number, "error": str(e)})
-
-            final_trip_list = list(all_trips_data.values())
-            logger.info(f"Fetched a total of {len(final_trip_list)} unique records from CURB.")
-
-            # Step 4: Store Raw Data
-            inserted, updated = self.repo.bulk_insert_or_update(final_trip_list)
-            self.db.commit()
-            logger.info(f"Database operation complete: {inserted} new trips inserted, {updated} trips updated.")
-
-            # Step 5: Reconcile Trips
-            unreconciled_trips = self.repo.get_unreconciled_trips()
-            reconciled_count = 0
-            reconciliation_id = None
-            
-            if unreconciled_trips:
-                if settings.environment == "production":
-                    logger.info("Reconciling with CURB server (production environment).")
-                    trip_ids_to_reconcile = [trip.curb_trip_id.split('-')[-1] for trip in unreconciled_trips]
-                    reconciliation_id = f"BAT-RECO-{dt.datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                    try:
-                        self.api_service.reconcile_trips(trip_ids_to_reconcile, reconciliation_id)
-                        # Update status in local DB after successful API call
-                        for trip in unreconciled_trips:
-                            self.repo.update_trip_status(trip.id, CurbTripStatus.RECONCILED, reconciliation_id)
-                        self.db.commit()
-                        reconciled_count = len(unreconciled_trips)
-                        logger.info(f"Successfully reconciled {reconciled_count} trips with CURB API.")
-                    except CurbApiError as e:
-                        self.db.rollback()
-                        logger.error(f"Failed to reconcile trips with CURB API: {e}")
-                        api_errors.append({"reconciliation": "failed", "error": str(e)})
-                else:
-                    reconciled_count = self._reconcile_locally(unreconciled_trips)
-
-            return {
-                "medallions_queried": len(medallion_numbers),
-                "date_range": {"from": from_date_str, "to": to_date_str},
-                "records_fetched": len(final_trip_list),
-                "newly_inserted": inserted,
-                "records_updated": updated,
-                "records_reconciled": reconciled_count,
-                "reconciliation_id": reconciliation_id,
-                "api_errors": api_errors
-            }
-
-        except Exception as e:
-            self.db.rollback()
-            logger.error("An unexpected error occurred during CURB import: %s", e, exc_info=True)
-            raise
-
-    def map_reconciled_trips(self) -> Dict:
-        """
-        Finds all RECONCILED (but not yet mapped) trips and attempts to associate them
-        with internal Driver, Medallion, Vehicle, and Lease records. On success, the
-        trip status is updated to MAPPED.
-        """
-        logger.info("Starting task to map reconciled CURB trip records.")
+        Import CASH trips from one or more CURB accounts
         
-        trips_to_map = self.repo.find_trips_by_status(CurbTripStatus.RECONCILED)
-
-        if not trips_to_map:
-            logger.info("No reconciled CURB trips found to map.")
-            return {
-                "total_trips_found": 0,
-                "successfully_mapped": 0,
-                "mapping_failures": 0,
-                "errors": []
-            }
-            
-        logger.info(f"Found {len(trips_to_map)} reconciled trips to process for mapping.")
-        
-        # Use the shared mapping logic
-        return self._process_trip_mappings(trips_to_map)
-
-        # return {
-        #     "total_trips_to_map": len(trips_to_map),
-        #     "successfully_mapped": successful_count,
-        #     "mapping_failures": failed_count,
-        #     "errors": errors,
-        # }
-    
-    def map_reconciled_trips_by_ids(self, trip_ids: List[int]) -> Dict:
-        """
-        Map specific reconciled trips by their internal database IDs.
-        More efficient than mapping all reconciled trips when only targeting a subset.
+        Process:
+        1. Get active accounts (or specific accounts if provided)
+        2. For each account, call GET_TRIPS_LOG10 API
+        3. Store raw XML to S3 data lake
+        4. Parse XML and extract CASH trips only
+        5. Map to driver/lease/vehicle
+        6. Store in database with IMPORTED status
+        7. Reconcile based on account config (server or local)
         
         Args:
-            trip_ids: List of internal CurbTrip.id values to map
-            
-        Returns:
-            Dictionary with mapping results
+            account_ids: Specific accounts to import from (None = all active)
+            from_datetime: Start datetime (default: 3 hours ago)
+            to_datetime: End datetime (default: now)
         """
-        logger.info(f"Starting targeted mapping for {len(trip_ids)} specific trip IDs.")
+        start_time = datetime.now()
         
-        trips_to_map = (
-            self.db.query(CurbTrip)
-            .filter(
-                CurbTrip.id.in_(trip_ids),
-                CurbTrip.status == CurbTripStatus.RECONCILED
-            )
-            .all()
-        )
+        # Set datetime range (3-hour window by default)
+        if not to_datetime:
+            to_datetime = datetime.now(timezone.utc)
+        if not from_datetime:
+            from_datetime = to_datetime - timedelta(hours=3)
         
-        if not trips_to_map:
-            logger.info("No reconciled trips found for the provided IDs.")
+        # Get accounts to process
+        if account_ids:
+            accounts = [self.repo.get_account_by_id(aid) for aid in account_ids]
+        else:
+            accounts = self.repo.get_active_accounts()
+        
+        if not accounts:
             return {
-                "total_trips_found": 0,
-                "successfully_mapped": 0,
-                "mapping_failures": 0,
-                "errors": []
+                "status": "no_accounts",
+                "message": "No active CURB accounts found",
+                "accounts_processed": [],
             }
-            
-        logger.info(f"Found {len(trips_to_map)} reconciled trips to process for targeted mapping.")
         
-        # Use the same mapping logic as the main method
-        return self._process_trip_mappings(trips_to_map)
-    
-    def _process_trip_mappings(self, trips_to_map: List[CurbTrip]) -> Dict:
-        """
-        Internal method to process trip mappings for a given list of trips.
-        Extracted from map_reconciled_trips to avoid code duplication.
-        """
-        successful_count = 0
-        failed_count = 0
+        logger.info(f"Starting CURB import for {len(accounts)} account(s) from {from_datetime} to {to_datetime}")
+        
+        all_trips = []
+        account_results = []
         errors = []
-
-        for trip in trips_to_map:
+        
+        for account in accounts:
             try:
-                # Find the driver by tlc license number
-                driver = driver_service.get_drivers(db=self.db, tlc_license_number=trip.curb_driver_id)
-                if not driver:
-                    raise DataMappingError("TLC License", trip.curb_driver_id)
-                
-                # Find the medallion by cab number
-                medallion = medallion_service.get_medallion(db=self.db, medallion_number=trip.curb_cab_number)
-                if not medallion:
-                    raise DataMappingError("Medallion Number", trip.curb_cab_number)
-                
-                # Find the active lease mapping this driver and medallion
-                lease = lease_service.get_lease(
-                    db=self.db, driver_id=driver.driver_id, medallion_number=medallion.medallion_number,
-                    status="Active"
+                account_trips = self._import_from_account(
+                    account,
+                    from_datetime,
+                    to_datetime
                 )
-
-                if not lease:
-                    raise DataMappingError(
-                        "Lease", f"Driver ID {driver.driver_id} & Medallion {medallion.medallion_number}"
-                    )
                 
-                # Update the CurbTrip record with foreign keys and set status to MAPPED
-                trip.driver_id = driver.id
-                trip.medallion_id = medallion.id
-                trip.lease_id = lease.id
-                trip.vehicle_id = lease.vehicle_id
-                trip.status = CurbTripStatus.MAPPED
+                all_trips.extend(account_trips)
+                account_results.append({
+                    "account_id": account.id,
+                    "account_name": account.account_name,
+                    "trips_fetched": len(account_trips),
+                    "status": "success"
+                })
                 
-                if lease.vehicle and lease.vehicle.registrations:
-                    trip.plate = lease.vehicle.registrations[0].plate_number
-
-                successful_count += 1
-
-            except DataMappingError as e:
-                failed_count += 1
-                errors.append({"curb_trip_id": trip.curb_trip_id, "error": str(e)})
-                logger.warning(f"Mapping failed for trip {trip.curb_trip_id}: {e}")
-                continue
+                logger.info(f"Account '{account.account_name}': fetched {len(account_trips)} CASH trips")
+                
             except Exception as e:
-                failed_count += 1
-                errors.append({"curb_trip_id": trip.curb_trip_id, "error": f"An unexpected error occurred: {str(e)}"})
-                logger.error(f"Unexpected error mapping trip {trip.curb_trip_id}: {e}", exc_info=True)
-                continue
-
-        try:
+                logger.error(f"Failed to import from account '{account.account_name}': {e}", exc_info=True)
+                errors.append({
+                    "account_id": account.id,
+                    "account_name": account.account_name,
+                    "error": str(e)
+                })
+        
+        # Bulk insert all trips from all accounts
+        trips_imported, trips_updated = 0, 0
+        if all_trips:
+            trips_imported, trips_updated = self.repo.bulk_insert_or_update_trips(all_trips)
             self.db.commit()
-            logger.info(f"Committed {successful_count} successful trip mappings to the database.")
-        except SQLAlchemyError as e:
-            self.db.rollback()
-            logger.error("Database commit failed during trip mapping: %s", e, exc_info=True)
-            errors.append({"general_error": "Database commit failed", "detail": str(e)})
-            failed_count = len(trips_to_map)  # Mark all as failed if commit fails
-            successful_count = 0
-
+        
+        # Reconciliation
+        reconciliation_details = self._handle_reconciliation(accounts)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
         return {
-            "total_trips_to_map": len(trips_to_map),
-            "successfully_mapped": successful_count,
-            "mapping_failures": failed_count,
+            "status": "success",
+            "message": f"Imported from {len(accounts)} account(s)",
+            "accounts_processed": account_results,
+            "datetime_range": {
+                "from": from_datetime.isoformat(),
+                "to": to_datetime.isoformat()
+            },
+            "total_trips_fetched": len(all_trips),
+            "trips_imported": trips_imported,
+            "trips_updated": trips_updated,
+            "trips_skipped": len(all_trips) - trips_imported - trips_updated,
+            "reconciled_count": reconciliation_details.get("total_reconciled", 0),
+            "reconciliation_details": reconciliation_details,
+            "processing_time_seconds": round(processing_time, 2),
             "errors": errors,
         }
     
-    def post_mapped_earnings_to_ledger(
-        self, start_date: date, end_date: date,
-        lease_id: Optional[int] = None, driver_id: Optional[int] = None
-    ) -> Dict:
-        """
-        Finds all MAPPED credit card trips for a given period and optional filters,
-        and posts them as earnings to the centralized ledger.
-        """
-        logger.info(
-            f"Starting manual earnings posting for period: {start_date} to {end_date} "
-            f"(Lease ID: {lease_id}, Driver ID: {driver_id})"
-        )
-
-        try:
-            trips_to_post = self.repo.get_mapped_credit_card_trips_for_posting(
-                start_date=start_date,
-                end_date=end_date,
-                lease_id=lease_id,
-                driver_id=driver_id
-            )
-
-            if not trips_to_post:
-                logger.info("No new mapped credit card earnings found to post to the ledger.")
-                return {
-                    "drivers_processed": 0,
-                    "trips_posted": 0,
-                    "total_amount_posted": 0.0,
-                    "errors": []
-                }
-
-            # Group earnings by (driver_id, lease_id) to make one ledger call per combination
-            earnings_by_driver_lease: Dict[tuple, Decimal] = {}
-            trips_by_driver_lease: Dict[tuple, List[int]] = {}
-
-            for trip in trips_to_post:
-                if trip.driver_id is None or trip.lease_id is None:
-                    logger.warning(f"Skipping trip {trip.curb_trip_id} as it is missing driver_id or lease_id.")
-                    continue
-                
-                # Earnings are net of taxes/surcharges, so we sum the core components
-                net_earning = (trip.total_amount or Decimal("0.0"))                
-                key = (trip.driver_id, trip.lease_id)
-                earnings_by_driver_lease.setdefault(key, Decimal("0.0"))
-                trips_by_driver_lease.setdefault(key, [])
-
-                earnings_by_driver_lease[key] += net_earning
-                trips_by_driver_lease[key].append(trip.id)
-
-            posted_driver_count = 0
-            total_posted_amount = Decimal("0.0")
-            errors = []
-
-            for (driver_id, lease_id), total_earnings in earnings_by_driver_lease.items():
-                try:
-                    logger.info(f"Posting earnings of ${total_earnings} for driver_id {driver_id} on lease {lease_id}.")
-                    
-                    # This service call will create the CREDIT posting and apply it against open balances
-                    self.ledger_service.apply_weekly_earnings(
-                        driver_id=driver_id,
-                        earnings_amount=total_earnings,
-                        lease_id=lease_id,
-                    )
-                    
-                    # On success, update the status of the trips that were included in this batch
-                    trip_ids_to_update = trips_by_driver_lease[(driver_id, lease_id)]
-                    for trip_id in trip_ids_to_update:
-                        self.repo.update_trip_status(trip_id, CurbTripStatus.POSTED_TO_LEDGER)
-                    
-                    posted_driver_count += 1
-                    total_posted_amount += total_earnings
-                
-                except Exception as e:
-                    error_msg = f"Failed to post earnings for driver {driver_id} on lease {lease_id}: {str(e)}"
-                    errors.append({"driver_id": driver_id, "lease_id": lease_id, "error": error_msg})
-                    logger.error(error_msg, exc_info=True)
-            
-            self.db.commit()
-            logger.info(
-                f"Manual earnings posting complete. Processed {posted_driver_count} driver/lease pairs. "
-                f"Total amount posted: ${total_posted_amount}"
-            )
-
-            return {
-                "drivers_processed": posted_driver_count,
-                "trips_posted": len(trips_to_post) - sum(len(e) for e in errors),
-                "total_amount_posted": float(total_posted_amount),
-                "errors": errors
-            }
-
-        except Exception as e:
-            self.db.rollback()
-            logger.error("A critical error occurred during the earnings posting process: %s", e, exc_info=True)
-            raise TripProcessingError(
-                trip_id="batch", reason=f"A critical error occurred: {e}"
-            ) from e
-
-    # --- S3 Backup CURB trips -----------------------------        
-    def import_and_reconcile_from_s3(
+    def _import_from_account(
         self,
-        start_datetime: dt.datetime,
-        end_datetime: dt.datetime,
-    ) -> Dict:
+        account: CurbAccount,
+        from_datetime: datetime,
+        to_datetime: datetime,
+    ) -> List[Dict]:
         """
-        Import and reconcile CURB data from S3 XML files based on datetime range.
-
-        This method:
-        1. Lists XML files in S3 for the datetime range (matches exact folder structure)
-        2. Downloads and parses XML files
-        3. Normalizes trip data
-        4. Stores in database
-        5. Reconciles trips
-
-        Args:
-            start_datetime: Start datetime for import
-            end_datetime: End datetime for import
-
+        Import trips from a single CURB account
+        
+        Fetches from BOTH endpoints:
+        1. GET_TRIPS_LOG10 - All trip data (CASH, credit card, etc.)
+        2. Get_Trans_By_Date_Cab12 - Card transaction data
+        
         Returns:
-            Dictionary with import summary
+            List of parsed trip dictionaries ready for database insertion
         """
-        logger.info(
-            f"Starting CURB import from S3 for datetime range: {start_datetime} to {end_datetime}"
-        )
+        api_service = CurbApiService(account)
+        
+        # Format datetime for CURB API
+        from_str = from_datetime.strftime("%m/%d/%Y %H:%M:%S")
+        to_str = to_datetime.strftime("%m/%d/%Y %H:%M:%S")
+        
+        all_trips = []
+        
+        # --- CALL 1: GET_TRIPS_LOG10 - Get all trips (CASH and credit cards) ---
 
         try:
-            # Step 1: List S3 files
-            s3_files = self._list_s3_files_by_datetime_range(
-                start_datetime, end_datetime
-            )
+            logger.info(f"Fetching trips from GET_TRIPS_LOG10 for {account.account_name}")
+            trips_xml = api_service.get_trips_log10(from_str, to_str, recon_stat=0)
+            
+            # Store to S3 data lake
+            self._store_to_s3(account, trips_xml, from_datetime, "trips")
+            
+            # Parse trips (all payment types)
+            trips = self._parse_trips_xml(trips_xml, account.id)
+            all_trips.extend(trips)
+            logger.info(f"GET_TRIPS_LOG10: Parsed {len(trips)} trips")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch GET_TRIPS_LOG10 for {account.account_name}: {e}")
+        
+        # --- CALL 2: Get_Trans_By_Date_Cab12 - Get card transactions ---
+        
+        try:
+            logger.info(f"Fetching transactions from Get_Trans_By_Date_Cab12 for {account.account_name}")
+            trans_xml = api_service.get_trans_by_date_cab12(from_str, to_str)
+            
+            # Store to S3 data lake
+            self._store_to_s3(account, trans_xml, from_datetime, "transactions")
+            
+            # Parse transactions
+            transactions = self._parse_transactions_xml(trans_xml, account.id)
+            all_trips.extend(transactions)
+            logger.info(f"Get_Trans_By_Date_Cab12: Parsed {len(transactions)} transactions")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch Get_Trans_By_Date_Cab12 for {account.account_name}: {e}")
+        
+        # Deduplicate by curb_trip_id (in case same trip appears in both endpoints)
+        unique_trips = {}
+        for trip in all_trips:
+            trip_id = trip.get("curb_trip_id")
+            if trip_id:
+                # Keep the one with more complete data (prefer transactions data)
+                if trip_id not in unique_trips or trip.get("payment_type") != PaymentType.CASH:
+                    unique_trips[trip_id] = trip
+        
+        deduplicated_trips = list(unique_trips.values())
+        logger.info(f"Total unique trips after deduplication: {len(deduplicated_trips)}")
+        
+        # Map to internal entities
+        mapped_trips = []
+        for trip in deduplicated_trips:
+            try:
+                mapped_trip = self._map_trip_to_entities(trip)
+                if mapped_trip:
+                    mapped_trips.append(mapped_trip)
+            except Exception as e:
+                logger.warning(f"Failed to map trip {trip.get('curb_trip_id')}: {e}")
+                # Still include trip but without mapping
+                mapped_trips.append(trip)
+        
+        logger.info(f"Mapped {len(mapped_trips)} trips to internal entities")
+        return mapped_trips
+    
+    def _parse_trips_xml(self, xml_response: str, account_id: int) -> List[Dict]:
+        """
+        Parse CURB GET_TRIPS_LOG10 XML response
+        
+        Extracts ALL payment types (CASH, credit card, private card, etc.)
+        
+        Returns:
+            List of trip dictionaries
+        """
+        try:
+            root = ET.fromstring(xml_response)
+            trips = []
+            
+            # Extract the inner XML from GET_TRIPS_LOG10 element
+            result_element = root.find(".//{https://www.taxitronic.org/VTS_SERVICE/}GET_TRIPS_LOG10Result")
+            
+            if result_element is None or not result_element.text:
+                logger.warning("No GET_TRIPS_LOG10Result found in response")
+                return []
+            
+            # Parse the inner XML (trans/tran elements are in the text content)
+            inner_xml = result_element.text
+            inner_root = ET.fromstring(f"<root>{inner_xml}</root>")  # Wrap in root to parse properly
+            
+            # Navigate to TRIPS/RECORD elements
+            for record in inner_root.findall(".//RECORD"):
+                # Map payment type from T attribute
+                payment_type_code = record.get("T", "")
+                payment_type = self._map_payment_type(payment_type_code)
+                
+                trip = {
+                    "account_id": account_id,
+                    "curb_trip_id": f"{record.get('PERIOD')}-{record.get('ID')}",
+                    "curb_driver_id": record.get("DRIVER", ""),
+                    "curb_cab_number": record.get("CABNUMBER", ""),
+                    "status": CurbTripStatus.IMPORTED,
+                    "payment_type": payment_type,
+                    
+                    # Parse timestamps
+                    "start_time": self._parse_datetime(record.get("START_DATE")),
+                    "end_time": self._parse_datetime(record.get("END_DATE")),
+                    
+                    # Financial amounts
+                    "fare": Decimal(record.get("TRIP", "0.00")),
+                    "tips": Decimal(record.get("TIPS", "0.00")),
+                    "tolls": Decimal(record.get("TOLLS", "0.00")),
+                    "extras": Decimal(record.get("EXTRAS", "0.00")),
+                    "total_amount": Decimal(record.get("TOTAL_AMOUNT", "0.00")),
+                    
+                    # Tax breakdown
+                    "surcharge": Decimal(record.get("TAX", "0.00")),
+                    "improvement_surcharge": Decimal(record.get("IMPTAX", "0.00")),
+                    "congestion_fee": Decimal(record.get("CONGFEE", "0.00")),
+                    "airport_fee": Decimal(record.get("airportFee", "0.00")),
+                    "cbdt_fee": Decimal(record.get("cbdt", "0.00")),
+                    
+                    # Additional data
+                    "distance_miles": Decimal(record.get("DIST_SERVCE", "0.00")),
+                    "num_passengers": int(record.get("PASSENGER_NUM", 1)),
 
-            if not s3_files["transactions"] and not s3_files["trips"]:
-                logger.warning("No XML files found in S3 for the specified date range")
-                return {
-                    "message": "No XML files found in S3 for the specified date range",
-                    "records_fetched": 0,
-                    "newly_inserted": 0,
-                    "records_updated": 0,
-                    "records_reconciled": 0,
+                    # Coordinates
+                    "start_long": Decimal(record.get("GPS_START_LO", "0.00")),
+                    "start_lat": Decimal(record.get("GPS_START_LA", "0.00")),
+                    "end_long": Decimal(record.get("GPS_END_LO", "0.00")),
+                    "end_lat": Decimal(record.get("GPS_END_LA", "0.00")),
+
+                    # Number of services
+                    "num_service": int(record.get("NUM_SERVICE", 1)),
+
+                    # Transaction Date
+                    "transaction_date": self._parse_datetime(record.get("END_DATE")),
                 }
-
-            # Step 2: Download and parse XML files
-            all_trips_data = {}
-            parse_errors = []
-
-            # Process transaction files
-            for s3_key in s3_files["transactions"]:
-                try:
-                    xml_content = self._download_and_parse_xml_from_s3(s3_key)
-                    normalized_trans = self._parse_and_normalize_trips(xml_content)
-
-                    # Deduplicate using dictionary
-                    for trip in normalized_trans:
-                        all_trips_data[trip["curb_trip_id"]] = trip
-
-                    logger.info(
-                        f"Parsed {len(normalized_trans)} transactions from {s3_key}"
-                    )
-
-                except Exception as e:
-                    logger.error(f"Failed to process {s3_key}: {e}")
-                    parse_errors.append({"file": s3_key, "error": str(e)})
-
-            # Process trip files
-            for s3_key in s3_files["trips"]:
-                try:
-                    xml_content = self._download_and_parse_xml_from_s3(s3_key)
-                    normalized_trips = self._parse_and_normalize_trips(xml_content, filter_cash_only=True)
-
-                    # Deduplicate using dictionary
-                    for trip in normalized_trips:
-                        all_trips_data[trip["curb_trip_id"]] = trip
-
-                    logger.info(f"Parsed {len(normalized_trips)} trips from {s3_key}")
-
-                except Exception as e:
-                    logger.error(f"Failed to process {s3_key}: {e}")
-                    parse_errors.append({"file": s3_key, "error": str(e)})
-
-            final_trip_list = list(all_trips_data.values())
-            logger.info(
-                f"Fetched a total of {len(final_trip_list)} unique records from S3."
-            )
-
-            # Step 3: Store data in database
-            inserted, updated = self.repo.bulk_insert_or_update(final_trip_list)
-            self.db.commit()
-            logger.info(
-                f"Database operation complete: {inserted} new trips inserted, {updated} trips updated."
-            )
-
-            # Step 4: Reconcile trips
-            unreconciled_trips = self.repo.get_unreconciled_trips()
-            reconciled_count = 0
-            reconciliation_id = None
-
-            if unreconciled_trips:
-                if settings.environment == "production":
-                    logger.info(
-                        "Reconciling with CURB server (production environment)."
-                    )
-                    trip_ids_to_reconcile = [
-                        trip.curb_trip_id.split("-")[-1] for trip in unreconciled_trips
-                    ]
-                    reconciliation_id = f"BAT-S3-RECO-{dt.datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-                    try:
-                        self.api_service.reconcile_trips(
-                            trip_ids_to_reconcile, reconciliation_id
-                        )
-                        # Update status in local DB after successful API call
-                        for trip in unreconciled_trips:
-                            self.repo.update_trip_status(
-                                trip.id, CurbTripStatus.RECONCILED, reconciliation_id
-                            )
-                        self.db.commit()
-                        reconciled_count = len(unreconciled_trips)
-                        logger.info(
-                            f"Successfully reconciled {reconciled_count} trips with CURB API."
-                        )
-                    except CurbApiError as e:
-                        self.db.rollback()
-                        logger.error(f"Failed to reconcile trips with CURB API: {e}")
-                        parse_errors.append(
-                            {"reconciliation": "failed", "error": str(e)}
-                        )
-                else:
-                    reconciled_count = self._reconcile_locally(unreconciled_trips)
-
-            datetime_format = (
-                f"{settings.common_date_format} {settings.common_time_format}"
-            )
-            return {
-                "source": "s3",
-                "datetime_range": {
-                    "from": start_datetime.strftime(datetime_format),
-                    "to": end_datetime.strftime(datetime_format),
-                },
-                "files_processed": {
-                    "transactions": len(s3_files["transactions"]),
-                    "trips": len(s3_files["trips"]),
-                },
-                "records_fetched": len(final_trip_list),
-                "newly_inserted": inserted,
-                "records_updated": updated,
-                "records_reconciled": reconciled_count,
-                "reconciliation_id": reconciliation_id,
-                "parse_errors": parse_errors,
-            }
-
-        except Exception as e:
-            self.db.rollback()
-            logger.error(
-                "An unexpected error occurred during S3 import: %s", e, exc_info=True
-            )
-            raise
-
-    def _download_and_parse_xml_from_s3(self, s3_key: str) -> str:
+                
+                trips.append(trip)
+            
+            logger.info(f"Parsed {len(trips)} trips from GET_TRIPS_LOG10 XML")
+            return trips
+            
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse GET_TRIPS_LOG10 XML: {e}")
+            raise CurbDataParsingError(f"XML parsing failed: {e}") from e
+        
+    def _parse_transactions_xml(self, xml_response: str, account_id: int) -> List[Dict]:
         """
-        Download XML file from S3 and return its contents.
-
-        Args:
-            s3_key: S3 object key
-
+        Parse CURB Get_Trans_By_Date_Cab12 XML response
+        
+        Extracts credit card and other non-cash transactions.
+        
         Returns:
-            XML content as string
+            List of transaction dictionaries
         """
-        logger.debug(f"Downloading XML from S3: {s3_key}")
-
         try:
-            # Download file from S3
-            file_content = s3_utils.download_file(key=s3_key)
+            # Parse outer SOAP envelope
+            root = ET.fromstring(xml_response)
+            transactions = []
+            
+            # Extract the inner XML from Get_Trans_By_Date_Cab12Result element
+            result_element = root.find(".//{https://www.taxitronic.org/VTS_SERVICE/}Get_Trans_By_Date_Cab12Result")
+            
+            if result_element is None or not result_element.text:
+                logger.warning("No Get_Trans_By_Date_Cab12Result found in response")
+                return []
+            
+            # Parse the inner XML (trans/tran elements are in the text content)
+            inner_xml = result_element.text
+            inner_root = ET.fromstring(f"<root>{inner_xml}</root>")  # Wrap in root to parse properly
+            
+            # Now find tran elements (no namespace in inner XML)
+            for tran in inner_root.findall(".//tran"):
+                # Get ROWID attribute (unique transaction ID)
+                rowid = tran.get("ROWID", "")
+                
+                # Extract nested elements
+                trip_date = self._get_element_text(tran, "TRIPDATE")
+                trip_time_start = self._get_element_text(tran, "TRIPTIMESTART")
+                trip_time_end = self._get_element_text(tran, "TRIPTIMEEND")
+                
+                # Combine date and time
+                start_time = self._parse_transaction_datetime(trip_date, trip_time_start)
+                end_time = self._parse_transaction_datetime(trip_date, trip_time_end)
+                
+                # Map CC_TYPE to payment type
+                cc_type = self._get_element_text(tran, "CC_TYPE")
+                payment_type = self._map_cc_type_to_payment(cc_type)
+                
+                transaction = {
+                    "account_id": account_id,
+                    "curb_trip_id": f"TRANS-{rowid}",  # Use ROWID as unique ID
+                    "curb_driver_id": self._get_element_text(tran, "TRIPDRIVERID"),
+                    "curb_cab_number": self._get_element_text(tran, "CABNUMBER"),
+                    "status": CurbTripStatus.IMPORTED,
+                    "payment_type": payment_type,
+                    
+                    # Timestamps
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    
+                    # Financial amounts
+                    "fare": Decimal(self._get_element_text(tran, "TRIPTRIPS", "0.00")),
+                    "tips": Decimal(self._get_element_text(tran, "TRIPTIPS", "0.00")),
+                    "tolls": Decimal(self._get_element_text(tran, "TRIPTOLL", "0.00")),
+                    "extras": Decimal(self._get_element_text(tran, "TRIPEXTRAS", "0.00")),
+                    "total_amount": Decimal(self._get_element_text(tran, "AMOUNT", "0.00")),
+                    
+                    # Tax breakdown
+                    "surcharge": Decimal(self._get_element_text(tran, "TAX", "0.00")),
+                    "improvement_surcharge": Decimal(self._get_element_text(tran, "IMPTAX", "0.00")),
+                    "congestion_fee": Decimal(self._get_element_text(tran, "CongFee", "0.00")),
+                    "airport_fee": Decimal(self._get_element_text(tran, "airportFee", "0.00")),
+                    "cbdt_fee": Decimal(self._get_element_text(tran, "cbdt", "0.00")),
+                    
+                    # Additional data
+                    "distance_miles": Decimal(self._get_element_text(tran, "TRIPDIST", "0.00")),
+                    "num_passengers": 1,  # Not provided in transaction data
 
-            if file_content is None:
-                raise Exception(f"Failed to download file from S3: {s3_key}")
+                    # Coordinates (not provided in transaction data)
+                    "start_long": Decimal(self._get_element_text(tran, "From_Lo", "0.00")),
+                    "start_lat": Decimal(self._get_element_text(tran, "From_La", "0.00")),
+                    "end_long": Decimal(self._get_element_text(tran, "To_Lo", "0.00")),
+                    "end_lat": Decimal(self._get_element_text(tran, "To_La", "0.00")),
 
-            # If file_content is bytes, decode it
-            if isinstance(file_content, bytes):
-                xml_content = file_content.decode("utf-8")
-            elif isinstance(file_content, BytesIO):
-                xml_content = file_content.getvalue().decode("utf-8")
-            else:
-                xml_content = str(file_content)
+                    # Number of services (not provided in transaction data)
+                    "num_service": self._get_element_text(tran, "NUM_SERVICE", 1),
 
-            logger.debug(
-                f"Successfully downloaded {len(xml_content)} bytes from {s3_key}"
-            )
-            return xml_content
-
-        except Exception as e:
-            logger.error(f"Error downloading/parsing XML from S3: {e}", exc_info=True)
-            raise
-
-    def _list_s3_files_by_datetime_range(
-        self, start_datetime: dt.datetime, end_datetime: dt.datetime
-    ) -> Dict[str, List[str]]:
+                    # Transaction Date
+                    "transaction_date": self._parse_datetime(self._get_element_text(tran, "DATETIME")),
+                }
+                
+                transactions.append(transaction)
+            
+            logger.info(f"Parsed {len(transactions)} transactions from Get_Trans_By_Date_Cab12 XML")
+            return transactions
+            
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse Get_Trans_By_Date_Cab12 XML: {e}")
+            raise CurbDataParsingError(f"Transaction XML parsing failed: {e}") from e
+        
+    def _get_element_text(self, parent: ET.Element, tag_name: str, default: str = "") -> str:
+        """Helper to safely extract text from XML element (no namespace for inner transaction XML)"""
+        element = parent.find(f".//{tag_name}")
+        if element is not None and element.text:
+            return element.text.strip()
+        return default
+    
+    def _map_payment_type(self, type_code: str) -> PaymentType:
         """
-        List XML files from S3 within a datetime range.
-        Lists all buckets and filters based on timestamp in bucket names.
-        Folder structure: curb-data/MM-DD-YYYY/HH-MM-SS/
-
+        Map GET_TRIPS_LOG10 T attribute to PaymentType enum
+        
+        T values:
+        - "$" = CASH
+        - "C" = CCARD (credit card/mobile)
+        - "P" = PRIVATE CARD
+        """
+        mapping = {
+            "$": PaymentType.CASH,
+            "C": PaymentType.CREDIT_CARD,
+            "P": PaymentType.CREDIT_CARD,  # Private cards treated as credit
+        }
+        return mapping.get(type_code, PaymentType.UNKNOWN)
+    
+    def _map_cc_type_to_payment(self, cc_type: str) -> PaymentType:
+        """
+        Map Get_Trans_By_Date_Cab12 CC_TYPE to PaymentType enum
+        
+        CC_TYPE values from documentation:
+        1 = Visa, 2 = AMEX, 3 = Mastercard, 4 = Discover, 5 = Diners Club,
+        6 = JCB, 7 = VeriPay, 8 = Debit, 9 = PayPal, 10 = Other, 
+        11 = Split, 12 = Virtual Card
+        
+        All are considered credit card transactions
+        """
+        return PaymentType.CREDIT_CARD
+    
+    def _parse_transaction_datetime(self, date_str: str, time_str: str) -> datetime:
+        """
+        Parse transaction date and time into datetime
+        
         Args:
-            start_datetime: Start datetime
-            end_datetime: End datetime
-
-        Returns:
-            Dictionary with 'transactions' and 'trips' lists of S3 keys
+            date_str: Date in MM/DD/YYYY format
+            time_str: Time in HH:MM format
         """
-        logger.info(f"Listing S3 files from {start_datetime} to {end_datetime}")
-
-        transactions_files = []
-        trips_files = []
-
         try:
-            # List all files under the curb-data folder
-            prefix = f"{settings.curb_s3_folder}/"
-            all_files = s3_utils.list_files(prefix=prefix)
-
-            logger.debug(f"Found {len(all_files)} total files in {prefix}")
-
-            # Filter files based on datetime range from bucket names
-            for file_key in all_files:
-                # Skip metadata files
-                if "/metadata/" in file_key or not file_key.endswith(".xml"):
-                    continue
-
-                # Extract date and time from path: curb-data/09-21-2025/12-00-00/file.xml
-                path_parts = file_key.split("/")
-                if len(path_parts) < 3:
-                    continue
-
-                folder_date = path_parts[-3]  # e.g., "09-21-2025"
-                folder_time = path_parts[-2]  # e.g., "12-00-00"
-
-                # Convert folder names back to datetime for comparison
-                try:
-                    # Replace dashes with slashes for date, and colons for time
-                    date_str = folder_date.replace("-", "/")
-                    time_str = folder_time.replace("-", ":")
-
-                    # Parse using settings formats
-                    datetime_str = f"{date_str} {time_str}"
-                    datetime_format = (
-                        f"{settings.common_date_format} {settings.common_time_format}"
-                    )
-                    file_datetime = dt.datetime.strptime(datetime_str, datetime_format)
-
-                    # Check if file datetime is within range
-                    if start_datetime <= file_datetime <= end_datetime:
-                        if "transactions_" in file_key:
-                            transactions_files.append(file_key)
-                        elif "trips_" in file_key:
-                            trips_files.append(file_key)
-
-                except ValueError as e:
-                    logger.warning(
-                        f"Failed to parse datetime from path {file_key}: {e}"
-                    )
-                    continue
-
+            # Combine date and time
+            datetime_str = f"{date_str} {time_str}:00"
+            return datetime.strptime(datetime_str, "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc)
+        except:
+            return datetime.now(timezone.utc)
+        
+    def _parse_datetime(self, date_str: str) -> datetime:
+        """Parse CURB datetime string: MM/DD/YYYY HH:MM:SS"""
+        try:
+            return datetime.strptime(date_str, "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc)
+        except:
+            return datetime.now(timezone.utc)
+        
+    def _map_trip_to_entities(self, trip: Dict) -> Dict:
+        """
+        Map CURB identifiers to internal driver/lease/vehicle/medallion
+        
+        Logic:
+        1. Find driver by curb_driver_id (matches TLC license number)
+        2. Find active lease for that driver at trip start time
+        3. Get vehicle and medallion from the lease
+        """
+        driver_id = None
+        lease_id = None
+        vehicle_id = None
+        medallion_id = None
+        
+        # Find driver by TLC license matching curb_driver_id
+        driver = self.db.query(Driver).join(Driver.tlc_license).filter(
+            Driver.tlc_license.has(tlc_license_number=trip["curb_driver_id"])
+        ).first()
+        
+        if driver:
+            driver_id = driver.driver_id
+            
+            # Find active lease at trip start time
+            active_lease = lease_service.get_lease(
+                self.db, driver_id=driver_id, medallion_number=trip["curb_cab_number"]
+            )
+            
+            if active_lease:
+                lease_id = active_lease.id
+                vehicle_id = active_lease.vehicle_id
+                medallion_id = active_lease.medallion_id
+        
+            # Update trip with mapped IDs
+            trip["driver_id"] = driver.id
+            trip["lease_id"] = lease_id
+            trip["vehicle_id"] = vehicle_id
+            trip["medallion_id"] = medallion_id
+            
+            return trip
+        return None
+    
+    def _store_to_s3(self, account: CurbAccount, xml_content: str, timestamp: datetime, data_type: str = "trips"):
+        """
+        Store raw XML to S3 data lake
+        
+        Args:
+            account: CURB account
+            xml_content: Raw XML response
+            timestamp: Import timestamp
+            data_type: "trips" or "transactions"
+        """
+        try:
+            # S3 path structure: curb/{data_type}/{account_name}/YYYY-MM-DD-HH/{timestamp}.xml
+            s3_path = (
+                f"curb/{data_type}/{account.account_name}/"
+                f"{timestamp.strftime('%Y-%m-%d-%H')}/"
+                f"{timestamp.strftime('%Y%m%d%H%M%S')}.xml"
+            )
+            
+            xml_bytes = xml_content.encode('utf-8')
+            file_obj = BytesIO(xml_bytes)
+            
+            s3_utils.upload_file(file_obj, s3_path, content_type="application/xml")
+            logger.info(f"Stored {data_type} XML to S3: {s3_path}")
+            
         except Exception as e:
-            logger.error(f"Failed to list files from S3: {e}", exc_info=True)
-            raise
+            logger.error(f"Failed to store {data_type} to S3: {e}")
+            # Don't fail the import if S3 fails
 
-        logger.info(
-            f"Found {len(transactions_files)} transaction files and {len(trips_files)} trip files in datetime range"
-        )
+    # --- RECONCILIATION ---
 
-        return {"transactions": transactions_files, "trips": trips_files}
-
-
-# --- Celery Tasks ---
-
-@app.task(
-    bind=True,
-    name="curb.post_earnings_to_ledger",
-    max_retries=3,
-    default_retry_delay=60,
-)
-def post_earnings_to_ledger_task(
-    self,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    lease_id: Optional[int] = None,
-    driver_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Celery task to post MAPPED credit card earnings to the centralized ledger.
-
-    This task is designed to run as part of the Sunday financial processing chain.
-    It finds all MAPPED credit card trips for the specified period and posts them
-    as earnings (CREDIT entries) to the ledger, applying them against open balances.
-
-    Args:
-        start_date: Start date in YYYY-MM-DD format (defaults to previous Sunday)
-        end_date: End date in YYYY-MM-DD format (defaults to previous Saturday)
-        lease_id: Optional filter for specific lease
-        driver_id: Optional filter for specific driver
-
-    Returns:
-        Dictionary with posting results including:
-        - drivers_processed: Number of unique drivers processed
-        - trips_posted: Number of trips successfully posted
-        - total_amount_posted: Total dollar amount posted to ledger
-        - errors: List of any posting errors
-
-    Example:
-        {
-            "drivers_processed": 25,
-            "trips_posted": 150,
-            "total_amount_posted": 12500.75,
+    def _handle_reconciliation(self, accounts: List[CurbAccount]) -> Dict:
+        """Handle reconciliation for all accounts based on their config"""
+        results = {
+            "server_reconciled": 0,
+            "local_reconciled": 0,
+            "total_reconciled": 0,
             "errors": []
         }
-    """
-    from app.core.db import SessionLocal
-    import datetime as dt
-    from datetime import timedelta
+        
+        for account in accounts:
+            try:
+                if account.reconciliation_mode == ReconciliationMode.SERVER:
+                    count = self._reconcile_with_server(account)
+                    results["server_reconciled"] += count
+                else:
+                    count = self._reconcile_locally(account)
+                    results["local_reconciled"] += count
+                
+                results["total_reconciled"] += count
+                
+            except Exception as e:
+                logger.error(f"Reconciliation failed for {account.account_name}: {e}")
+                results["errors"].append({
+                    "account": account.account_name,
+                    "error": str(e)
+                })
+        
+        return results
+    
+    def _reconcile_with_server(self, account: CurbAccount) -> int:
+        """Reconcile trips with CURB API (server-side)"""
+        # Get unreconciled trips for this account
+        trips = self.db.query(CurbTrip).filter(
+            and_(
+                CurbTrip.account_id == account.id,
+                CurbTrip.reconciliation_id.is_(None)
+            )
+        ).limit(1000).all()  # Batch size
+        
+        if not trips:
+            return 0
+        
+        # Extract CURB trip IDs (format: PERIOD-ID, we need just ID)
+        trip_ids = [trip.curb_trip_id.split('-')[1] for trip in trips]
+        reconciliation_id = f"BAT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        
+        try:
+            api_service = CurbApiService(account)
+            api_service.reconcile_trips(trip_ids, reconciliation_id)
+            
+            # Mark as reconciled in database
+            internal_trip_ids = [trip.id for trip in trips]
+            count = self.repo.mark_trips_as_reconciled(internal_trip_ids, reconciliation_id)
+            self.db.commit()
+            
+            logger.info(f"Server reconciled {count} trips for {account.account_name}")
+            return count
+            
+        except Exception as e:
+            self.db.rollback()
+            raise CurbReconciliationError(f"Server reconciliation failed: {e}")
+        
+    def _reconcile_locally(self, account: CurbAccount) -> int:
+        """Mark trips as reconciled locally (no API call)"""
+        trips = self.db.query(CurbTrip).filter(
+            and_(
+                CurbTrip.account_id == account.id,
+                CurbTrip.reconciliation_id.is_(None)
+            )
+        ).limit(1000).all()
+        
+        if not trips:
+            return 0
+        
+        reconciliation_id = f"LOCAL-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        trip_ids = [trip.id for trip in trips]
+        
+        count = self.repo.mark_trips_as_reconciled(trip_ids, reconciliation_id)
+        self.db.commit()
+        
+        logger.info(f"Locally reconciled {count} trips for {account.account_name}")
+        return count
 
-    logger.info("*" * 80)
-    logger.info("Starting CURB earnings posting task")
+    # --- LEDGER POSTING ---
 
-    db = None
-    try:
-        # Initialize database session and service
-        db = SessionLocal()
-        curb_service = CurbService(db)
-
-        # Calculate date range if not provided (previous Sunday to Saturday)
-        if not start_date or not end_date:
-            now = dt.datetime.now()
-            # Find last Sunday (week starts on Sunday)
-            days_since_sunday = (now.weekday() + 1) % 7  # Monday=0 becomes 1, Sunday=6 becomes 0
-            last_sunday = now - timedelta(days=days_since_sunday + 7)  # Go back to previous Sunday
-            last_saturday = last_sunday + timedelta(days=6)  # End of that week
-
-            if not start_date:
-                start_date = last_sunday.strftime("%Y-%m-%d")
-            if not end_date:
-                end_date = last_saturday.strftime("%Y-%m-%d")
-
-        # Convert string dates to date objects
-        start_date_obj = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
-        end_date_obj = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
-
-        logger.info(f"Posting earnings for period: {start_date_obj} to {end_date_obj}")
-        if lease_id:
-            logger.info(f"Filtering by lease ID: {lease_id}")
-        if driver_id:
-            logger.info(f"Filtering by driver ID: {driver_id}")
-
-        # Post earnings to ledger
-        result = curb_service.post_mapped_earnings_to_ledger(
-            start_date=start_date_obj,
-            end_date=end_date_obj,
-            lease_id=lease_id,
-            driver_id=driver_id
+    def post_trips_to_ledger(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        driver_ids: Optional[List[int]] = None,
+        lease_ids: Optional[List[int]] = None,
+    ) -> Dict:
+        """
+        Post individual CASH trips to ledger as CREDIT postings
+        
+        Each trip becomes a separate ledger entry:
+        - Category: EARNINGS
+        - Entry Type: CREDIT
+        - Reference ID: CURB-TRIP-{curb_trip_id}
+        - Amount: total_amount (negative for credit)
+        
+        Process:
+        1. Get trips with status IMPORTED and mapped to driver/lease
+        2. For each trip, create ledger posting
+        3. Update trip status to POSTED_TO_LEDGER
+        """
+        logger.info(f"Posting CURB trips to ledger from {start_date} to {end_date}")
+        
+        # Get trips ready for posting
+        trips = self.repo.get_trips_ready_for_ledger(
+            start_date, end_date, driver_ids, lease_ids
         )
-
-        logger.info(
-            f"Earnings posting completed: {result.get('drivers_processed', 0)} drivers processed, "
-            f"${result.get('total_amount_posted', 0.0)} posted to ledger"
-        )
-
-        logger.info("*" * 80)
-        return result
-
-    except Exception as e:
-        logger.error(f"Earnings posting task failed: {str(e)}", exc_info=True)
-        if db:
-            db.rollback()
-        raise self.retry(exc=e, countdown=60)
-
-    finally:
-        if db:
-            db.close()
-
+        
+        if not trips:
+            return {
+                "status": "no_trips",
+                "message": "No trips ready for ledger posting",
+                "trips_processed": 0,
+            }
+        
+        posted_count = 0
+        failed_count = 0
+        postings_created = []
+        errors = []
+        total_amount = Decimal("0.00")
+        
+        for trip in trips:
+            try:
+                # Create individual ledger posting for this trip
+                reference_id = f"CURB-TRIP-{trip.curb_trip_id}"
+                
+                posting, balance = self.ledger_service.create_obligation(
+                    category=PostingCategory.EARNINGS,
+                    amount=trip.total_amount,  # Positive amount
+                    entry_type=EntryType.CREDIT,  # CREDIT for earnings
+                    reference_id=reference_id,
+                    driver_id=trip.driver_id,
+                    lease_id=trip.lease_id,
+                    vehicle_id=trip.vehicle_id,
+                    medallion_id=trip.medallion_id,
+                )
+                
+                # Update trip status
+                self.repo.update_trip_status(
+                    trip.id,
+                    CurbTripStatus.POSTED_TO_LEDGER,
+                    ledger_posting_ref=reference_id
+                )
+                
+                posted_count += 1
+                total_amount += trip.total_amount
+                postings_created.append({
+                    "trip_id": trip.curb_trip_id,
+                    "driver_id": trip.driver_id,
+                    "amount": float(trip.total_amount),
+                    "posting_id": posting.id,
+                })
+                
+                logger.debug(f"Posted trip {trip.curb_trip_id} to ledger: ${trip.total_amount}")
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Failed to post trip {trip.curb_trip_id}: {e}", exc_info=True)
+                errors.append({
+                    "trip_id": trip.curb_trip_id,
+                    "error": str(e)
+                })
+        
+        self.db.commit()
+        
+        return {
+            "status": "success",
+            "message": f"Posted {posted_count} trips to ledger",
+            "date_range": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat()
+            },
+            "trips_processed": len(trips),
+            "trips_posted_to_ledger": posted_count,
+            "trips_failed": failed_count,
+            "total_amount_posted": float(total_amount),
+            "postings_created": postings_created[:10],  # First 10 for summary
+            "errors": errors,
+        } 

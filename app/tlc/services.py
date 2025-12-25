@@ -60,7 +60,7 @@ class TLCService:
                 violation_type=TLCViolationType(violation_data["violation_type"]),
                 issue_date=violation_data["issue_date"],
                 issue_time=violation_data.get("issue_time"),
-                description=violation_data.get("description"),
+                ea_reason=violation_data.get("ea_reason"),
                 amount=Decimal(violation_data["amount"]),
                 service_fee=Decimal(violation_data.get("service_fee", settings.tlc_service_fee)),
                 total_payable=total_payable,

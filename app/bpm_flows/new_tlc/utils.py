@@ -28,8 +28,8 @@ def format_tlc_violation(db: Session, tlc_violation: TLCViolation):
         "due_date": iso(tlc_violation.due_date),
 
         # Details
-        "violation_type": getattr(tlc_violation.violation_type, "value", None),
-        "description": tlc_violation.description,
+        "violation_type": tlc_violation.violation_type,
+        "ea_reason": tlc_violation.ea_reason,
 
         # Amounts (safe float conversion)
         "amount": float(tlc_violation.amount) if tlc_violation.amount is not None else None,

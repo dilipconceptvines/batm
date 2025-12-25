@@ -80,8 +80,8 @@ class Settings(BaseSettings):
     # Redis base fields (for .env / local)
     redis_host: str
     redis_port: str
-    redis_username: str
-    redis_password: str
+    redis_username: Optional[str] = None
+    redis_password: Optional[str] = None
 
     # DB values remain normal fields (support .env)
     db_host: str
@@ -125,14 +125,6 @@ class Settings(BaseSettings):
     medallion_designation_template_id: str = None
     power_of_attorney_template_id: str = None
     additional_driver_template_id: str = None
-
-    curb_url: str = None
-    curb_merchant: str = None
-    curb_username: str = None
-    curb_password: str = None
-    curb_s3_folder: str = None
-    curb_results_s3_folder: str = None
-    curb_import_window_minutes: int = None
 
     secret_key: str = None
     algorithm: str = None
@@ -276,8 +268,9 @@ class Settings(BaseSettings):
         else:
             logger.info("🧠 Redis config source: .env / environment variables")
 
-        host = data.get("REDIS_HOST") or self.redis_host
-        port = data.get("REDIS_PORT") or self.redis_port
+        # Use explicit defaults for localhost development
+        host = data.get("REDIS_HOST") or self.redis_host or "localhost"
+        port = data.get("REDIS_PORT") or self.redis_port or "6379"
         username = data.get("REDIS_USERNAME") or self.redis_username
         password = data.get("REDIS_PASSWORD") or self.redis_password
 

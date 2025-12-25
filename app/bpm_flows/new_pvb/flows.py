@@ -15,7 +15,7 @@ from app.drivers.services import driver_service
 from app.leases.services import lease_service
 from app.vehicles.services import vehicle_service
 from app.medallions.services import medallion_service
-from app.pvb.models import PVBViolation, PVBViolationStatus, PVBSource
+from app.pvb.models import PVBViolation, PVBViolationStatus, PVBSource , PVBDisposition
 from app.pvb.services import PVBService
 from app.pvb.tasks import post_pvb_violations_to_ledger_task
 from app.uploads.services import upload_service
@@ -66,7 +66,6 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: Dict[str, Any] =
                     db, 
                     driver_id=driver.driver_id, 
                     status="Active", 
-                    exclude_additional_drivers=True, 
                     multiple=True
                 )
 
@@ -82,11 +81,8 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: Dict[str, Any] =
             if active_leases and active_leases[0]:
                 # Get primary driver from first lease
                 first_lease = active_leases[0][0] if isinstance(active_leases[0], list) else active_leases[0]
-                for lease_driver in first_lease.lease_driver:
-                    if not lease_driver.is_additional_driver:
-                        driver = lease_driver.driver
-                        break
-        
+                driver = first_lease.driver[0] if first_lease.driver else None
+
         # Search by Vehicle Plate Number
         elif vehicle_plate_no:
             # Extract plate and state if format is "PLATE-STATE"
@@ -104,10 +100,7 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: Dict[str, Any] =
             )
             if active_leases and active_leases[0]:
                 first_lease = active_leases[0][0] if isinstance(active_leases[0], list) else active_leases[0]
-                for lease_driver in first_lease.lease_driver:
-                    if not lease_driver.is_additional_driver:
-                        driver = lease_driver.driver
-                        break
+                driver = first_lease.driver[0] if first_lease.driver else None
         
         if not driver:
             logger.info("No driver found for PVB case", case_no=case_no)
@@ -143,11 +136,6 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: Dict[str, Any] =
         # Format lease data for UI
         formatted_leases = []
         for lease in lease_list:
-            driver_lease = lease_service.get_lease_drivers(db=db , lease_id=lease.id , driver_id=driver.driver_id , is_additional_driver=False)
-
-            if not driver_lease:
-                continue
-            
             medallion_owner = format_medallion_response(lease.medallion).get("medallion_owner" , "N/A") if lease.medallion else "N/A"
             formatted_leases.append({
                 "id": lease.id,
@@ -240,18 +228,6 @@ def choose_driver_process(db: Session, case_no: str, step_data: Dict[str, Any]):
         if not lease:
             raise HTTPException(status_code=404, detail="Active lease not found")
         
-        # Verify driver is the primary driver on the lease
-        is_primary_driver = False
-        for lease_driver in lease.lease_driver:
-            if lease_driver.driver_id == driver.driver_id and not lease_driver.is_additional_driver:
-                is_primary_driver = True
-                break
-        
-        if not is_primary_driver:
-            raise HTTPException(
-                status_code=400, 
-                detail="Driver is not the primary driver on the selected lease"
-            )
         
         vehicle = vehicle_service.get_vehicles(
             db=db , vehicle_id=vehicle_id, plate_number=vehicle_plate_no
@@ -279,7 +255,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: Dict[str, Any]):
         payment = Decimal(step_data.get("payment" , 0))
         processing_fee = 0
 
-        if fine <= 50:
+        if fine <= 50 and fine > 0:
             processing_fee = Decimal(5)
         elif fine > 50:
             processing_fee = Decimal(7)
@@ -313,6 +289,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: Dict[str, Any]):
                 violation.interest = interest
                 violation.reduction = reduction
                 violation.amount_due = amount_due
+                violation.disposition = step_data.get("disposition" , PVBDisposition.PAID.value)
                 violation.violation_code = step_data.get("violation_code" , None)
                 violation.violation_country = step_data.get("violation_country" , None)
                 violation.street_name = step_data.get("street_name" , None)
@@ -332,6 +309,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: Dict[str, Any]):
                 violation.new_issue = step_data.get("new_issue" , False)
                 violation.hearing_ind = step_data.get("hearing" , None)
                 violation.penalty_warning = step_data.get("penalty_warning" , None)
+                violation.note = step_data.get("note" , None)
 
 
                 db.flush()
@@ -356,6 +334,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: Dict[str, Any]):
                 "interest": interest,
                 "reduction": reduction,
                 "amount_due": amount_due,
+                "disposition": step_data.get("disposition" , PVBDisposition.PAID.value),
                 "violation_code": step_data.get("violation_code" , None),
                 "violation_country": step_data.get("violation_country" , None),
                 "street_name": step_data.get("street_name" , None),
@@ -374,7 +353,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: Dict[str, Any]):
                 "new_issue": step_data.get("new_issue" , False),
                 "hearing_ind": step_data.get("hearing" , None),
                 "penalty_warning": step_data.get("penalty_warning" , None),
-
+                "note": step_data.get("note" , None)
             }
             
             violation = pvb_service.create_manual_violation(case_no, initial_data, 1)

@@ -146,7 +146,10 @@ class PVBRepository:
         source: Optional[str] = None,
         violation_code: Optional[str] = None,
         violation_country: Optional[str] = None,
-        street_name: Optional[str] = None
+        street_name: Optional[str] = None,
+        disposition: Optional[str] = None,
+        from_reduce_to: Optional[float] = None,
+        to_reduce_to: Optional[float] = None,
     ) -> Tuple[List[PVBViolation], int]:
         """
         Retrieves a paginated, sorted, and filtered list of PVB violations.
@@ -268,6 +271,16 @@ class PVBRepository:
         if street_name:
             query = apply_multi_filter(query, PVBViolation.street_name, street_name)
 
+        if disposition:
+            dispos = [s.strip() for s in disposition.split(',') if s.strip()]
+            query = query.filter(PVBViolation.disposition.in_(dispos))
+
+        if from_reduce_to:
+            query = query.filter(PVBViolation.reduce_to >= from_reduce_to)
+
+        if to_reduce_to:
+            query = query.filter(PVBViolation.reduce_to <= to_reduce_to)
+
 
         total_items = query.with_entities(func.count(PVBViolation.id)).scalar()
 
@@ -295,6 +308,7 @@ class PVBRepository:
             "violation_code": PVBViolation.violation_code,
             "violation_country": PVBViolation.violation_country,
             "street_name": PVBViolation.street_name,
+            "disposition": PVBViolation.disposition,
         }
         
         if sort_by and sort_order:

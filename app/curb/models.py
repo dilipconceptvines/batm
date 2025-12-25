@@ -1,4 +1,13 @@
-### app/curb/models.py
+# app/curb/models.py
+
+"""
+CURB Data Models - Simplified Architecture
+
+This module defines the database models for CURB trip management:
+1. CurbAccount: Multi-account configuration support
+2. CurbTrip: Simplified trip storage with 2-status flow
+3. Enums: Clean status and payment type definitions
+"""
 
 from datetime import datetime
 from decimal import Decimal
@@ -6,12 +15,8 @@ from enum import Enum as PyEnum
 from typing import Optional
 
 from sqlalchemy import (
-    DateTime,
-    Enum,
-    ForeignKey,
-    Integer,
-    Numeric,
-    String,
+    DateTime, Enum, ForeignKey, Integer, Numeric,
+    String, Boolean, Index
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -20,29 +25,96 @@ from app.users.models import AuditMixin
 
 
 class CurbTripStatus(str, PyEnum):
-    """Enumeration for the status of a CURB trip record."""
-
-    UNRECONCILED = "UNRECONCILED"
-    RECONCILED = "RECONCILED"
-    MAPPED = "MAPPED"
+    """
+    Simplified 2-status flow for trip processing
+    
+    IMPORTED: Raw data from CURB API stored in database
+    POSTED_TO_LEDGER: Individual trip posted as ledger CREDIT entry
+    """
+    IMPORTED = "IMPORTED"
     POSTED_TO_LEDGER = "POSTED_TO_LEDGER"
-    ERROR = "ERROR"
 
 
 class PaymentType(str, PyEnum):
-    """Enumeration for the trip's payment type."""
-
+    """Payment method for trip (we only store CASH trips)"""
     CASH = "CASH"
-    CREDIT_CARD = "CREDIT_CARD"
-    PRIVATE = "PRIVATE"
+    CREDIT_CARD = "CREDIT_CARD"  # For reference, but we don't import these
     UNKNOWN = "UNKNOWN"
+
+
+class ReconciliationMode(str, PyEnum):
+    """Per-account reconciliation configuration"""
+    SERVER = "server"  # Use CURB API Reconciliation_TRIP_LOG
+    LOCAL = "local"    # Mark as reconciled locally only
+
+
+class CurbAccount(Base, AuditMixin):
+    """
+    Multi-account CURB configuration
+    
+    Supports multiple CURB accounts with individual reconciliation settings.
+    Each account can be configured for server-side or local reconciliation.
+    """
+    
+    __tablename__ = "curb_accounts"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    
+    # Account identification
+    account_name: Mapped[str] = mapped_column(
+        String(100), unique=True, index=True,
+        comment="Friendly name for this CURB account (e.g., 'Production', 'Backup')"
+    )
+    
+    # API credentials
+    merchant_id: Mapped[str] = mapped_column(
+        String(50), nullable=False,
+        comment="CURB Merchant ID"
+    )
+    username: Mapped[str] = mapped_column(
+        String(100), nullable=False,
+        comment="CURB API username"
+    )
+    password: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="CURB API password (store encrypted in production)"
+    )
+    api_url: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        default="https://api.taxitronic.org/vts_service/taxi_service.asmx",
+        comment="CURB API endpoint URL"
+    )
+    
+    # Configuration
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="Whether to fetch data from this account"
+    )
+    reconciliation_mode: Mapped[ReconciliationMode] = mapped_column(
+        Enum(ReconciliationMode, values_callable=lambda x: [e.value for e in x]), 
+        default=ReconciliationMode.LOCAL, nullable=False,
+        comment="How to handle reconciliation for this account"
+    )
+    
+    # Relationships
+    trips: Mapped[list["CurbTrip"]] = relationship(back_populates="account", lazy="select")
+    
+    def __repr__(self):
+        return f"<CurbAccount(id={self.id}, name='{self.account_name}', active={self.is_active})>"
 
 
 class CurbTrip(Base, AuditMixin):
     """
-    Represents a single trip or financial transaction record imported from the CURB API.
-    This table consolidates data from multiple CURB endpoints and links it to the
-    core entities within the BAT Connect system.
+    Simplified CURB trip storage
+    
+    Stores individual CASH trips from GET_TRIPS_LOG10 endpoint.
+    Each trip becomes an individual ledger CREDIT posting.
+    
+    Key improvements:
+    - Only 2 statuses (IMPORTED → POSTED_TO_LEDGER)
+    - Links to source account for multi-account support
+    - Optimized indexes for common queries
+    - Stores only essential financial data
     """
 
     __tablename__ = "curb_trips"
@@ -51,98 +123,135 @@ class CurbTrip(Base, AuditMixin):
 
     # --- Unique Identifiers from Source ---
     curb_trip_id: Mapped[str] = mapped_column(
-        String(255),
-        unique=True,
-        index=True,
+        String(255), unique=True, index=True, nullable=False,
         comment="Unique identifier for the trip from CURB (e.g., ROWID).",
     )
-    curb_period: Mapped[Optional[str]] = mapped_column(
-        String(50), comment="The accounting period from CURB (e.g., '201903')."
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("curb_accounts.id"), nullable=False, index=True,
+        comment="Which CURB account this trip came from"
     )
 
-    # --- Local System Status ---
     status: Mapped[CurbTripStatus] = mapped_column(
-        Enum(CurbTripStatus),
-        nullable=False,
-        default=CurbTripStatus.UNRECONCILED,
-        index=True,
-        comment="The processing status of the trip within the BAT system.",
+        Enum(CurbTripStatus), default=CurbTripStatus.IMPORTED, nullable=False,
+        index=True, comment="Current processing status"
     )
 
     # --- Foreign Key Associations ---
     driver_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("drivers.id"), index=True
+        Integer, ForeignKey("drivers.id"), index=True,
+        comment="Internal driver ID (mapped from curb_driver_id)"
     )
     lease_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("leases.id"), index=True
+        Integer, ForeignKey("leases.id"), index=True,
+        comment="Active lease during this trip"
     )
     vehicle_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("vehicles.id"), index=True
+        Integer, ForeignKey("vehicles.id"), index=True,
+        comment="Vehicle used during the trip"
     )
     medallion_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("medallions.id"), index=True
+        Integer, ForeignKey("medallions.id"), index=True,
+        comment="Medallion associated with the trip"
     )
 
-    # --- Denormalized Identifiers from Source (for reporting and reconciliation) ---
+    # === Raw CURB Identifiers (for mapping) ===
     curb_driver_id: Mapped[str] = mapped_column(
-        String(100), index=True, comment="The raw driver identifier from CURB."
+        String(100), index=True, nullable=False,
+        comment="Driver ID from CURB system"
     )
-    curb_cab_number: Mapped[Optional[str]] = mapped_column(
-        String(100), index=True, comment="The raw cab/medallion number from CURB."
-    )
-    plate: Mapped[Optional[str]] = mapped_column(
-        String(50), comment="Vehicle plate number, if available."
+    curb_cab_number: Mapped[str] = mapped_column(
+        String(100), index=True, nullable=False,
+        comment="Cab/Medallion number from CURB"
     )
 
-    # --- Trip Timestamps ---
+    # === Trip Timestamps ===
     start_time: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), comment="The start date and time of the trip."
+        DateTime(timezone=True), nullable=False, index=True,
+        comment="Trip start datetime (used for 3-hour windowing)"
     )
     end_time: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), comment="The end date and time of the trip."
+        DateTime(timezone=True), nullable=False,
+        comment="Trip end datetime"
     )
 
-    # --- Core Financials ---
+    # === Financial Data (CASH trips only) ===
     fare: Mapped[Decimal] = mapped_column(
-        Numeric(10, 2), comment="Base fare amount."
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Base fare amount"
     )
-    tips: Mapped[Decimal] = mapped_column(Numeric(10, 2), comment="Tip amount.")
-    tolls: Mapped[Decimal] = mapped_column(Numeric(10, 2), comment="Toll charges.")
-    extras: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2), comment="Extra charges."
+    tips: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Tip amount"
+    )
+    tolls: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Toll charges"
+    )
+    extras: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Extra charges"
     )
     total_amount: Mapped[Decimal] = mapped_column(
-        Numeric(10, 2), comment="Total amount charged for the trip."
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"), index=True,
+        comment="Total trip amount"
     )
 
-    # --- Tax & Surcharge Breakdown ---
-    surcharge: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2), comment="State Surcharge (TAX)."
+    # === Tax & Fee Breakdown ===
+    surcharge: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="State Surcharge (MTA Tax)"
     )
-    improvement_surcharge: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2), comment="Improvement Surcharge (IMPTAX / TIF)."
+    improvement_surcharge: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Improvement Surcharge (TIF)"
     )
-    congestion_fee: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2), comment="Congestion Fee (CongFee)."
+    congestion_fee: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Congestion Fee"
     )
-    airport_fee: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2), comment="Airport Fee (airportFee)."
+    airport_fee: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Airport Fee"
     )
-    cbdt_fee: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(10, 2), comment="Congestion Relief Zone Toll (cbdt)."
+    cbdt_fee: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, default=Decimal("0.00"),
+        comment="Congestion Relief Zone Toll (CBDT)"
     )
 
-    # --- Payment & Reconciliation Details ---
+    # === Payment Info ===
     payment_type: Mapped[PaymentType] = mapped_column(
-        Enum(PaymentType), comment="Method of payment (Cash, Credit, etc.)."
+        Enum(PaymentType), default=PaymentType.CASH, nullable=False, index=True,
+        comment="Payment method (we only import CASH)"
     )
+
+    # === Reconciliation Tracking ===
     reconciliation_id: Mapped[Optional[str]] = mapped_column(
-        String(100),
-        comment="The reconciliation identifier sent back to CURB.",
-        index=True,
+        String(100), index=True,
+        comment="Reconciliation batch ID sent to CURB API"
     )
     reconciled_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), comment="Timestamp when the trip was reconciled."
+        DateTime(timezone=True),
+        comment="When this trip was marked as reconciled"
+    )
+
+    # === Ledger Integration ===
+    ledger_posting_ref: Mapped[Optional[str]] = mapped_column(
+        String(255), index=True,
+        comment="Reference ID of the ledger posting created for this trip"
+    )
+    posted_to_ledger_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        comment="When this trip was posted to the ledger"
+    )
+
+    # === Additional Trip Data ===
+    distance_miles: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 2),
+        comment="Trip distance in miles"
+    )
+    num_passengers: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        comment="Number of passengers"
     )
 
     start_long: Mapped[Optional[Decimal]] = mapped_column(
@@ -167,49 +276,63 @@ class CurbTrip(Base, AuditMixin):
     )
 
     # --- Relationships ---
-    driver: Mapped[Optional["Driver"]] = relationship()
-    lease: Mapped[Optional["Lease"]] = relationship()
-    vehicle: Mapped[Optional["Vehicle"]] = relationship()
-    medallion: Mapped[Optional["Medallion"]] = relationship()
+    account: Mapped["CurbAccount"] = relationship(back_populates="trips", lazy="joined")
+    driver: Mapped[Optional["Driver"]] = relationship(lazy="select")
+    lease: Mapped[Optional["Lease"]] = relationship(lazy="select")
+    vehicle: Mapped[Optional["Vehicle"]] = relationship(lazy="select")
+    medallion: Mapped[Optional["Medallion"]] = relationship(lazy="select")
+
+    __table_args__ = (
+        # For datetime window queries with status filtering
+        Index('idx_curb_trip_time_status', 'start_time', 'status'),
+        
+        # For payment type filtering (cash vs credit)
+        Index('idx_curb_payment_status', 'payment_type', 'status'),
+        
+        # For driver-based queries with time ordering
+        Index('idx_curb_driver_time', 'driver_id', 'start_time'),
+        
+        # For lease-based queries
+        Index('idx_curb_lease_time', 'lease_id', 'start_time'),
+        
+        # For account-based filtering
+        Index('idx_curb_account_time', 'account_id', 'start_time'),
+        
+        # For finding unposted trips ready for ledger
+        Index('idx_curb_ready_for_ledger', 'status', 'driver_id', 'start_time'),
+    )
 
     def to_dict(self):
-        """Converts the CurbTrip object to a dictionary."""
+        """Convert trip to dictionary for API responses"""
         return {
             "id": self.id,
             "curb_trip_id": self.curb_trip_id,
+            "account_id": self.account_id,
             "status": self.status.value,
             "driver_id": self.driver_id,
-            "lease_id": self.lease_id,
-            "vehicle_id": self.vehicle_id,
-            "medallion_id": self.medallion_id,
             "curb_driver_id": self.curb_driver_id,
             "curb_cab_number": self.curb_cab_number,
-            "plate": self.plate,
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "end_time": self.end_time.isoformat() if self.end_time else None,
-            "fare": float(self.fare) if self.fare is not None else 0.0,
-            "tips": float(self.tips) if self.tips is not None else 0.0,
-            "tolls": float(self.tolls) if self.tolls is not None else 0.0,
-            "extras": float(self.extras) if self.extras is not None else 0.0,
-            "total_amount": float(self.total_amount)
-            if self.total_amount is not None
-            else 0.0,
-            "surcharge": float(self.surcharge) if self.surcharge is not None else 0.0,
-            "improvement_surcharge": float(self.improvement_surcharge)
-            if self.improvement_surcharge is not None
-            else 0.0,
-            "congestion_fee": float(self.congestion_fee)
-            if self.congestion_fee is not None
-            else 0.0,
-            "airport_fee": float(self.airport_fee)
-            if self.airport_fee is not None
-            else 0.0,
-            "cbdt_fee": float(self.cbdt_fee) if self.cbdt_fee is not None else 0.0,
+            "fare": float(self.fare),
+            "tips": float(self.tips),
+            "tolls": float(self.tolls),
+            "extras": float(self.extras),
+            "total_amount": float(self.total_amount),
+            "surcharge": float(self.surcharge),
+            "improvement_surcharge": float(self.improvement_surcharge),
+            "congestion_fee": float(self.congestion_fee),
+            "airport_fee": float(self.airport_fee),
+            "cbdt_fee": float(self.cbdt_fee),
             "payment_type": self.payment_type.value,
-            "reconciliation_id": self.reconciliation_id,
-            "reconciled_at": self.reconciled_at.isoformat()
-            if self.reconciled_at
-            else None,
-            "created_on": self.created_on.isoformat() if self.created_on else None,
-            "updated_on": self.updated_on.isoformat() if self.updated_on else None,
+            "ledger_posting_ref": self.ledger_posting_ref,
+            "posted_to_ledger_at": self.posted_to_ledger_at.isoformat() if self.posted_to_ledger_at else None,
+            "transaction_date": self.transaction_date.isoformat() if self.transaction_date else None,
+            "start_lat": float(self.start_lat) if self.start_lat else None,
+            "start_long": float(self.start_long) if self.start_long else None,
+            "end_lat": float(self.end_lat) if self.end_lat else None,
+            "end_long": float(self.end_long) if self.end_long else None,
         }
+    
+    def __repr__(self):
+        return f"<CurbTrip(id={self.id}, trip_id='{self.curb_trip_id}', status={self.status.value}, amount={self.total_amount})>"

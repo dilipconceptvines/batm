@@ -16,7 +16,7 @@ from app.drivers.services import driver_service
 from app.vehicles.services import vehicle_service
 from app.medallions.services import medallion_service
 from app.tlc.services import TLCService
-from app.tlc.models import TLCViolation , TLCViolationType , TLCDisposition
+from app.tlc.models import TLCViolation , TLCViolationType , TLCDisposition , EAReason
 from app.uploads.services import upload_service
 from app.utils.logger import get_logger
 from app.medallions.utils import format_medallion_response
@@ -54,18 +54,8 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
 
         violation_data = format_tlc_violation(db , violation)
 
-        violation_tyeps = {
-            TLCViolationType.FI.value : "Failure to Inspect Vehicle",
-            TLCViolationType.FN.value : "Failure to Comply with Notice",
-            TLCViolationType.RF.value : "Reinspection Fee",
-            TLCViolationType.EA.value : [
-                "Air Bag Light",
-                "Defective Light",
-                "Dirty Cab",
-                "Meter Mile Run",
-                "Windshield"
-            ]
-        }
+        violation_tyeps = [vt.value for vt in TLCViolationType]
+        ea_reason = [ea.value for ea in EAReason]
 
         if not case_entity:
             bpm_service.create_case_entity(
@@ -85,7 +75,8 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
                 "driver": None,
                 "leases": [],
                 "tlc_violation": violation_data,
-                "violation_types": violation_tyeps
+                "violation_types": violation_tyeps,
+                "ea_reason": ea_reason
             }
         
         if not active_lease:
@@ -102,7 +93,8 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
                 },
                 "lease": {},
                 "tlc_violation": violation_data,
-                "violation_types": violation_tyeps
+                "violation_types": violation_tyeps,
+                "ea_reason": ea_reason
             }
         
         # Format lease data for UI
@@ -168,6 +160,31 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
         )   
         
         logger.info("Successfully fetched driver and lease details for TLC case", case_no=case_no, driver_id=driver.id)
+
+        altered_documents = upload_service.get_documents(
+            db=db,
+            object_type="tlc",
+            object_id=violation.id,
+            like_document_type="altered_documents",
+            multiple=True
+        )
+
+        if not altered_documents:
+            altered_documents = [
+                 {
+                "document_id": "",
+                "document_name": "",
+                "document_note": "",
+                "document_path": "",
+                "document_type": "altered_document_1",
+                "document_date": "",
+                "document_object_type": "tlc",
+                "document_object_id": violation.id,
+                "document_size": "",
+                "document_uploaded_date": "",
+                "presigned_url": "",
+            }
+            ]
         
         return {
             "data": format_data,
@@ -175,7 +192,9 @@ def choose_driver_fetch(db: Session, case_no: str, case_params: dict = None):
             "other_tlc": other_tlc,
             "tlc_violation": violation_data,
             "violation_types": violation_tyeps,
-            "service_fee": settings.tlc_service_fee
+            "service_fee": settings.tlc_service_fee,
+            "ea_reason": ea_reason,
+            "altered_documents": altered_documents
         }
         
     except Exception as e:
@@ -290,10 +309,11 @@ def choose_driver_process(db: Session, case_no: str, step_data: dict):
                 raise ValueError("TLC disposition cannot be changed from dismissed to paid or reduced")
             
             total_payble = Decimal(step_data.get("driver_payable"))
-
+            disposition_change_date = None
 
             if step_data.get("disposition") == TLCDisposition.REDUCED.value:
                 amount = violation.driver_payable - Decimal(step_data.get("driver_payable"))
+                disposition_change_date = step_data.get("disposition_change_date")
                 ledger_posting = ledger_service.create_obligation(
                     category=PostingCategory.TLC,
                     entry_type= EntryType.CREDIT if amount > 0 else EntryType.DEBIT,
@@ -306,7 +326,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: dict):
                 )
             elif step_data.get("disposition") == TLCDisposition.DISMISSED.value:
                 amount = abs(violation.driver_payable - settings.tlc_service_fee)
-                total_payble = 0
+                disposition_change_date = step_data.get("disposition_change_date")
                 ledger_posting = ledger_service.create_obligation(
                     category=PostingCategory.TLC,
                     entry_type= EntryType.CREDIT if amount > 0 else EntryType.DEBIT,
@@ -324,13 +344,14 @@ def choose_driver_process(db: Session, case_no: str, step_data: dict):
             violation.issue_time = datetime.now().time()
             violation.plate = vehicle_plate_no
             violation.violation_type = step_data.get("ticket_type")
-            violation.description = step_data.get("description")
+            violation.ea_reason = step_data.get("ea_reason")
             violation.amount = Decimal(step_data.get("penalty_amount"))
             violation.service_fee = settings.tlc_service_fee
             violation.total_payable = Decimal(step_data.get("penalty_amount") + settings.tlc_service_fee)
             violation.driver_payable = total_payble
             violation.reduced_tlc_amount = step_data.get("reduced_by")
             violation.disposition = step_data.get("disposition")
+            violation.disposition_change_date = disposition_change_date
             violation.due_date = step_data.get("due_date")
             violation.note = step_data.get("note")
             db.add(violation)
@@ -348,7 +369,7 @@ def choose_driver_process(db: Session, case_no: str, step_data: dict):
                 "issue_time": datetime.now().time(),
                 "plate": vehicle_plate_no,
                 "violation_type": step_data.get("ticket_type"),
-                "description": step_data.get("description"),
+                "ea_reason": step_data.get("ea_reason"),
                 "amount": Decimal(step_data.get("penalty_amount")),
                 "driver_payable": Decimal(step_data.get("driver_payable")),
                 "disposition": step_data.get("disposition"),

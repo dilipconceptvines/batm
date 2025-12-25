@@ -75,9 +75,15 @@ result_backend_transport_options = {
 # This defines when periodic tasks should run
 beat_schedule = {
     # --- CURB Fetch, Upload to S3, and Process Pipeline (Daily) ---
-    "curb-fetch-upload-and-process": {
-        "task": "curb.full_sync_chain",
-        "schedule": crontab(hour=0, minute=0),  # Runs daily at 12:00 AM
+    "curb-import-3hour-window": {
+        "task": "curb.import_trips_task",
+        "schedule": crontab(minute=0, hour='*/3'),
+        "options": {"timezone": "America/New_York"},
+    },
+    
+    "curb-post-to-ledger-sunday": {
+        "task": "curb.post_trips_to_ledger_task",
+        "schedule": crontab(hour=3, minute=30, day_of_week=0),
         "options": {"timezone": "America/New_York"},
     },
     

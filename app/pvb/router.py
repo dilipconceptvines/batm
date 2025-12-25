@@ -137,6 +137,8 @@ def list_pvb_violations(
     to_reduction: Optional[float] = Query(None, description="Filter by Reduction (to)."),
     from_processing_fee: Optional[float] = Query(None, description="Filter by Processing Fee (from)."),
     to_processing_fee: Optional[float] = Query(None, description="Filter by Processing Fee (to)."),
+    from_reduce_to: Optional[float] = Query(None, description="Filter by Reduce To (from)."),
+    to_reduce_to: Optional[float] = Query(None, description="Filter by Reduce To (to)."),
     failure_reason: Optional[str] = Query(None, description="Filter by Failure Reason."),
     lease_id: Optional[str] = Query(None, description="Filter by associated Lease ID."),
     vin: Optional[str] = Query(None, description="Filter by associated Vehicle VIN."),
@@ -144,8 +146,9 @@ def list_pvb_violations(
     medallion_no: Optional[str] = Query(None, description="Filter by associated Medallion No."),
     status: Optional[str] = Query(None, description="Filter by Status."),
     source: Optional[str] = Query(None, description="Filter by Source."),
-    violation_code = Query(None, description="Filter by Violation Code."),
-    violation_country = Query(None, description="Filter by Violation Country."),
+    violation_code: Optional[str] = Query(None, description="Filter by Violation Code."),
+    violation_country: Optional[str] = Query(None, description="Filter by Violation Country."),
+    disposition : Optional[str] = Query(None, description="Filter by Disposition."),
     street_name = Query(None, description="Filter by Street Name."),
     pvb_service: PVBService = Depends(get_pvb_service),
     current_user: User = Depends(get_current_user),
@@ -194,7 +197,10 @@ def list_pvb_violations(
             source=source,
             violation_code = violation_code,
             violation_country = violation_country,
-            street_name = street_name
+            street_name = street_name,
+            disposition = disposition,
+            from_reduce_to=from_reduce_to,
+            to_reduce_to=to_reduce_to
         )
 
         response_items = [
@@ -221,7 +227,11 @@ def list_pvb_violations(
                 failure_reason=v.failure_reason,
                 violation_code= v.violation_code,
                 violation_country= v.violation_country,
-                street_name = v.street_name
+                street_name = v.street_name,
+                disposition = v.disposition,
+                disposition_change_date = v.disposition_change_date,
+                note = v.note,
+                reduce_by = v.reduce_to
             ) for v in violations
         ]
         
@@ -325,7 +335,11 @@ def export_pvb_violations(
                 failure_reason=v.failure_reason,
                 violation_code= v.violation_code,
                 violation_country= v.violation_country,
-                street_name = v.street_name
+                street_name = v.street_name,
+                disposition = v.disposition,
+                disposition_change_date = v.disposition_change_date,
+                note = v.note,
+                reduce_by = v.reduce_to
             ).model_dump(exclude={"id"}) for v in violations
         ]
         
@@ -542,6 +556,10 @@ def get_pvb_violation(
                 "judgement":pvb.judgement,
                 "ng_pmt":pvb.ng_pmt,
                 "payment":pvb.payment,
+                "disposition" : pvb.disposition,
+                "disposition_change_date": pvb.disposition_change_date,
+                "note" : pvb.note,
+                "reduce_by" : pvb.reduce_to,
                 "document":upload_service.get_documents(
                     db=db , object_id=pvb.id , object_type="pvb" , document_type="pvb_invoice"
                 )

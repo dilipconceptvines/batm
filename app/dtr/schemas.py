@@ -222,9 +222,9 @@ class DTRSummaryResponse(BaseModel):
 class SendDTREmailRequest(BaseModel):
     """Request schema for sending DTR emails"""
     dtr_ids: List[int] = Field(..., description="List of DTR IDs to send via email")
-    recipient_email: Optional[EmailStr] = Field(
+    recipient_emails: Optional[List[EmailStr]] = Field(
         None,
-        description="Optional override email. If not provided, uses driver's email."
+        description="Optional list of recipient emails. If not provided, uses each driver's email."
     )
     include_violations: bool = Field(
         True,

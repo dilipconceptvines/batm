@@ -22,19 +22,25 @@ from app.users.models import AuditMixin
 
 
 class TLCViolationType(str, PyEnum):
-    """Enumeration for the type of TLC Violation."""
-    FI = "FI" # Failure to Inspect Vehicle
-    FN = "FN" # Failure to Comply with Notice
-    RF = "RF" # Reinspection Fee
-    EA = "EA"
-
-
+    """Enumeration for the types of TLC Violations."""
+    FAILURE_TO_INSPECT_VEHICLE = "Failure to Inspect Vehicle"
+    FAILURE_TO_COMPLY_WITH_NOTICE = "Failure to Comply with Notice"
+    REINSPECTION_FEE = "Reinspection Fee"
+    DIRECTIVE = "Directive"
+    ENFORCEMENT_ACTION = "Enforcement Action"
 class TLCDisposition(str, PyEnum):
     """Enumeration for the disposition of a TLC Violation."""
     PAID = "Paid"
     REDUCED = "Reduced"
     DISMISSED = "Dismissed"
 
+class EAReason(str, PyEnum):
+    """Enumeration for reasons under Enforcement Action violation type."""
+    AIR_BAG_LIGHT = "Air Bag Light"
+    DEFECTIVE_LIGHT = "Defective Light"
+    DIRTY_CAB = "Dirty Cab"
+    METER_MILE_RUN = "Meter Mile Run"
+    WINDSHIELD = "Windshield"
 
 class TLCViolationStatus(str, PyEnum):
     """Internal status for tracking ledger posting."""
@@ -58,8 +64,8 @@ class TLCViolation(Base, AuditMixin):
     summons_no: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     issue_date: Mapped[date] = mapped_column(Date)
     issue_time: Mapped[Optional[time]] = mapped_column(Time)
-    violation_type: Mapped[TLCViolationType] = mapped_column(Enum(TLCViolationType))
-    description: Mapped[Optional[str]] = mapped_column(Text, comment="Required only if type is FN.")
+    violation_type: Mapped[str] = mapped_column(String(255), comment="Type of TLC violation.")
+    ea_reason: Mapped[Optional[str]] = mapped_column(Text, comment="Reason for EA violation type", nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), comment="Base ticket amount.")
     service_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     total_payable: Mapped[Decimal] = mapped_column(Numeric(10, 2), comment="Calculated as Amount + Service Fee.")
@@ -68,6 +74,7 @@ class TLCViolation(Base, AuditMixin):
     disposition: Mapped[TLCDisposition] = mapped_column(Enum(TLCDisposition), default=TLCDisposition.PAID)
     due_date: Mapped[date] = mapped_column(Date)
     note: Mapped[Optional[str]] = mapped_column(Text)
+    disposition_change_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     
     # --- Entity Links ---
     driver_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("drivers.id"), index=True, nullable=True)
@@ -98,8 +105,8 @@ class TLCViolation(Base, AuditMixin):
             "summons_no": self.summons_no,
             "issue_date": self.issue_date.isoformat() if self.issue_date else None,
             "issue_time": self.issue_time.isoformat() if self.issue_time else None,
-            "violation_type": self.violation_type.value,
-            "description": self.description,
+            "violation_type": self.violation_type,
+            "ea_reason": self.ea_reason,
             "amount": float(self.amount),
             "service_fee": float(self.service_fee),
             "total_payable": float(self.total_payable),

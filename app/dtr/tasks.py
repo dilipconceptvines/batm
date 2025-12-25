@@ -12,6 +12,7 @@ from datetime import date, timedelta
 from celery import shared_task
 
 from app.core.db import SessionLocal
+from app.worker.app import app as celery_app
 from app.dtr.models import DTR
 from app.dtr.email_service import get_dtr_email_service
 from app.utils.logger import get_logger
@@ -19,7 +20,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-@shared_task(name="dtr.send_weekly_dtr_emails")
+@celery_app.task(name="dtr.send_weekly_dtr_emails")
 def send_weekly_dtr_emails_task():
     """
     Weekly task to send DTR emails to all drivers whose DTRs were generated.
@@ -168,7 +169,7 @@ def send_weekly_dtr_emails_task():
         db.close()
 
 
-@shared_task(name="dtr.send_dtr_email_on_demand")
+@celery_app.task(name="dtr.send_dtr_email_on_demand")
 def send_dtr_email_on_demand_task(
     dtr_id: int,
     recipient_email: str = None,

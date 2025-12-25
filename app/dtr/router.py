@@ -5,7 +5,7 @@ import json
 import decimal
 from io import BytesIO
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -91,7 +91,7 @@ def generate_batch_dtrs(
         from app.leases.schemas import LeaseStatus
         
         query = db.query(Lease).filter(
-            Lease.status.in_([LeaseStatus.ACTIVE, LeaseStatus.TERMINATED])
+            Lease.lease_status.in_([LeaseStatus.ACTIVE, LeaseStatus.TERMINATED])
         )
         
         if request.lease_ids:
@@ -530,23 +530,24 @@ async def send_dtr_emails_on_demand(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Send DTR emails to selected drivers with attachments at any point in time.
+    Send DTR emails to multiple recipients with attachments at any point in time.
     
-    This endpoint allows staff to manually trigger DTR email delivery for specific DTRs.
-    Each email includes:
+    This endpoint allows staff to manually trigger DTR email delivery for specific DTRs
+    to one or more recipients. Each email includes:
     - DTR PDF
     - PVB Violations report (if any violations exist for the period)
     - TLC Violations report (if any violations exist for the period)
     
     **Use Cases:**
+    - Send multiple DTRs to multiple recipients (all combinations)
     - Resend DTRs that failed to deliver
-    - Send DTRs to alternate email addresses
+    - Send DTRs to alternate email addresses (accounting, managers, etc.)
     - Manually trigger delivery for specific drivers
     - Send DTRs without violation reports (set include_violations=false)
     
     **Process:**
     1. Validates all DTR IDs exist
-    2. Queues Celery tasks for each DTR
+    2. Queues Celery tasks for each DTR × recipient combination
     3. Returns immediate response (emails sent asynchronously)
     
     **Email Templates Used:**
@@ -554,6 +555,8 @@ async def send_dtr_emails_on_demand(
     
     **Note:** Emails are sent asynchronously via Celery. This endpoint returns
     immediately after queuing the tasks. Check logs for delivery status.
+    
+    **Example:** Send DTRs 1,2,3 to john@example.com and jane@example.com = 6 emails total
     """
     try:
         # Validate all DTR IDs exist
@@ -567,90 +570,98 @@ async def send_dtr_emails_on_demand(
                 detail=f"DTRs not found: {sorted(missing_ids)}"
             )
         
-        # Queue Celery tasks for each DTR
+        # Determine recipient list (None means use driver's email for each DTR)
+        recipients_to_send = request.recipient_emails if request.recipient_emails else [None]
+        
+        # Queue Celery tasks for each DTR and each recipient
         emails_queued = 0
         emails_failed = 0
         results = []
         
         for dtr_id in request.dtr_ids:
-            try:
-                # Try to queue the Celery task first
-                task = send_dtr_email_on_demand_task.delay(
-                    dtr_id=dtr_id,
-                    recipient_email=request.recipient_email,
-                    include_violations=request.include_violations
-                )
-                
-                emails_queued += 1
-                results.append({
-                    "dtr_id": dtr_id,
-                    "status": "queued",
-                    "task_id": task.id
-                })
-                
-                logger.info(
-                    "DTR email queued", dtr_id=dtr_id,
-                    task_id=task.id, user_id=current_user.id
-                )
-                
-            except (OperationalError, ConnectionRefusedError, Exception) as e:
-                # Fallback: If Celery is down, send email directly
-                if isinstance(e, (OperationalError, ConnectionRefusedError)) or "Connection refused" in str(e):
-                    logger.warning(
-                        "Celery broker unavailable, falling back to direct email send", 
-                        dtr_id=dtr_id, error=str(e)
+            for recipient_email in recipients_to_send:
+                try:
+                    # Try to queue the Celery task first
+                    task = send_dtr_email_on_demand_task.delay(
+                        dtr_id=dtr_id,
+                        recipient_email=recipient_email,
+                        include_violations=request.include_violations
                     )
                     
-                    try:
-                        # Send email directly using email service
-                        email_service = DTREmailService(db)
-                        result = await email_service.send_on_demand_dtr_email(
-                            dtr_id=dtr_id,
-                            recipient_email=request.recipient_email,
-                            include_violations=request.include_violations
+                    emails_queued += 1
+                    results.append({
+                        "dtr_id": dtr_id,
+                        "recipient": recipient_email or "driver's email",
+                        "status": "queued",
+                        "task_id": task.id
+                    })
+                    
+                    logger.info(
+                        "DTR email queued", dtr_id=dtr_id,
+                        recipient=recipient_email, task_id=task.id, user_id=current_user.id
+                    )
+                    
+                except (OperationalError, ConnectionRefusedError, Exception) as e:
+                    # Fallback: If Celery is down, send email directly
+                    if isinstance(e, (OperationalError, ConnectionRefusedError)) or "Connection refused" in str(e):
+                        logger.warning(
+                            "Celery broker unavailable, falling back to direct email send", 
+                            dtr_id=dtr_id, recipient=recipient_email, error=str(e)
                         )
                         
-                        if result.get("success", False):
-                            emails_queued += 1
+                        try:
+                            # Send email directly using email service
+                            email_service = DTREmailService(db)
+                            result = await email_service.send_on_demand_dtr_email(
+                                dtr_id=dtr_id,
+                                recipient_email=recipient_email,
+                                include_violations=request.include_violations
+                            )
+                            
+                            if result.get("success", False):
+                                emails_queued += 1
+                                results.append({
+                                    "dtr_id": dtr_id,
+                                    "recipient": recipient_email or "driver's email",
+                                    "status": "sent_directly",
+                                    "task_id": None
+                                })
+                                
+                                logger.info(
+                                    "DTR email sent directly (Celery fallback)", 
+                                    dtr_id=dtr_id, recipient=recipient_email, user_id=current_user.id
+                                )
+                            else:
+                                raise Exception(result.get("error", "Unknown error in direct email send"))
+                                
+                        except Exception as direct_error:
+                            emails_failed += 1
                             results.append({
                                 "dtr_id": dtr_id,
-                                "status": "sent_directly",
-                                "task_id": None
+                                "recipient": recipient_email or "driver's email",
+                                "status": "failed",
+                                "error": f"Celery down and direct send failed: {str(direct_error)}"
                             })
                             
-                            logger.info(
-                                "DTR email sent directly (Celery fallback)", 
-                                dtr_id=dtr_id, user_id=current_user.id
+                            logger.error(
+                                "Failed to send DTR email (both Celery and direct)", 
+                                dtr_id=dtr_id, recipient=recipient_email,
+                                celery_error=str(e), direct_error=str(direct_error), exc_info=True
                             )
-                        else:
-                            raise Exception(result.get("error", "Unknown error in direct email send"))
-                            
-                    except Exception as direct_error:
+                    else:
+                        # Non-connection related error, handle normally
                         emails_failed += 1
                         results.append({
                             "dtr_id": dtr_id,
+                            "recipient": recipient_email or "driver's email",
                             "status": "failed",
-                            "error": f"Celery down and direct send failed: {str(direct_error)}"
+                            "error": str(e)
                         })
                         
                         logger.error(
-                            "Failed to send DTR email (both Celery and direct)", 
-                            dtr_id=dtr_id, celery_error=str(e), 
-                            direct_error=str(direct_error), exc_info=True
+                            "Failed to queue DTR email", dtr_id=dtr_id,
+                            recipient=recipient_email, error=str(e), exc_info=True
                         )
-                else:
-                    # Non-connection related error, handle normally
-                    emails_failed += 1
-                    results.append({
-                        "dtr_id": dtr_id,
-                        "status": "failed",
-                        "error": str(e)
-                    })
-                    
-                    logger.error(
-                        "Failed to queue DTR email", dtr_id=dtr_id,
-                        error=str(e), exc_info=True
-                    )
         
         return SendDTREmailResponse(
             total_requested=len(request.dtr_ids),
@@ -669,12 +680,12 @@ async def send_dtr_emails_on_demand(
         ) from e
 
 
-@router.post("/send-dtr-email/{dtr_id}", summary="Send Single DTR Email")
+@router.post("/send-dtr-email/{dtr_id}", summary="Send DTR Email to Multiple Recipients")
 async def send_single_dtr_email(
     dtr_id: int,
-    recipient_email: Optional[EmailStr] = Query(
+    recipient_emails: Optional[List[EmailStr]] = Query(
         None,
-        description="Optional override email. If not provided, uses driver's email."
+        description="Optional list of recipient emails. If not provided, uses driver's email."
     ),
     include_violations: bool = Query(
         True,
@@ -684,17 +695,17 @@ async def send_single_dtr_email(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Send a single DTR email (convenience endpoint).
+    Send a single DTR email to multiple recipients.
     
-    This is a simplified version of the batch endpoint for sending a single DTR.
+    This endpoint sends the same DTR to multiple email addresses.
     
     **Parameters:**
     - `dtr_id`: The DTR ID to send
-    - `recipient_email`: Optional override email (defaults to driver's email)
+    - `recipient_emails`: Optional list of recipient emails (defaults to driver's email if not provided)
     - `include_violations`: Include PVB/TLC violation reports (default: true)
     
     **Returns:**
-    - Task ID for tracking the email delivery
+    - Summary of emails queued/sent
     """
     try:
         # Validate DTR exists
@@ -704,67 +715,106 @@ async def send_single_dtr_email(
                 status_code=404, detail=f"DTR not found: {dtr_id}"
             )
         
-        # Try to queue the Celery task first
-        try:
-            task = send_dtr_email_on_demand_task.delay(
-                dtr_id=dtr_id,
-                recipient_email=recipient_email,
-                include_violations=include_violations
-            )
-            
-            logger.info(
-                "Single DTR email queued", dtr_id=dtr_id,
-                task_id=task.id, user_id=current_user.id
-            )
-            
-            return {
-                "dtr_id": dtr_id,
-                "status": "queued",
-                "task_id": task.id,
-                "message": "DTR email has been queued for delivery"
-            }
-            
-        except (OperationalError, ConnectionRefusedError, Exception) as e:
-            # Fallback: If Celery is down, send email directly
-            if isinstance(e, (OperationalError, ConnectionRefusedError)) or "Connection refused" in str(e):
-                logger.warning(
-                    "Celery broker unavailable, falling back to direct email send", 
-                    dtr_id=dtr_id, error=str(e)
-                )
-                
-                # Send email directly using email service
-                email_service = DTREmailService(db)
-                result = await email_service.send_on_demand_dtr_email(
+        # If no recipient emails provided, use None (will default to driver's email)
+        emails_to_send = recipient_emails if recipient_emails else [None]
+        
+        emails_queued = 0
+        emails_failed = 0
+        results = []
+        
+        for recipient_email in emails_to_send:
+            try:
+                # Try to queue the Celery task first
+                task = send_dtr_email_on_demand_task.delay(
                     dtr_id=dtr_id,
                     recipient_email=recipient_email,
                     include_violations=include_violations
                 )
                 
-                if result.get("success", False):
-                    logger.info(
-                        "Single DTR email sent directly (Celery fallback)", 
-                        dtr_id=dtr_id, user_id=current_user.id
+                emails_queued += 1
+                results.append({
+                    "recipient": recipient_email or "driver's email",
+                    "status": "queued",
+                    "task_id": task.id
+                })
+                
+                logger.info(
+                    "DTR email queued", dtr_id=dtr_id,
+                    recipient=recipient_email, task_id=task.id, user_id=current_user.id
+                )
+                
+            except (OperationalError, ConnectionRefusedError, Exception) as e:
+                # Fallback: If Celery is down, send email directly
+                if isinstance(e, (OperationalError, ConnectionRefusedError)) or "Connection refused" in str(e):
+                    logger.warning(
+                        "Celery broker unavailable, falling back to direct email send", 
+                        dtr_id=dtr_id, recipient=recipient_email, error=str(e)
                     )
                     
-                    return {
-                        "dtr_id": dtr_id,
-                        "status": "sent_directly",
-                        "task_id": None,
-                        "message": "DTR email sent directly (Celery unavailable)"
-                    }
+                    try:
+                        # Send email directly using email service
+                        email_service = DTREmailService(db)
+                        result = await email_service.send_on_demand_dtr_email(
+                            dtr_id=dtr_id,
+                            recipient_email=recipient_email,
+                            include_violations=include_violations
+                        )
+                        
+                        if result.get("success", False):
+                            emails_queued += 1
+                            results.append({
+                                "recipient": recipient_email or "driver's email",
+                                "status": "sent_directly",
+                                "task_id": None
+                            })
+                            
+                            logger.info(
+                                "DTR email sent directly (Celery fallback)", 
+                                dtr_id=dtr_id, recipient=recipient_email, user_id=current_user.id
+                            )
+                        else:
+                            raise Exception(result.get("error", "Unknown error in direct email send"))
+                            
+                    except Exception as direct_error:
+                        emails_failed += 1
+                        results.append({
+                            "recipient": recipient_email or "driver's email",
+                            "status": "failed",
+                            "error": f"Celery down and direct send failed: {str(direct_error)}"
+                        })
+                        
+                        logger.error(
+                            "Failed to send DTR email (both Celery and direct)", 
+                            dtr_id=dtr_id, recipient=recipient_email,
+                            celery_error=str(e), direct_error=str(direct_error), exc_info=True
+                        )
                 else:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to send DTR email: {result.get('error', 'Unknown error')}"
+                    # Non-connection related error, handle normally
+                    emails_failed += 1
+                    results.append({
+                        "recipient": recipient_email or "driver's email",
+                        "status": "failed",
+                        "error": str(e)
+                    })
+                    
+                    logger.error(
+                        "Failed to queue DTR email", dtr_id=dtr_id,
+                        recipient=recipient_email, error=str(e), exc_info=True
                     )
-            else:
-                # Non-connection related error, re-raise
-                raise e
+        
+        return {
+            "dtr_id": dtr_id,
+            "total_recipients": len(emails_to_send),
+            "emails_queued": emails_queued,
+            "emails_failed": emails_failed,
+            "results": results,
+            "message": f"Sent to {emails_queued} recipient(s), {emails_failed} failed"
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error sending single DTR email: {str(e)}", exc_info=True)
+        logger.error(f"Error sending DTR email: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail="Failed to queue DTR email"
