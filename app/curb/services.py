@@ -29,6 +29,7 @@ from app.curb.repository import CurbRepository
 from app.drivers.models import Driver
 from app.leases.services import lease_service
 from app.ledger.models import PostingCategory, EntryType
+from app.ledger.repository import LedgerRepository
 from app.ledger.services import LedgerService
 from app.utils.logger import get_logger
 from app.utils.s3_utils import s3_utils
@@ -174,7 +175,8 @@ class CurbService:
     def __init__(self, db: Session):
         self.db = db
         self.repo = CurbRepository(db)
-        self.ledger_service = LedgerService(db)
+        self.ledger_repo = LedgerRepository(db)
+        self.ledger_service = LedgerService(self.ledger_repo)
 
     # --- DATA IMPORT FROM CURB API ---
 
@@ -311,7 +313,7 @@ class CurbService:
 
         try:
             logger.info(f"Fetching trips from GET_TRIPS_LOG10 for {account.account_name}")
-            trips_xml = api_service.get_trips_log10(from_str, to_str, recon_stat=0)
+            trips_xml = api_service.get_trips_log10(from_str, to_str, recon_stat=-1)
             
             # Store to S3 data lake
             self._store_to_s3(account, trips_xml, from_datetime, "trips")
@@ -767,22 +769,18 @@ class CurbService:
         lease_ids: Optional[List[int]] = None,
     ) -> Dict:
         """
-        Post individual CASH trips to ledger as CREDIT postings
+        Post CURB trips to ledger with proper handling of refunds and zero amounts
         
-        Each trip becomes a separate ledger entry:
-        - Category: EARNINGS
-        - Entry Type: CREDIT
-        - Reference ID: CURB-TRIP-{curb_trip_id}
-        - Amount: total_amount (negative for credit)
+        Scenarios:
+        1. Positive total_amount → Post as CREDIT (earnings)
+        2. Negative total_amount → Post as DEBIT (refund/chargeback)
+        3. Zero total_amount → Skip (no financial impact)
         
-        Process:
-        1. Get trips with status IMPORTED and mapped to driver/lease
-        2. For each trip, create ledger posting
-        3. Update trip status to POSTED_TO_LEDGER
+        Note: Taxes are included in total_amount by CURB API
         """
+        
         logger.info(f"Posting CURB trips to ledger from {start_date} to {end_date}")
         
-        # Get trips ready for posting
         trips = self.repo.get_trips_ready_for_ledger(
             start_date, end_date, driver_ids, lease_ids
         )
@@ -796,65 +794,147 @@ class CurbService:
         
         posted_count = 0
         failed_count = 0
+        skipped_zero_count = 0
+        refund_count = 0
         postings_created = []
         errors = []
         total_amount = Decimal("0.00")
         
         for trip in trips:
             try:
-                # Create individual ledger posting for this trip
-                reference_id = f"CURB-TRIP-{trip.curb_trip_id}"
+                # ====== SCENARIO 1: Zero Amount - Skip ======
+                if trip.total_amount == 0:
+                    skipped_zero_count += 1
+                    logger.info(
+                        f"Skipping trip {trip.curb_trip_id} - zero net amount "
+                        f"(Taxes: MTA=${trip.surcharge}, Cong=${trip.congestion_fee})"
+                    )
+                    trip.status = CurbTripStatus.POSTED_TO_LEDGER
+                    trip.posted_to_ledger_at = datetime.now()
+                    trip.ledger_posting_ref = "SKIPPED-ZERO-AMOUNT"
+                    continue
                 
-                posting, balance = self.ledger_service.create_obligation(
-                    category=PostingCategory.EARNINGS,
-                    amount=trip.total_amount,  # Positive amount
-                    entry_type=EntryType.CREDIT,  # CREDIT for earnings
-                    reference_id=reference_id,
-                    driver_id=trip.driver_id,
-                    lease_id=trip.lease_id,
-                    vehicle_id=trip.vehicle_id,
-                    medallion_id=trip.medallion_id,
-                )
+                # ====== SCENARIO 2: Negative Amount - Refund/Chargeback ======
+                elif trip.total_amount < 0:
+                    refund_count += 1
+                    logger.warning(
+                        f"Processing REFUND for trip {trip.curb_trip_id}: "
+                        f"${trip.total_amount} "
+                        f"(Fare: ${trip.fare}, Taxes: ${self._calculate_taxes(trip)})"
+                    )
+                    
+                    # For refunds, we need to DEBIT (reduce earnings)
+                    # But create_obligation expects positive amounts for DEBIT
+                    # So we use absolute value and DEBIT entry type
+                    reference_id = f"CURB-REFUND-{trip.curb_trip_id}"
+                    
+                    posting, balance = self.ledger_service.create_obligation(
+                        category=PostingCategory.EARNINGS,
+                        amount=abs(trip.total_amount),  # Use absolute value
+                        entry_type=EntryType.DEBIT,     # DEBIT reduces earnings
+                        reference_id=reference_id,
+                        driver_id=trip.driver_id,
+                        lease_id=trip.lease_id,
+                        vehicle_id=trip.vehicle_id,
+                        medallion_id=trip.medallion_id,
+                    )
+                    
+                    trip.status = CurbTripStatus.POSTED_TO_LEDGER
+                    trip.posted_to_ledger_at = datetime.now()
+                    trip.ledger_posting_ref = posting.id
+                    
+                    posted_count += 1
+                    total_amount += trip.total_amount  # Keep negative for reporting
+                    
+                    postings_created.append({
+                        "trip_id": trip.curb_trip_id,
+                        "driver_id": trip.driver_id,
+                        "amount": float(trip.total_amount),
+                        "type": "REFUND",
+                        "posting_id": posting.id,
+                    })
                 
-                # Update trip status
-                self.repo.update_trip_status(
-                    trip.id,
-                    CurbTripStatus.POSTED_TO_LEDGER,
-                    ledger_posting_ref=reference_id
-                )
+                # ====== SCENARIO 3: Positive Amount - Normal Earnings ======
+                else:  # trip.total_amount > 0
+                    reference_id = f"CURB-TRIP-{trip.curb_trip_id}"
+                    
+                    posting, balance = self.ledger_service.create_obligation(
+                        category=PostingCategory.EARNINGS,
+                        amount=trip.total_amount,      # Positive amount
+                        entry_type=EntryType.CREDIT,   # CREDIT for earnings
+                        reference_id=reference_id,
+                        driver_id=trip.driver_id,
+                        lease_id=trip.lease_id,
+                        vehicle_id=trip.vehicle_id,
+                        medallion_id=trip.medallion_id,
+                    )
+                    
+                    trip.status = CurbTripStatus.POSTED_TO_LEDGER
+                    trip.posted_to_ledger_at = datetime.now()
+                    trip.ledger_posting_ref = posting.id
+                    
+                    posted_count += 1
+                    total_amount += trip.total_amount
+                    
+                    postings_created.append({
+                        "trip_id": trip.curb_trip_id,
+                        "driver_id": trip.driver_id,
+                        "amount": float(trip.total_amount),
+                        "type": "EARNING",
+                        "posting_id": posting.id,
+                    })
                 
-                posted_count += 1
-                total_amount += trip.total_amount
-                postings_created.append({
-                    "trip_id": trip.curb_trip_id,
-                    "driver_id": trip.driver_id,
-                    "amount": float(trip.total_amount),
-                    "posting_id": posting.id,
-                })
-                
-                logger.debug(f"Posted trip {trip.curb_trip_id} to ledger: ${trip.total_amount}")
+                # Commit every 100 trips
+                if (posted_count + refund_count) % 100 == 0:
+                    self.db.commit()
+                    logger.info(
+                        f"Progress: {posted_count} earnings, "
+                        f"{refund_count} refunds, "
+                        f"{skipped_zero_count} skipped"
+                    )
                 
             except Exception as e:
                 failed_count += 1
-                logger.error(f"Failed to post trip {trip.curb_trip_id}: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to post trip {trip.curb_trip_id}: {e}",
+                    exc_info=True
+                )
                 errors.append({
                     "trip_id": trip.curb_trip_id,
+                    "amount": float(trip.total_amount),
                     "error": str(e)
                 })
         
+        # Final commit
         self.db.commit()
+        
+        logger.info(
+            f"CURB ledger posting completed: "
+            f"{posted_count} earnings posted, "
+            f"{refund_count} refunds posted, "
+            f"{skipped_zero_count} zero-amount skipped, "
+            f"{failed_count} failed"
+        )
         
         return {
             "status": "success",
-            "message": f"Posted {posted_count} trips to ledger",
-            "date_range": {
-                "start": start_date.isoformat(),
-                "end": end_date.isoformat()
-            },
-            "trips_processed": len(trips),
-            "trips_posted_to_ledger": posted_count,
+            "message": f"Posted {posted_count + refund_count} trips to ledger",
+            "trips_processed": posted_count,
+            "refunds_processed": refund_count,
+            "trips_skipped": skipped_zero_count,
             "trips_failed": failed_count,
-            "total_amount_posted": float(total_amount),
-            "postings_created": postings_created[:10],  # First 10 for summary
-            "errors": errors,
-        } 
+            "total_amount": total_amount,
+            "postings_created": postings_created[:10],
+            "errors": errors[:10] if errors else [],
+        }
+
+
+    def _calculate_taxes(self, trip: CurbTrip) -> Decimal:
+        """Calculate total taxes/fees for a trip"""
+        return (
+            trip.surcharge + 
+            trip.improvement_surcharge + 
+            trip.congestion_fee + 
+            trip.airport_fee + 
+            trip.cbdt_fee
+        )

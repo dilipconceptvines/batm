@@ -76,8 +76,7 @@ class CurbRepository:
 
     def bulk_insert_or_update_trips(self, trips_data: List[dict]) -> Tuple[int, int]:
         """
-        Efficiently insert new trips and update existing ones using MySQL's
-        INSERT ... ON DUPLICATE KEY UPDATE.
+        Insert/update trips individually with savepoints (like EZPass pattern)
         
         Args:
             trips_data: List of trip dictionaries

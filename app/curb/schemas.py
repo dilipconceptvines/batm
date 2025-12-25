@@ -8,7 +8,7 @@ Defines request/response schemas for API endpoints and data validation.
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -171,19 +171,12 @@ class AccountProcessedDetail(BaseModel):
 
 
 class CurbImportResponse(BaseModel):
-    """Response schema for import operations"""
+    """Response schema for async import operations"""
     status: str
     message: str
-    accounts_processed: List[AccountProcessedDetail]
+    task_id: str
+    accounts: Union[str, List[int]]
     datetime_range: dict
-    total_trips_fetched: int
-    trips_imported: int
-    trips_updated: int
-    trips_skipped: int
-    reconciled_count: int
-    reconciliation_details: dict
-    processing_time_seconds: float
-    errors: List[dict] = []
 
 
 # ==============================================================================

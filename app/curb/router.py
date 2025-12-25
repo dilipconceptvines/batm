@@ -21,7 +21,6 @@ from app.curb.schemas import (
     CurbAccountResponse,
     CurbAccountUpdate,
     CurbImportRequest,
-    CurbImportResponse,
     CurbLedgerPostRequest,
     CurbLedgerPostResponse,
     CurbTripFilters,
@@ -30,6 +29,7 @@ from app.curb.schemas import (
 )
 from app.curb.services import CurbService
 from app.curb.models import CurbAccount
+from app.curb.tasks import import_trips_task
 from app.users.models import User
 from app.utils.logger import get_logger
 
@@ -208,37 +208,56 @@ def get_curb_trip(
     
 # --- Data import --- #
 
-@router.post("/import", response_model=CurbImportResponse)
+@router.post("/import", status_code=202)
 def import_curb_data(
     import_request: CurbImportRequest = None,
-    service: CurbService = Depends(get_curb_service),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Manually trigger CURB data import
+    Trigger CURB data import via background task
     
     Imports CASH trips from configured CURB accounts for the specified
     datetime range. If no range specified, imports last 3 hours.
+    
+    Returns immediately with task ID. Import runs asynchronously.
     """
     try:
         if import_request is None:
             import_request = CurbImportRequest()
         
-        result = service.import_trips_from_accounts(
-            account_ids=import_request.account_ids,
-            from_datetime=import_request.from_datetime,
-            to_datetime=import_request.to_datetime,
+        # Prepare task arguments
+        task_kwargs = {}
+        
+        if import_request.account_ids:
+            task_kwargs['account_ids'] = import_request.account_ids
+        
+        if import_request.from_datetime:
+            task_kwargs['from_datetime'] = import_request.from_datetime.isoformat()
+        
+        if import_request.to_datetime:
+            task_kwargs['to_datetime'] = import_request.to_datetime.isoformat()
+        
+        # Trigger async task
+        task = import_trips_task.apply_async(kwargs=task_kwargs)
+        
+        logger.info(
+            f"CURB import task queued by user {current_user.id} - "
+            f"task_id: {task.id}, params: {task_kwargs}"
         )
         
-        logger.info(f"Manual CURB import triggered by user {current_user.id}: {result['trips_imported']} trips imported")
+        return {
+            "status": "accepted",
+            "message": "CURB import task queued successfully",
+            "task_id": task.id,
+            "accounts": import_request.account_ids or "all active accounts",
+            "datetime_range": {
+                "from": import_request.from_datetime.isoformat() if import_request.from_datetime else "3 hours ago",
+                "to": import_request.to_datetime.isoformat() if import_request.to_datetime else "now"
+            }
+        }
         
-        return CurbImportResponse(**result)
-        
-    except CurbError as e:
-        logger.error(f"CURB import failed: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        logger.error(f"Unexpected error during CURB import: {e}", exc_info=True)
+        logger.error(f"Failed to queue CURB import task: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
     
 # --- Ledger Posting --- #
