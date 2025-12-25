@@ -104,63 +104,63 @@ class CurbRepository:
         if not trips_to_process:
             return 0, 0
         
-        try:
-            logger.info(f"Bulk inserting/updating {len(trips_to_process)} CURB trips")
-            
-            # Process in smaller batches to avoid lock contention
-            batch_size = 100
-            total_processed = 0
-            
-            for i in range(0, len(trips_to_process), batch_size):
-                batch = trips_to_process[i:i + batch_size]
-                batch_num = (i // batch_size) + 1
-                total_batches = (len(trips_to_process) + batch_size - 1) // batch_size
+        logger.info(f"Processing {len(trips_to_process)} CURB trips individually")
+        
+        inserted_count = 0
+        updated_count = 0
+        failed_count = 0
+        
+        for i, trip_data in enumerate(trips_to_process, 1):
+            try:
+                # Use savepoint for each trip
+                savepoint = self.db.begin_nested()
                 
-                # Use MySQL's INSERT ... ON DUPLICATE KEY UPDATE
-                stmt = insert(CurbTrip)
+                # Check if trip already exists
+                existing_trip = self.db.query(CurbTrip).filter(
+                    CurbTrip.curb_trip_id == trip_data['curb_trip_id']
+                ).first()
                 
-                # Define which columns to update on duplicate
-                update_dict = {
-                    "end_time": stmt.inserted.end_time,
-                    "fare": stmt.inserted.fare,
-                    "tips": stmt.inserted.tips,
-                    "tolls": stmt.inserted.tolls,
-                    "extras": stmt.inserted.extras,
-                    "total_amount": stmt.inserted.total_amount,
-                    "surcharge": stmt.inserted.surcharge,
-                    "improvement_surcharge": stmt.inserted.improvement_surcharge,
-                    "congestion_fee": stmt.inserted.congestion_fee,
-                    "airport_fee": stmt.inserted.airport_fee,
-                    "cbdt_fee": stmt.inserted.cbdt_fee,
-                    "distance_miles": stmt.inserted.distance_miles,
-                    "num_passengers": stmt.inserted.num_passengers,
-                    "transaction_date": stmt.inserted.transaction_date,
-                    "start_lat": stmt.inserted.start_lat,
-                    "start_long": stmt.inserted.start_long,
-                    "end_lat": stmt.inserted.end_lat,
-                    "end_long": stmt.inserted.end_long,
-                    "num_service": stmt.inserted.num_service,
-                    "updated_on": datetime.now(),
-                }
+                if existing_trip:
+                    # Update existing trip
+                    for key, value in trip_data.items():
+                        if hasattr(existing_trip, key) and key not in ['id', 'created_on']:
+                            setattr(existing_trip, key, value)
+                    existing_trip.updated_on = datetime.now()
+                    updated_count += 1
+                else:
+                    # Insert new trip
+                    new_trip = CurbTrip(**trip_data)
+                    self.db.add(new_trip)
+                    inserted_count += 1
                 
-                stmt = stmt.on_duplicate_key_update(**update_dict)
+                # Flush to trigger any constraint violations
+                self.db.flush()
                 
-                # Execute batch (no flush - commit happens in service layer)
-                logger.info(f"Processing batch {batch_num}/{total_batches}: {len(batch)} trips")
-                self.db.execute(stmt, batch)
-                total_processed += len(batch)
-            
-            logger.info(f"Bulk operation complete: {total_processed} trips processed")
-            return total_processed, 0
-            
-        except IntegrityError as e:
-            logger.error(f"Integrity error during bulk insert: {e}")
-            self.db.rollback()
-            raise
-        except SQLAlchemyError as e:
-            logger.error(f"Database error during bulk insert: {e}")
-            self.db.rollback()
-            raise
+                # Commit the savepoint if successful
+                savepoint.commit()
+                
+                # Log progress every 100 trips
+                if i % 100 == 0:
+                    logger.info(f"Processed {i}/{len(trips_to_process)} trips (inserted: {inserted_count}, updated: {updated_count})")
+                
+            except Exception as e:
+                # Rollback only this savepoint
+                savepoint.rollback()
+                failed_count += 1
+                logger.warning(f"Failed to process trip {trip_data.get('curb_trip_id', 'unknown')}: {e}")
+                
+                # Log first few failures in detail
+                if failed_count <= 5:
+                    logger.error(f"Trip data that failed: {trip_data}", exc_info=True)
+                
+                continue
+        
+        logger.info(
+            f"Completed: {inserted_count} inserted, {updated_count} updated, "
+            f"{failed_count} failed out of {len(trips_to_process)} total"
+        )
+        
+        return inserted_count, updated_count
 
     # --- CURB TRIP QUERY OPERATIONS --- #
 

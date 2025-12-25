@@ -6,13 +6,8 @@ from enum import Enum as PyEnum
 from typing import Optional, List
 
 from sqlalchemy import (
-    DateTime,
-    Enum,
-    ForeignKey,
-    Integer,
-    Numeric,
-    String,
-    Text,
+    DateTime, Enum, ForeignKey, Integer,
+    Numeric, String, Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,15 +25,40 @@ class EZPassImportStatus(str, PyEnum):
 
 
 class EZPassTransactionStatus(str, PyEnum):
-    """Enumeration for the lifecycle status of a single EZPass transaction."""
-
+    """
+    Enumeration for the lifecycle status of a single EZPass transaction.
+    
+    CURRENT WORKFLOW (v2.0):
+    =======================
+    IMPORTED → POSTED_TO_LEDGER (single atomic operation)
+       ↓
+    ASSOCIATION_FAILED (if no vehicle/trip match found)
+    
+    ACTIVE STATUSES (v2.0):
+    - IMPORTED: Raw transaction imported from CSV, awaiting association & posting
+    - POSTED_TO_LEDGER: Successfully associated AND posted to centralized ledger in single operation
+    - ASSOCIATION_FAILED: Could not match to vehicle/driver via CURB trips
+    - POSTING_FAILED: Association succeeded but ledger posting failed (rare edge case)
+    
+    DEPRECATED STATUSES (v1.0 - Backward Compatibility Only):
+    - ASSOCIATION_PENDING: No longer used in new workflow
+    - ASSOCIATED: Bypassed in new immediate posting flow
+    - POSTING_PENDING: No longer used in new workflow
+    
+    Migration Note: Existing transactions with deprecated statuses can be migrated
+    using the migrate_legacy_associated_transactions service method.
+    """
+    
+    # ========== ACTIVE STATUSES (v2.0) ==========
     IMPORTED = "Imported"
-    ASSOCIATION_PENDING = "Association Pending"
-    ASSOCIATION_FAILED = "Association Failed"
-    ASSOCIATED = "Associated"
-    POSTING_PENDING = "Posting Pending"
-    POSTING_FAILED = "Posting Failed"
     POSTED_TO_LEDGER = "Posted to Ledger"
+    ASSOCIATION_FAILED = "Association Failed"
+    POSTING_FAILED = "Posting Failed"
+    
+    # ========== DEPRECATED STATUSES (v1.0 - Backward Compatibility) ==========
+    ASSOCIATION_PENDING = "Association Pending"  # DEPRECATED: Use IMPORTED instead
+    ASSOCIATED = "Associated"  # DEPRECATED: Bypassed in new flow
+    POSTING_PENDING = "Posting Pending"  # DEPRECATED: Use POSTED_TO_LEDGER instead
 
 
 class EZPassImport(Base, AuditMixin):

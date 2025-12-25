@@ -23,7 +23,6 @@ from app.ezpass.schemas import (
     PaginatedEZPassImportLogResponse,
 )
 from app.ezpass.services import EZPassService, AVAILABLE_LOG_STATUSES, AVAILABLE_LOG_TYPES
-from app.ezpass.stubs import create_stub_ezpass_response
 from app.users.models import User
 from app.users.utils import get_current_user
 from app.utils.exporter_utils import ExporterFactory
@@ -64,7 +63,6 @@ async def upload_ezpass_csv(
 
 @router.get("", response_model=PaginatedEZPassTransactionResponse, summary="List EZPass Transactions")
 def list_ezpass_transactions(
-    use_stubs: bool = Query(False, description="Return stubbed data for testing."),
     page: int = Query(1, ge=1, description="Page number for pagination."),
     per_page: int = Query(10, ge=1, le=100, description="Items per page."),
     sort_by: Optional[str] = Query("transaction_date", description="Field to sort by."),
@@ -94,9 +92,6 @@ def list_ezpass_transactions(
     Provides a paginated and filterable view of all imported EZPass transactions,
     matching the UI requirements.
     """
-    if use_stubs:
-        return create_stub_ezpass_response(page, per_page)
-    
     try:
         transactions, total_items = ezpass_service.repo.list_transactions(
             page=page,
