@@ -75,17 +75,39 @@ result_backend_transport_options = {
 # This defines when periodic tasks should run
 beat_schedule = {
     # --- CURB Fetch, Upload to S3, and Process Pipeline (Daily) ---
-    "curb-import-3hour-window": {
+    # ==========================================================================
+    # CURB IMPORT - 8 INTERVALS PER DAY (Every 3 hours)
+    # ==========================================================================
+    # Runs at: 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 EST/EDT
+    #
+    # Import Windows (each job imports the PREVIOUS 3-hour window):
+    # - 00:00 run → imports 21:00-23:59:59 (previous day)
+    # - 03:00 run → imports 00:00-02:59:59
+    # - 06:00 run → imports 03:00-05:59:59
+    # - 09:00 run → imports 06:00-08:59:59
+    # - 12:00 run → imports 09:00-11:59:59
+    # - 15:00 run → imports 12:00-14:59:59
+    # - 18:00 run → imports 15:00-17:59:59
+    # - 21:00 run → imports 18:00-20:59:59
+    # ==========================================================================
+    "curb-import-8-intervals-daily": {
         "task": "curb.import_trips_task",
-        "schedule": crontab(minute=0, hour='*/3'),
+        "schedule": crontab(minute=0, hour='0,3,6,9,12,15,18,21'),  # 8 times per day
         "options": {"timezone": "America/New_York"},
+        "kwargs": {
+            # Task will automatically use 3-hour window
+            # No need to specify from_datetime/to_datetime
+        }
     },
     
-    "curb-post-to-ledger-sunday": {
-        "task": "curb.post_trips_to_ledger_task",
-        "schedule": crontab(hour=3, minute=30, day_of_week=0),
-        "options": {"timezone": "America/New_York"},
-    },
+    # Alternative: If you want ALIGNED windows (run at end of each window)
+    # This version runs at 02:59, 05:59, 08:59, etc. to import complete windows
+    # "curb-import-aligned-windows": {
+    #     "task": "curb.import_trips_aligned_task",  # Use the aligned version
+    #     "schedule": crontab(minute=59, hour='2,5,8,11,14,17,20,23'),
+    #     "options": {"timezone": "America/New_York"},
+    #     "enabled": False,  # Enable this if you prefer aligned windows
+    # },
     
     # ========================================================================
     # SUNDAY MORNING FINANCIAL PROCESSING CHAIN (REPLACES 5 INDIVIDUAL TASKS)

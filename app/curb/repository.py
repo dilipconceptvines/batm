@@ -17,6 +17,11 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.curb.exceptions import CurbAccountNotFoundError, CurbTripNotFoundError
 from app.curb.models import CurbAccount, CurbTrip, CurbTripStatus, PaymentType
+from app.drivers.models import Driver
+from app.vehicles.models import Vehicle, VehicleRegistration
+from app.medallions.models import Medallion
+from app.drivers.models import TLCLicense
+from app.utils.general import apply_multi_filter
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -369,3 +374,189 @@ class CurbRepository:
                 CurbTrip.status == CurbTripStatus.IMPORTED
             ).scalar(),
         }
+    
+    def list_trips_with_enhanced_filters(
+        self,
+        page: int = 1,
+        per_page: int = 50,
+        # Comma-separated ID/Text filters
+        trip_ids: Optional[str] = None,
+        driver_ids: Optional[str] = None,
+        vehicle_plates: Optional[str] = None,
+        medallion_numbers: Optional[str] = None,
+        tlc_license_numbers: Optional[str] = None,
+        # Date range filters
+        trip_start_from: Optional[datetime] = None,
+        trip_start_to: Optional[datetime] = None,
+        trip_end_from: Optional[datetime] = None,
+        trip_end_to: Optional[datetime] = None,
+        transaction_date_from: Optional[datetime] = None,
+        transaction_date_to: Optional[datetime] = None,
+        # Amount range filters
+        total_amount_from: Optional[Decimal] = None,
+        total_amount_to: Optional[Decimal] = None,
+        # Payment modes (comma-separated)
+        payment_modes: Optional[str] = None,
+        # Status filter
+        status: Optional[str] = None,
+        # Account filter
+        account_ids: Optional[List[int]] = None,
+        # Sorting
+        sort_by: str = "start_time",
+        sort_order: str = "desc",
+    ) -> Tuple[List[CurbTrip], int]:
+        """
+        Enhanced trip listing with comprehensive filters optimized for millions of records.
+        
+        **Optimization Strategy:**
+        - Uses indexed columns for filtering (composite indexes)
+        - Minimal joins - only loads relationships needed
+        - Count query optimization with same filters
+        - Proper use of query.options() for eager loading
+        
+        Returns:
+            Tuple of (filtered_trips, total_count)
+        """
+        
+        # Base query with optimized joins
+        # Only join tables that are actually needed for filtering or display
+        query = self.db.query(CurbTrip).options(
+            joinedload(CurbTrip.account),  # Always needed for display
+            joinedload(CurbTrip.driver),    # Always needed for display
+            joinedload(CurbTrip.lease),     # Always needed for display
+        )
+        
+        # Track which additional joins we need
+        needs_vehicle_join = vehicle_plates is not None
+        needs_medallion_join = medallion_numbers is not None
+        needs_tlc_join = tlc_license_numbers is not None
+        
+        # Conditionally join only when needed for filtering
+        if needs_vehicle_join:
+            query = query.outerjoin(Vehicle, CurbTrip.vehicle_id == Vehicle.id)
+            query = query.outerjoin(
+                VehicleRegistration,
+                and_(
+                    Vehicle.id == VehicleRegistration.vehicle_id,
+                    VehicleRegistration.is_active == True
+                )
+            )
+        
+        if needs_medallion_join:
+            query = query.outerjoin(Medallion, CurbTrip.medallion_id == Medallion.id)
+        
+        if needs_tlc_join:
+            query = query.outerjoin(Driver, CurbTrip.driver_id == Driver.id)
+            query = query.outerjoin(TLCLicense, Driver.tlc_license_id == TLCLicense.id)
+        
+        # ==================================================================
+        # APPLY FILTERS (using indexed columns where possible)
+        # ==================================================================
+        
+        # 1. Trip IDs filter (comma-separated) - uses unique index
+        if trip_ids:
+            query = apply_multi_filter(query, CurbTrip.curb_trip_id, trip_ids)
+        
+        # 2. Driver IDs filter (comma-separated) - uses indexed column
+        if driver_ids:
+            driver_id_list = [int(did.strip()) for did in driver_ids.split(',') if did.strip().isdigit()]
+            if driver_id_list:
+                query = query.filter(CurbTrip.driver_id.in_(driver_id_list))
+        
+        # 3. Vehicle plates filter (comma-separated)
+        if vehicle_plates:
+            query = apply_multi_filter(query, VehicleRegistration.plate_number, vehicle_plates)
+        
+        # 4. Medallion numbers filter (comma-separated) - uses curb_cab_number (indexed)
+        if medallion_numbers:
+            query = apply_multi_filter(query, CurbTrip.curb_cab_number, medallion_numbers)
+        
+        # 5. TLC License numbers filter (comma-separated)
+        if tlc_license_numbers:
+            query = apply_multi_filter(query, TLCLicense.tlc_license_number, tlc_license_numbers)
+        
+        # 6. Trip start date range filter - uses composite index idx_curb_trip_time_status
+        if trip_start_from:
+            query = query.filter(CurbTrip.start_time >= trip_start_from)
+        if trip_start_to:
+            query = query.filter(CurbTrip.start_time <= trip_start_to)
+        
+        # 7. Trip end date range filter
+        if trip_end_from:
+            query = query.filter(CurbTrip.end_time >= trip_end_from)
+        if trip_end_to:
+            query = query.filter(CurbTrip.end_time <= trip_end_to)
+        
+        # 8. Transaction date range filter
+        if transaction_date_from:
+            query = query.filter(CurbTrip.transaction_date >= transaction_date_from)
+        if transaction_date_to:
+            query = query.filter(CurbTrip.transaction_date <= transaction_date_to)
+        
+        # 9. Total amount range filter
+        if total_amount_from:
+            query = query.filter(CurbTrip.total_amount >= total_amount_from)
+        if total_amount_to:
+            query = query.filter(CurbTrip.total_amount <= total_amount_to)
+        
+        # 10. Payment modes filter (comma-separated) - uses indexed column
+        if payment_modes:
+            payment_mode_list = [pm.strip().upper() for pm in payment_modes.split(',') if pm.strip()]
+            # Convert string values to PaymentType enum
+            valid_payment_types = []
+            for pm in payment_mode_list:
+                try:
+                    valid_payment_types.append(PaymentType[pm])
+                except KeyError:
+                    logger.warning(f"Invalid payment mode: {pm}")
+            
+            if valid_payment_types:
+                query = query.filter(CurbTrip.payment_type.in_(valid_payment_types))
+        
+        # 11. Status filter - uses composite index idx_curb_trip_time_status
+        if status:
+            try:
+                status_enum = CurbTripStatus[status.upper()]
+                query = query.filter(CurbTrip.status == status_enum)
+            except KeyError:
+                logger.warning(f"Invalid status: {status}")
+        
+        # 12. Account IDs filter - uses indexed column
+        if account_ids:
+            query = query.filter(CurbTrip.account_id.in_(account_ids))
+        
+        # ==================================================================
+        # GET TOTAL COUNT (before pagination, with same filters)
+        # ==================================================================
+        total_count = query.with_entities(func.count(CurbTrip.id)).scalar()
+        
+        # ==================================================================
+        # APPLY SORTING
+        # ==================================================================
+        sort_column_map = {
+            "trip_id": CurbTrip.curb_trip_id,
+            "start_time": CurbTrip.start_time,
+            "end_time": CurbTrip.end_time,
+            "transaction_date": CurbTrip.transaction_date,
+            "driver_id": CurbTrip.driver_id,
+            "total_amount": CurbTrip.total_amount,
+            "payment_type": CurbTrip.payment_type,
+            "status": CurbTrip.status,
+        }
+        
+        sort_column = sort_column_map.get(sort_by, CurbTrip.start_time)
+        
+        if sort_order.lower() == "asc":
+            query = query.order_by(sort_column.asc())
+        else:
+            query = query.order_by(sort_column.desc())
+        
+        # ==================================================================
+        # APPLY PAGINATION
+        # ==================================================================
+        offset = (page - 1) * per_page
+        trips = query.offset(offset).limit(per_page).all()
+        
+        logger.info(f"Retrieved {len(trips)} CURB trips (page {page}, total: {total_count})")
+        
+        return trips, total_count
