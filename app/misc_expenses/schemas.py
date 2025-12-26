@@ -6,6 +6,8 @@ from typing import List, Optional, Dict, Any
 
 from pydantic import BaseModel, Field
 
+from app.misc_expenses.models import PaymentType, MiscellaneousExpenseStatus
+
 
 class MiscellaneousExpenseCreate(BaseModel):
     """
@@ -19,6 +21,10 @@ class MiscellaneousExpenseCreate(BaseModel):
     medallion_id: int
 
     # From Step 2: Expense Information
+    payment_type: PaymentType = Field(
+        ..., 
+        description="EXPENSE (charge to driver) or CREDIT (credit to driver)"
+    )
     category: str = Field(..., min_length=1, description="The category of the expense (e.g., Lost Key, Cleaning Fee).")
     amount: Decimal = Field(..., gt=0, description="The total amount of the charge.")
     expense_date: date
@@ -34,6 +40,7 @@ class MiscellaneousExpenseResponse(BaseModel):
     reference_no: Optional[str] = Field(None, alias="reference_number")
     category: str
     expense_date: date = Field(..., alias="expense_date")
+    payment_type: str
     amount: Decimal
     notes: Optional[str] = None
     driver_name: Optional[str] = None

@@ -465,7 +465,7 @@ def get_curb_statistics(
         raise HTTPException(status_code=500, detail=str(e)) from e
     
 
-@router.get("/trips/export", summary="Export CURB Trips Data")
+@router.get("/trips/export/all", summary="Export CURB Trips Data")
 def export_curb_trips(
     export_format: str = Query("excel", regex="^(excel|csv|pdf|json)$", alias="format"),
     

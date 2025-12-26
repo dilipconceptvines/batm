@@ -8,6 +8,7 @@
     "lease_id",
     "vehicle_id",
     "medallion_id",
+    "payment_type",
     "category",
     "amount",
     "expense_date"
@@ -17,6 +18,11 @@
       "type": "integer",
       "description": "Unique identifier for the driver",
       "minimum": 1
+    },
+    "payment_type": {
+      "type": "string",
+      "description": "Type of payment",
+      "enum": ["EXPENSE", "CREDIT"]
     },
     "lease_id": {
       "type": "integer",

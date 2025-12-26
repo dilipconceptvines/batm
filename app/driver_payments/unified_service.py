@@ -14,6 +14,7 @@ from sqlalchemy import or_, and_, func, case
 
 from app.dtr.models import DTR, DTRStatus, PaymentMethod as DTRPaymentMethod
 from app.interim_payments.models import InterimPayment, PaymentMethod as InterimPaymentMethod
+from app.misc_expenses.models import MiscellaneousExpense, PaymentType
 from app.loans.models import DriverLoan, LoanStatus
 from app.repairs.models import RepairInvoice, RepairInvoiceStatus
 from app.drivers.models import Driver, TLCLicense
@@ -164,6 +165,20 @@ class UnifiedDriverPaymentsService:
                 plate_number=plate_number
             )
             all_payments.extend(repair_payments)
+
+        # 5. Miscellaneous Payments (NEW)
+        if not receipt_type or receipt_type in ["Miscellaneous Expense", "Miscellaneous Credit"]:
+            misc_payments = self._get_miscellaneous_payments(
+                receipt_number=receipt_number,
+                status=status,
+                total_due_min=total_due_min,
+                total_due_max=total_due_max,
+                medallion_number=medallion_number,
+                tlc_license=tlc_license,
+                driver_name=driver_name,
+                plate_number=plate_number
+            )
+            all_payments.extend(misc_payments)
         
         # Sort the combined results
         all_payments = self._sort_payments(all_payments, sort_by, sort_order)
@@ -177,6 +192,105 @@ class UnifiedDriverPaymentsService:
         paginated_payments = all_payments[start_idx:end_idx]
         
         return paginated_payments, total
+    
+    def _get_miscellaneous_payments(self, **filters) -> List[UnifiedPaymentItem]:
+        """Get Miscellaneous Payment records"""
+        query = self.db.query(MiscellaneousExpense).options(
+            joinedload(MiscellaneousExpense.driver).joinedload(Driver.tlc_license),
+            joinedload(MiscellaneousExpense.lease).joinedload(Lease.medallion),
+            joinedload(MiscellaneousExpense.vehicle)
+        )
+        
+        # Apply filters similar to other payment types
+        if filters.get('receipt_number'):
+            query = query.filter(
+                MiscellaneousExpense.expense_id.ilike(f'%{filters["receipt_number"]}%')
+            )
+        
+        if filters.get('status'):
+            query = query.filter(MiscellaneousExpense.status == filters['status'])
+        
+        # Amount filters
+        if filters.get('total_due_min') is not None:
+            query = query.filter(MiscellaneousExpense.amount >= filters['total_due_min'])
+        if filters.get('total_due_max') is not None:
+            query = query.filter(MiscellaneousExpense.amount <= filters['total_due_max'])
+        
+        # Join filters for related entities
+        if filters.get('medallion_number'):
+            med_vals = [m.strip() for m in filters['medallion_number'].split(',') if m.strip()]
+            if med_vals:
+                query = query.join(MiscellaneousExpense.lease).join(Lease.medallion).filter(
+                    or_(*[Medallion.medallion_number.ilike(f'%{m}%') for m in med_vals])
+                )
+        
+        if filters.get('tlc_license'):
+            tlc_vals = [t.strip() for t in filters['tlc_license'].split(',') if t.strip()]
+            if tlc_vals:
+                query = query.join(MiscellaneousExpense.driver).join(
+                    TLCLicense, Driver.tlc_license_number_id == TLCLicense.id, isouter=True
+                ).filter(
+                    or_(*[TLCLicense.tlc_license_number.ilike(f'%{t}%') for t in tlc_vals])
+                )
+        
+        if filters.get('driver_name'):
+            name_vals = [n.strip() for n in filters['driver_name'].split(',') if n.strip()]
+            if name_vals:
+                exprs = []
+                for n in name_vals:
+                    like = f'%{n}%'
+                    exprs.extend([
+                        Driver.first_name.ilike(like),
+                        Driver.last_name.ilike(like),
+                        func.concat(Driver.first_name, ' ', Driver.last_name).ilike(like)
+                    ])
+                query = query.join(MiscellaneousExpense.driver).filter(or_(*exprs))
+        
+        if filters.get('plate_number'):
+            plate_vals = [p.strip() for p in filters['plate_number'].split(',') if p.strip()]
+            if plate_vals:
+                query = query.join(MiscellaneousExpense.vehicle).join(
+                    VehicleRegistration,
+                    VehicleRegistration.vehicle_id == Vehicle.id
+                ).filter(
+                    or_(*[VehicleRegistration.plate_number.ilike(f'%{p}%') for p in plate_vals])
+                )
+        
+        payments = query.all()
+        
+        result = []
+        for payment in payments:
+            receipt_type = (
+                "Miscellaneous Expense" 
+                if payment.payment_type == PaymentType.EXPENSE 
+                else "Miscellaneous Credit"
+            )
+            
+            item = UnifiedPaymentItem(
+                id=payment.id,
+                receipt_type=receipt_type,
+                receipt_number=payment.expense_id,
+                payment_date=payment.expense_date,
+                medallion_number=(
+                    payment.lease.medallion.medallion_number 
+                    if payment.lease and payment.lease.medallion 
+                    else None
+                ),
+                tlc_license=(
+                    payment.driver.tlc_license.tlc_license_number 
+                    if payment.driver and payment.driver.tlc_license 
+                    else None
+                ),
+                driver_name=payment.driver.full_name if payment.driver else None,
+                plate_number=None,
+                total_amount=payment.amount,
+                status=payment.status.value,
+                payment_method=None,
+                receipt_url=payment.presigned_receipt_url
+            )
+            result.append(item)
+        
+        return result
     
     def _get_dtr_payments(self, **filters) -> List[UnifiedPaymentItem]:
         """Get DTR payments"""

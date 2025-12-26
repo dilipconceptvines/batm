@@ -213,44 +213,18 @@ def search_driver_and_enter_expense_details_fetch(db: Session, case_no: str, cas
 @step(step_id="308", name="Process - Create Miscellaneous Expense", operation="process")
 def create_miscellaneous_expense_process(db: Session, case_no: str, step_data: Dict[str, Any]):
     """
-    Processes the final submission of the miscellaneous expense, creating the master record
-    and posting the charge immediately to the centralized ledger.
+    Processes miscellaneous payment creation (both EXPENSE and CREDIT)
     
-    This step handles:
-    1. Data validation using Pydantic schema
-    2. Creating the miscellaneous expense master record
-    3. Immediate posting to the ledger as a DEBIT obligation
-    4. Linking the expense to the BPM case
-    5. Creating audit trail
-    6. Closing the BPM case (single-step workflow)
-    
-    Args:
-        db: Database session
-        case_no: BPM case number
-        step_data: Dictionary containing expense creation data
-            - driver_id: ID of the driver
-            - lease_id: ID of the associated lease
-            - vehicle_id: ID of the vehicle
-            - medallion_id: ID of the medallion
-            - category: Expense category (e.g., "Cleaning", "Lost Key")
-            - amount: Decimal amount of the expense (must be > 0)
-            - expense_date: Date of the expense
-            - reference_number: Optional reference number
-            - notes: Optional notes
-            - document_id: Optional uploaded document ID
-    
-    Returns:
-        Dict with success message
-    
-    Raises:
-        HTTPException: For validation errors or ledger posting failures
+    Handles:
+    - Type="Expense" → Posts DEBIT to ledger (charge to driver)
+    - Type="Credit" → Posts CREDIT to ledger (credit to driver)
     """
     try:
         logger.info("Processing Miscellaneous Expense creation", case_no=case_no)
         
         # Validate the incoming data using Pydantic schema
         try:
-            expense_create_data = MiscellaneousExpenseCreate(**step_data)
+            payment_create_data = MiscellaneousExpenseCreate(**step_data)
         except Exception as validation_error:
             logger.error(
                 "Validation error for Miscellaneous Expense data",
@@ -275,7 +249,7 @@ def create_miscellaneous_expense_process(db: Session, case_no: str, step_data: D
         misc_expense_service = MiscellaneousExpenseService(db)
         created_expense = misc_expense_service.create_misc_expense(
             case_no=case_no,
-            expense_data=expense_create_data,
+            expense_data=payment_create_data,
             user_id=current_user_id
         )
         
@@ -310,17 +284,18 @@ def create_miscellaneous_expense_process(db: Session, case_no: str, step_data: D
             db,
             description=(
                 f"Miscellaneous Expense created: {created_expense.expense_id} - "
-                f"{expense_create_data.category} - ${expense_create_data.amount}"
+                f"{payment_create_data.category} - ${payment_create_data.amount}"
             ),
             case=case,
             meta_data={
                 "expense_id": created_expense.expense_id,
-                "category": expense_create_data.category,
-                "amount": float(expense_create_data.amount),
-                "driver_id": expense_create_data.driver_id,
-                "lease_id": expense_create_data.lease_id,
-                "expense_date": expense_create_data.expense_date.isoformat(),
-                "reference_number": expense_create_data.reference_number,
+                "payment_type": payment_create_data.payment_type.value,
+                "category": payment_create_data.category,
+                "amount": float(payment_create_data.amount),
+                "driver_id": payment_create_data.driver_id,
+                "lease_id": payment_create_data.lease_id,
+                "expense_date": payment_create_data.expense_date.isoformat(),
+                "reference_number": payment_create_data.reference_number,
             },
             audit_type=AuditTrailType.AUTOMATED,
         )
@@ -329,7 +304,7 @@ def create_miscellaneous_expense_process(db: Session, case_no: str, step_data: D
             "Miscellaneous Expense successfully created and posted to ledger",
             case_no=case_no,
             expense_id=created_expense.expense_id,
-            amount=float(expense_create_data.amount)
+            amount=float(payment_create_data.amount)
         )
         
         return {

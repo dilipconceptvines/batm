@@ -11,10 +11,10 @@ from app.misc_expenses.exceptions import (
     MiscellaneousExpenseLedgerError,
     MiscellaneousExpenseValidationError,
 )
-from app.misc_expenses.models import MiscellaneousExpense
+from app.misc_expenses.models import MiscellaneousExpense, MiscellaneousExpenseStatus
 from app.misc_expenses.repository import MiscellaneousExpenseRepository
 from app.misc_expenses.schemas import MiscellaneousExpenseCreate
-from app.ledger.models import PostingCategory
+from app.ledger.models import PostingCategory, EntryType
 from app.ledger.services import LedgerService
 from app.ledger.repository import LedgerRepository
 from app.utils.logger import get_logger
@@ -50,9 +50,10 @@ class MiscellaneousExpenseService:
 
     def create_misc_expense(self, case_no: str, expense_data: MiscellaneousExpenseCreate, user_id: int) -> MiscellaneousExpense:
         """
-        Creates a new Miscellaneous Expense from the BPM workflow.
-        This operation validates the data, creates the master record, and
-        immediately posts the charge as an obligation to the ledger.
+        Create miscellaneous payment (expense or credit)
+        
+        - EXPENSE: Posts DEBIT to ledger (charge to driver)
+        - CREDIT: Posts CREDIT to ledger (payment to driver)
         """
         try:
             # --- Validation ---
@@ -63,9 +64,55 @@ class MiscellaneousExpenseService:
 
             # --- Create Master Expense Record ---
             expense_id = self._generate_next_expense_id()
+
+            # Determine ledger entry type based on payment type
+            if expense_data.payment_type == "EXPENSE":
+                # Expense = DEBIT (charge to driver, increases what they owe)
+                entry_type = EntryType.DEBIT
+                posting_category = PostingCategory.MISCELLANEOUS_EXPENSE
+                logger.info(f"Creating EXPENSE (DEBIT) - {expense_id}")
+            else: # PaymentType.CREDIT
+                # Credit = CREDIT (payment to driver, increases what we owe them)
+                entry_type = EntryType.CREDIT
+                posting_category = PostingCategory.MISCELLANEOUS_CREDIT
+                logger.info(f"Creating CREDIT (CREDIT) - {expense_id}")
+
+            # Post to ledger
+            reference_id = f"MISC-PAY-{expense_id}"
+
+            try:
+                posting, balance = self.ledger_service.create_obligation(
+                    category=posting_category,
+                    amount=expense_data.amount,
+                    entry_type=entry_type,
+                    reference_id=reference_id,
+                    driver_id=expense_data.driver_id,
+                    lease_id=expense_data.lease_id,
+                    vehicle_id=expense_data.vehicle_id,
+                    medallion_id=expense_data.medallion_id,
+                )
+                
+                ledger_posting_id = posting.id
+                logger.info(
+                    f"Ledger posting created for {expense_data.payment_type.value}",
+                    payment_id=expense_id,
+                    posting_id=ledger_posting_id,
+                    entry_type=entry_type.value
+                )
+                
+            except Exception as ledger_error:
+                logger.error(
+                    "Ledger posting failed for miscellaneous payment",
+                    payment_id=expense_id,
+                    error=str(ledger_error)
+                )
+                raise MiscellaneousExpenseLedgerError(
+                    expense_id=expense_id,reason=f"Failed to post to ledger: {str(ledger_error)}"
+                ) from ledger_error
+
             new_expense = MiscellaneousExpense(
                 expense_id=expense_id,
-                case_no=case_no,
+                payment_type=expense_data.payment_type,
                 driver_id=expense_data.driver_id,
                 lease_id=expense_data.lease_id,
                 vehicle_id=expense_data.vehicle_id,
@@ -76,34 +123,22 @@ class MiscellaneousExpenseService:
                 amount=expense_data.amount,
                 notes=expense_data.notes,
                 created_by=user_id,
+                ledger_posting_ref=str(ledger_posting_id),
+                status=MiscellaneousExpenseStatus.OPEN,
             )
             
-            # --- Post to Ledger ---
-            # This is an atomic operation that creates a DEBIT posting and an OPEN balance
-            balance = self.ledger_service.create_obligation(
-                category=PostingCategory.MISC,
-                amount=new_expense.amount,
-                reference_id=new_expense.expense_id, # Use the unique expense ID as the reference
-                driver_id=new_expense.driver_id,
-                lease_id=new_expense.lease_id,
-                vehicle_id=new_expense.vehicle_id,
-                medallion_id=new_expense.medallion_id,
-            )
-            
-            # Link the ledger posting reference back to the expense record
-            new_expense.ledger_posting_ref = balance.reference_id # balance.reference_id holds the posting ID
-            
-            # Now that the ledger posting is successful, save the expense record
-            created_expense = self.repo.create_expense(new_expense)
-
-            # --- Link to BPM Case ---
-            bpm_service.create_case_entity(
-                self.db, case_no, "miscellaneous_expense", "id", str(created_expense.id)
-            )
-            
+            self.db.add(new_expense)
             self.db.commit()
-            logger.info(f"Successfully created Miscellaneous Expense {expense_id} and posted to ledger.")
-            return created_expense
+            self.db.refresh(new_expense)
+
+            logger.info(
+                f"Miscellaneous {expense_data.payment_type.value} created successfully",
+                payment_id=new_expense.expense_id,
+                amount=float(new_expense.amount),
+                category=new_expense.category
+            )
+
+            return new_expense
 
         except (MiscellaneousExpenseValidationError, InvalidAllocationError) as e:
             self.db.rollback()
