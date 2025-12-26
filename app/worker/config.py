@@ -108,6 +108,11 @@ beat_schedule = {
     #     "options": {"timezone": "America/New_York"},
     #     "enabled": False,  # Enable this if you prefer aligned windows
     # },
+
+    "ezpass_associate_and_post": {
+        "task": "ezpass.associate_and_post_transactions",
+        "schedule": crontab(minute=0, hour="*/3"),  # Every 3 hours
+    },
     
     # ========================================================================
     # SUNDAY MORNING FINANCIAL PROCESSING CHAIN (REPLACES 5 INDIVIDUAL TASKS)

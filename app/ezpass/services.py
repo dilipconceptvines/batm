@@ -6,10 +6,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional, Dict
 
-from celery import shared_task
 from sqlalchemy.orm import Session
 
-from app.core.db import SessionLocal
 from app.curb.models import CurbTrip
 from app.ezpass.exceptions import (
     AssociationError,
@@ -35,26 +33,30 @@ logger = get_logger(__name__)
 # a distributed lock (e.g., using Redis) would be more robust.
 IMPORT_IN_PROGRESS_FLAG = False
 
-# Available log types for filtering
-AVAILABLE_LOG_TYPES = [
-    "Import",
-    # Future: "Associate", "Post"
-]
-
-# Available log statuses for filtering
-AVAILABLE_LOG_STATUSES = [
-    "Success",
-    "Partial Success", 
-    "Failure",
-    "Pending",
-    "Processing"
-]
+AVAILABLE_LOG_TYPES = ["Import"]
+AVAILABLE_LOG_STATUSES = ["Success", "Partial Success", "Failure", "Pending", "Processing"]
 
 
 class EZPassService:
     """
-    Service layer for handling EZPass CSV imports, transaction association,
-    and ledger posting.
+    Service layer for handling EZPass CSV imports with immediate ledger posting.
+    
+    NEW WORKFLOW (v3.0):
+    ====================
+    1. Import CSV → IMPORTED status
+    2. Associate with vehicle/driver/lease → Immediately post to ledger
+    3. Transaction moves directly to POSTED_TO_LEDGER (single atomic operation)
+    
+    REASSIGNMENT FLOW:
+    =================
+    - IMPORTED/ASSOCIATION_FAILED: Update associations only
+    - POSTED_TO_LEDGER with balance > 0: Refund old driver + charge new driver
+    - POSTED_TO_LEDGER with balance = 0: Update associations only (already paid)
+    
+    CSV AMOUNT HANDLING:
+    ===================
+    - Negative amounts ($-9.11): Obligations (DEBIT to driver)
+    - Positive amounts ($9.00): Refunds (CREDIT to driver)
     """
 
     def __init__(self, db: Session):
@@ -68,715 +70,465 @@ class EZPassService:
         Maps CSV column names to their indices, handling different column orders.
         Returns a dictionary with expected field names as keys and column indices as values.
         """
-        # Define possible column name variations for each field
-        column_mappings = {
-            'transaction_id': ['transaction id', 'trans id', 'id', 'transaction_id', 'txn_id', 'lane txn id', 'lane transaction id'],
-            'tag_or_plate': ['tag/plate', 'tag or plate', 'plate', 'tag', 'tag_or_plate', 'license_plate', 'tag/plate #', 'tag/plate number'],
-            'agency': ['agency', 'toll agency', 'authority', 'agency_name'],
-            'entry_plaza': ['entry plaza', 'entry', 'entry_plaza', 'on_plaza', 'entrance'],
-            'exit_plaza': ['exit plaza', 'exit', 'exit_plaza', 'off_plaza', 'exit_point'],
-            'ezpass_class': ['class', 'vehicle class', 'ezpass class', 'ezpass_class', 'veh_class'],
-            'date': ['date', 'transaction date', 'trans date', 'txn_date', 'travel_date'],
-            'time': ['time', 'transaction time', 'trans time', 'txn_time', 'travel_time'],
-            'amount': ['amount', 'toll amount', 'charge', 'cost', 'fee', 'price'],
-            'medallion': ['medallion', 'med', 'cab', 'medallion_no', 'med_no', 'cab_no'],
-            'posted_date': ['posted date', 'posting date', 'post date'],
-            'balance': ['balance', 'post txn balance', 'transaction balance', 'account balance']
+        column_mapping = {
+            "Lane Txn ID": None,
+            "Tag/Plate #": None,
+            "Posted Date": None,
+            "Agency": None,
+            "Entry Plaza": None,
+            "Exit Plaza": None,
+            "Class": None,
+            "Date": None,
+            "Time": None,
+            "Amount": None,
+            "Post Txn Balance": None,
         }
         
-        # Normalize header names (lowercase, strip whitespace)
-        normalized_header = [col.strip().lower() for col in header]
+        for idx, col_name in enumerate(header):
+            col_name = col_name.strip()
+            if col_name in column_mapping:
+                column_mapping[col_name] = idx
         
-        # Find the index for each required field
-        field_indices = {}
-        
-        for field, possible_names in column_mappings.items():
-            index_found = None
-            for i, col_name in enumerate(normalized_header):
-                if any(possible_name in col_name for possible_name in possible_names):
-                    index_found = i
-                    break
-            
-            if index_found is not None:
-                field_indices[field] = index_found
-                logger.debug(f"Mapped field '{field}' to column index {index_found} ('{header[index_found]}')")
-            else:
-                logger.warning(f"Could not find column for field '{field}' in header: {header}")
-        
-        return field_indices
-
-    def _parse_transaction_row(self, row: list, column_indices: dict, row_num: int) -> Optional[dict]:
-        """
-        Parse a single CSV row into transaction data.
-        
-        Args:
-            row: List of CSV values
-            column_indices: Dictionary mapping field names to column indices
-            row_num: Row number (for error reporting)
-            
-        Returns:
-            Dictionary with parsed transaction data, or None if row should be excluded
-            
-        Raises:
-            CSVParseError: If row validation fails
-        """
-        try:
-            # Validate row has enough columns
-            max_index = max(column_indices.values())
-            if len(row) <= max_index:
-                raise CSVParseError(
-                    f"Row {row_num} has {len(row)} columns but needs at least {max_index + 1}"
-                )
-            
-            # Extract required fields
-            transaction_id = row[column_indices['transaction_id']].strip()
-            tag_or_plate = row[column_indices['tag_or_plate']].strip()
-            agency = row[column_indices['agency']].strip()
-            entry_plaza = row[column_indices['entry_plaza']].strip()
-            exit_plaza = row[column_indices['exit_plaza']].strip()
-            ezpass_class = row[column_indices['ezpass_class']].strip()
-            date_str = row[column_indices['date']].strip()
-            time_str = row[column_indices['time']].strip()
-            amount_str = row[column_indices['amount']].strip()
-            
-            # Validate required fields are not empty
-            if not all([transaction_id, tag_or_plate, agency, entry_plaza, exit_plaza, 
-                       ezpass_class, date_str, time_str, amount_str]):
-                raise CSVParseError(f"Row {row_num} has empty required fields")
-            
-            # Skip CRZ exit plaza transactions
-            if exit_plaza.upper() == "CRZ":
-                logger.debug(f"Excluding row {row_num} with CRZ exit plaza")
-                return None
-            
-            # Process amount (handle parentheses for negative values, remove $ signs)
-            amount_str = amount_str.replace("(", "-").replace(")", "").replace("$", "").replace(",", "")
-            
-            try:
-                amount = Decimal(amount_str)
-            except (ValueError, TypeError) as e:
-                raise CSVParseError(f"Row {row_num}: Invalid amount '{amount_str}': {e}")
-            
-            # Process datetime - combine date and time
-            transaction_datetime_str = f"{date_str} {time_str}"
-            transaction_datetime = None
-            
-            # Try parsing with different datetime formats
-            datetime_formats = [
-                "%m/%d/%Y %I:%M:%S %p",  # 10/28/2025 11:29:22 AM
-                "%m/%d/%Y %I:%M %p",     # 10/28/2025 11:29 AM
-                "%Y-%m-%d %H:%M:%S",     # 2025-10-28 11:29:22
-                "%Y-%m-%d %H:%M",        # 2025-10-28 11:29
-                "%m/%d/%Y %H:%M:%S",     # 10/28/2025 23:29:22
-                "%m/%d/%Y %H:%M",        # 10/28/2025 23:29
-                "%m-%d-%Y %I:%M:%S %p",  # 10-28-2025 11:29:22 AM
-                "%m-%d-%Y %H:%M:%S",     # 10-28-2025 23:29:22
-            ]
-            
-            for fmt in datetime_formats:
-                try:
-                    transaction_datetime = datetime.strptime(transaction_datetime_str, fmt)
-                    break
-                except ValueError:
-                    continue
-            
-            if transaction_datetime is None:
-                raise CSVParseError(
-                    f"Row {row_num}: Unable to parse datetime '{transaction_datetime_str}' "
-                    f"with any known format"
-                )
-            
-            # Get optional medallion field
-            medallion = None
-            if 'medallion' in column_indices and len(row) > column_indices['medallion']:
-                medallion_value = row[column_indices['medallion']].strip()
-                medallion = medallion_value if medallion_value else None
-            
-            # Get optional posting date field
-            posting_date = None
-            if 'posted_date' in column_indices and len(row) > column_indices['posted_date']:
-                posted_date_str = row[column_indices['posted_date']].strip()
-                if posted_date_str:
-                    posting_date_formats = [
-                        "%m/%d/%Y",      # 10/28/2025
-                        "%Y-%m-%d",      # 2025-10-28
-                        "%m-%d-%Y",      # 10-28-2025
-                        "%d/%m/%Y",      # 28/10/2025
-                    ]
-                    
-                    for fmt in posting_date_formats:
-                        try:
-                            posting_date = datetime.strptime(posted_date_str, fmt)
-                            break
-                        except ValueError:
-                            continue
-            
-            # Return parsed transaction data
-            return {
-                "transaction_id": transaction_id,
-                "tag_or_plate": tag_or_plate,
-                "agency": agency,
-                "entry_plaza": entry_plaza,
-                "exit_plaza": exit_plaza,
-                "ezpass_class": ezpass_class,
-                "transaction_datetime": transaction_datetime,
-                "amount": amount,
-                "med_from_csv": medallion,
-                "posting_date": posting_date,
-            }
-            
-        except CSVParseError:
-            raise  # Re-raise CSVParseError as-is
-        except (ValueError, IndexError, KeyError) as e:
-            raise CSVParseError(f"Row {row_num}: Parse error: {e}") from e
-        except Exception as e:
-            raise CSVParseError(f"Row {row_num}: Unexpected error: {e}") from e
-
-    def associate_transactions(self):
-        """
-        Business logic to associate imported EZPass transactions with drivers, leases, etc.
-        This method is designed to be run in a background task.
-        """
-        logger.info("Starting EZPass transaction association task.")
-        transactions_to_process = self.repo.get_transactions_by_status(EZPassTransactionStatus.IMPORTED)
-        
-        if not transactions_to_process:
-            logger.info("No imported EZPass transactions to associate.")
-            return {"processed": 0, "successful": 0, "failed": 0}
-
-        successful_count = 0
-        failed_count = 0
-
-        for trans in transactions_to_process:
-            updates = {"status": EZPassTransactionStatus.ASSOCIATION_FAILED}
-            try:
-                # 1. Find the vehicle using the plate number
-                plate_number_full = trans.tag_or_plate
-                plate_number = plate_number_full.split(' ')[1] if ' ' in plate_number_full else plate_number_full
-                
-                vehicle_reg = self.db.query(VehicleRegistration).filter(
-                    VehicleRegistration.plate_number.ilike(f"%{plate_number}%")
-                ).first()
-
-                if not vehicle_reg or not vehicle_reg.vehicle:
-                    raise AssociationError(trans.transaction_id, f"No vehicle found for plate '{plate_number}'")
-                
-                vehicle = vehicle_reg.vehicle
-                updates["vehicle_id"] = vehicle.id
-
-                # 2. Find the corresponding CURB trip to identify the driver
-                # Look for a trip within a time window around the toll time
-                time_buffer = timedelta(minutes=30)
-                trip_start = trans.transaction_datetime - time_buffer
-                trip_end = trans.transaction_datetime + time_buffer
-
-                curb_trip = self.db.query(CurbTrip).filter(
-                    CurbTrip.vehicle_id == vehicle.id,
-                    CurbTrip.start_time <= trip_end,
-                    CurbTrip.end_time >= trip_start
-                ).order_by(CurbTrip.start_time.desc()).first()
-                
-                if not curb_trip or not curb_trip.driver_id:
-                    curb_trip = self.db.query(CurbTrip).filter(
-                        CurbTrip.vehicle_id == vehicle.id
-                    ).order_by(CurbTrip.start_time.desc()).first()
-
-                if not curb_trip or not curb_trip.driver_id:
-                    raise AssociationError(trans.transaction_id, f"No active CURB trip found for vehicle {vehicle.id} around {trans.transaction_datetime}")
-                
-                updates["driver_id"] = curb_trip.driver_id
-                updates["lease_id"] = curb_trip.lease_id
-                updates["medallion_id"] = curb_trip.medallion_id
-                updates["status"] = EZPassTransactionStatus.ASSOCIATED
-                updates["failure_reason"] = None
-                successful_count += 1
-                
-            except AssociationError as e:
-                updates["failure_reason"] = e.reason
-                failed_count += 1
-                logger.warning(f"Association failed for transaction {trans.transaction_id}: {e.reason}")
-
-            except Exception as e:
-                updates["failure_reason"] = f"An unexpected error occurred: {str(e)}"
-                failed_count += 1
-                logger.error(f"Unexpected error associating transaction {trans.transaction_id}: {e}", exc_info=True)
-
-            finally:
-                self.repo.update_transaction(trans.id, updates)
-        
-        self.db.commit()
-        logger.info(f"Association task finished. Processed: {len(transactions_to_process)}, Successful: {successful_count}, Failed: {failed_count}")
-
-        return {"processed": len(transactions_to_process), "successful": successful_count, "failed": failed_count}
-
-    def post_tolls_to_ledger(self):
-        """
-        Posts successfully associated EZPass tolls as obligations to the Centralized Ledger.
-        This is designed to be run as a background task.
-        """
-        logger.info("Starting task to post EZPass tolls to ledger.")
-        transactions_to_post = self.repo.get_transactions_by_status(EZPassTransactionStatus.ASSOCIATED)
-
-        if not transactions_to_post:
-            logger.info("No associated EZPass transactions to post to ledger.")
-            return {"posted": 0, "failed": 0}
-
-        posted_count = 0
-        failed_count = 0
-
-        ledger_repo = LedgerRepository(self.db)
-        ledger_service = LedgerService(ledger_repo)
-
-        for trans in transactions_to_post:
-            updates = {"status": EZPassTransactionStatus.POSTING_FAILED}
-            try:
-                if not all([trans.driver_id, trans.lease_id, trans.amount != 0]):
-                    raise LedgerPostingError(trans.transaction_id, "Missing required driver, lease, or positive amount.")
-
-                if trans.amount < 0:
-                    trans.amount = trans.amount * -1
-
-                # The create_obligation method is atomic and handles both posting and balance creation
-                ledger_service.create_obligation(
-                    category=PostingCategory.EZPASS,
-                    amount=trans.amount,
-                    reference_id=trans.transaction_id,
-                    driver_id=trans.driver_id,
-                    lease_id=trans.lease_id,
-                    vehicle_id=trans.vehicle_id,
-                    medallion_id=trans.medallion_id,
-                )
-                
-                updates["status"] = EZPassTransactionStatus.POSTED_TO_LEDGER
-                updates["failure_reason"] = None
-                updates["posting_date"] = datetime.utcnow()
-                posted_count += 1
-
-            except Exception as e:
-                updates["failure_reason"] = f"Ledger service error: {str(e)}"
-                failed_count += 1
-                logger.error(f"Failed to post EZPass transaction {trans.transaction_id} to ledger: {e}", exc_info=True)
-            
-            finally:
-                self.repo.update_transaction(trans.id, updates)
-
-        self.db.commit()
-        logger.info(f"Ledger posting task finished. Posted: {posted_count}, Failed: {failed_count}")
-        return {"posted": posted_count, "failed": failed_count}
-    
-    def retry_failed_associations(self, transaction_ids: Optional[List[int]] = None) -> dict:
-        """
-        Retry automatic association logic for failed or specific transactions.
-        This uses the SAME association logic as the initial automatic process.
-        
-        If transaction_ids provided: Only retry those specific transactions
-        If transaction_ids is None: Retry ALL ASSOCIATION_FAILED transactions
-        
-        Business Logic (same as automatic association):
-        1. Extract plate number from tag_or_plate
-        2. Find Vehicle via plate number
-        3. Find CURB trip on that vehicle ±30 minutes of toll time
-        4. If found: Associate driver_id, lease_id, medallion_id from CURB trip
-        5. Update status to ASSOCIATED or ASSOCIATION_FAILED
-        """
-        logger.info(f"Retrying association for transactions: {transaction_ids or 'all failed'}")
-        
-        # Get transactions to retry
-        if transaction_ids:
-            # Retry specific transactions
-            transactions_to_process = [
-                self.repo.get_transaction_by_id(txn_id) 
-                for txn_id in transaction_ids
-            ]
-            transactions_to_process = [t for t in transactions_to_process if t is not None]
-        else:
-            # Retry all ASSOCIATION_FAILED transactions
-            transactions_to_process = self.repo.get_transactions_by_status(
-                EZPassTransactionStatus.ASSOCIATION_FAILED
+        missing_columns = [k for k, v in column_mapping.items() if v is None]
+        if missing_columns:
+            raise CSVParseError(
+                f"Missing required columns: {', '.join(missing_columns)}"
             )
         
-        if not transactions_to_process:
-            return {
-                "processed": 0,
-                "successful": 0,
-                "failed": 0,
-                "message": "No transactions to retry association"
-            }
-        
-        successful_count = 0
-        failed_count = 0
-        
-        for trans in transactions_to_process:
-            updates = {"status": EZPassTransactionStatus.ASSOCIATION_FAILED}
-            try:
-                # 1. Find the vehicle using the plate number (same logic as automatic)
-                plate_number_full = trans.tag_or_plate
-                plate_number = plate_number_full.split(' ')[1] if ' ' in plate_number_full else plate_number_full
-                
-                vehicle_reg = self.db.query(VehicleRegistration).filter(
-                    VehicleRegistration.plate_number.ilike(f"%{plate_number}%")
-                ).first()
-
-                if not vehicle_reg or not vehicle_reg.vehicle:
-                    raise AssociationError(trans.transaction_id, f"No vehicle found for plate '{plate_number}'")
-                
-                vehicle = vehicle_reg.vehicle
-                updates["vehicle_id"] = vehicle.id
-
-                # 2. Find the corresponding CURB trip to identify the driver
-                # Look for a trip within a time window around the toll time
-                time_buffer = timedelta(minutes=30)
-                trip_start = trans.transaction_datetime - time_buffer
-                trip_end = trans.transaction_datetime + time_buffer
-
-                curb_trip = self.db.query(CurbTrip).filter(
-                    CurbTrip.vehicle_id == vehicle.id,
-                    CurbTrip.start_time <= trip_end,
-                    CurbTrip.end_time >= trip_start
-                ).order_by(CurbTrip.start_time.desc()).first()
-
-                if not curb_trip or not curb_trip.driver_id:
-                    raise AssociationError(
-                        trans.transaction_id, 
-                        f"No active CURB trip found for vehicle {vehicle.id} around {trans.transaction_datetime}"
-                    )
-                
-                # SUCCESS - Associate with driver/lease from CURB trip
-                updates["driver_id"] = curb_trip.driver_id
-                updates["lease_id"] = curb_trip.lease_id
-                updates["medallion_id"] = curb_trip.medallion_id
-                updates["status"] = EZPassTransactionStatus.ASSOCIATED
-                updates["failure_reason"] = None
-                successful_count += 1
-                
-            except AssociationError as e:
-                updates["failure_reason"] = e.reason
-                failed_count += 1
-                logger.warning(f"Association retry failed for transaction {trans.transaction_id}: {e.reason}")
-
-            except Exception as e:
-                updates["failure_reason"] = f"Unexpected error during retry: {str(e)}"
-                failed_count += 1
-                logger.error(f"Unexpected error retrying transaction {trans.transaction_id}: {e}", exc_info=True)
-
-            finally:
-                self.repo.update_transaction(trans.id, updates)
-        
-        self.db.commit()
-        logger.info(
-            f"Association retry finished. Processed: {len(transactions_to_process)}, "
-            f"Successful: {successful_count}, Failed: {failed_count}"
-        )
-        
-        # If successful associations exist, trigger posting task
-        if successful_count > 0:
-            from app.ezpass.services import post_ezpass_tolls_to_ledger_task
-            post_ezpass_tolls_to_ledger_task.delay()
-        
-        return {
-            "processed": len(transactions_to_process),
-            "successful": successful_count,
-            "failed": failed_count,
-            "message": f"Retried {len(transactions_to_process)} transactions: {successful_count} succeeded, {failed_count} failed"
-        }
-
-    # ====================== Updated service methods ===================================
-
-    def process_uploaded_csv(
-        self, file_stream: io.BytesIO, file_name: str, user_id: int
-    ) -> dict:
+        return column_mapping
+    
+    def _parse_amount(self, amount_str: str) -> Decimal:
         """
-        Triggers the NEW COMBINED task that does both association and posting in a single
-        atomic operation.
-
-        Triggers associate_and_post_ezpass_transactions_task.delay()
+        Parse amount from CSV, handling both negative (obligations) and positive (refunds).
+        
+        Examples:
+        - "($9.11)" -> Decimal("-9.11") (obligation)
+        - "$9.00" -> Decimal("9.00") (refund)
+        - "($18.72)" -> Decimal("-18.72") (obligation)
+        """
+        if not amount_str or amount_str.strip() == "":
+            return Decimal("0.00")
+        
+        amount_str = amount_str.strip().replace(",", "")
+        
+        # Handle negative amounts in parentheses: ($9.11)
+        if amount_str.startswith("(") and amount_str.endswith(")"):
+            amount_str = amount_str[1:-1]  # Remove parentheses
+            amount_str = amount_str.replace("$", "")
+            return Decimal(f"-{amount_str}")
+        
+        # Handle positive amounts: $9.00
+        amount_str = amount_str.replace("$", "")
+        return Decimal(amount_str)
+    
+    def _should_exclude_row(self, row: dict, col_map: dict, row_num: int) -> tuple:
+        """
+        Determines if a CSV row should be excluded from import.
+        
+        Returns:
+            tuple: (should_exclude: bool, exclusion_reason: str)
+        """
+        exit_plaza = row[col_map["Exit Plaza"]].strip() if row[col_map["Exit Plaza"]] else ""
+        agency = row[col_map["Agency"]].strip() if row[col_map["Agency"]] else ""
+        
+        # Exclusion 1: CRZ Records
+        if "CRZ" in exit_plaza.upper():
+            return True, "CRZ_EXCLUSION: CRZ tolling points not part of billing logic"
+        
+        # Exclusion 2: Payment/Credit/Adjustment Records  
+        # These are identified by empty agency AND positive amounts typically
+        if not agency:
+            amount_str = row[col_map["Amount"]].strip()
+            if amount_str and not amount_str.startswith("("):
+                # This might be a payment/credit record
+                logger.debug(
+                    f"Row {row_num}: Empty agency with positive amount - likely payment record",
+                    amount=amount_str
+                )
+        
+        return False, ""
+    
+    def import_csv(self, file_content: bytes, filename: str, user_id: Optional[int] = None) -> dict:
+        """
+        Import EZPass CSV file and create transaction records.
+        
+        This method:
+        1. Validates CSV format
+        2. Excludes CRZ and payment records
+        3. Creates transactions in IMPORTED status
+        4. Returns import summary
+        
+        Transactions will be associated and posted in a separate step.
         """
         global IMPORT_IN_PROGRESS_FLAG
+        
         if IMPORT_IN_PROGRESS_FLAG:
             raise ImportInProgressError()
         
         IMPORT_IN_PROGRESS_FLAG = True
+        
         try:
-            logger.info(f"Starting EZPass CSV import for file: {file_name}")
-
-            # Read and decode the file stream
-            try:
-                content = file_stream.read().decode("utf-8")
-                csv_reader = csv.reader(io.StringIO(content))
-                header = next(csv_reader)
-                rows = list(csv_reader)
-            except Exception as e:
-                raise CSVParseError(f"Failed to read or decode CSV content: {e}") from e
+            # Read bytes from BytesIO and decode to text
+            csv_text = file_content.read().decode("utf-8-sig")
+            csv_reader = csv.reader(io.StringIO(csv_text))
             
-            if not rows:
-                logger.warning(f"EZPass CSV file '{file_name}' is empty or has no data rows.")
-                return {"message": "File is empty, no transactions were imported."}
+            header = next(csv_reader)
+            col_map = self._map_csv_columns(header)
             
-            # Map column names to indices dynamically
-            column_indices = self._map_csv_columns(header)
-            logger.info(f"Column mapping for {file_name}: {column_indices}")
-
-            # Validate required columns
-            required_columns = [
-                'transaction_id', 'tag_or_plate', 'agency', 'entry_plaza', 'exit_plaza',
-                'ezpass_class', 'date', 'time', 'amount'
-            ]
-            missing_fields = [field for field in required_columns if field not in column_indices]
-            if missing_fields:
-                raise CSVParseError(
-                    f"Missing required columns: {missing_fields}. "
-                    f"Found columns: {list(column_indices.keys())}"
-                )
-            
-            # Create import record
-            import_record = self.repo.create_import_record(
-                file_name=file_name,
-                total_records=len(rows)
+            import_batch = self.repo.create_import_batch(
+                file_name=filename,
+                status=EZPassImportStatus.PROCESSING,
+                created_by=user_id
             )
-            self.db.commit()
-
-            # Parse and bulk insert transactions
-            transactions_to_insert = []
+            
+            total_rows = 0
+            successful_imports = 0
             excluded_count = 0
-            failed_count = 0
-
-            for row_num, row in enumerate(rows, start=2):
+            failed_imports = 0
+            exclusion_details = []
+            
+            for row_num, row in enumerate(csv_reader, start=2):
+                total_rows += 1
+                
+                if len(row) < len(col_map):
+                    failed_imports += 1
+                    logger.warning(f"Row {row_num}: Insufficient columns")
+                    continue
+                
+                # Check exclusions
+                should_exclude, exclusion_reason = self._should_exclude_row(row, col_map, row_num)
+                if should_exclude:
+                    excluded_count += 1
+                    exclusion_details.append({
+                        "row": row_num,
+                        "reason": exclusion_reason,
+                        "transaction_id": row[col_map["Lane Txn ID"]].strip()
+                    })
+                    continue
+                
                 try:
                     # Parse transaction data
-                    parsed_transaction = self._parse_transaction_row(
-                        row, column_indices, row_num
+                    transaction_id = row[col_map["Lane Txn ID"]].strip()
+                    tag_plate = row[col_map["Tag/Plate #"]].strip()
+                    agency = row[col_map["Agency"]].strip()
+                    entry_plaza = row[col_map["Entry Plaza"]].strip() if row[col_map["Entry Plaza"]] else None
+                    exit_plaza = row[col_map["Exit Plaza"]].strip() if row[col_map["Exit Plaza"]] else None
+                    ezpass_class = row[col_map["Class"]].strip() if row[col_map["Class"]] else None
+                    
+                    # Parse date and time
+                    date_str = row[col_map["Date"]].strip()
+                    time_str = row[col_map["Time"]].strip()
+                    datetime_str = f"{date_str} {time_str}"
+                    transaction_datetime = datetime.strptime(datetime_str, "%m/%d/%Y %I:%M:%S %p")
+                    transaction_datetime = transaction_datetime.replace(tzinfo=timezone.utc)
+                    
+                    # Parse amount (handles both negative and positive)
+                    amount = self._parse_amount(row[col_map["Amount"]])
+                    
+                    # Check for duplicate
+                    existing = self.repo.get_transaction_by_transaction_id(transaction_id)
+                    if existing:
+                        logger.warning(
+                            f"Row {row_num}: Duplicate transaction_id {transaction_id}, skipping"
+                        )
+                        failed_imports += 1
+                        continue
+                    
+                    # Create transaction
+                    transaction_data = {
+                        "import_id": import_batch.id,
+                        "transaction_id": transaction_id,
+                        "tag_or_plate": tag_plate,
+                        "agency": agency,
+                        "entry_plaza": entry_plaza,
+                        "exit_plaza": exit_plaza,
+                        "transaction_datetime": transaction_datetime,
+                        "amount": amount,
+                        "ezpass_class": ezpass_class,
+                        "status": EZPassTransactionStatus.IMPORTED,
+                        "created_by": user_id,
+                    }
+                    
+                    self.repo.create_transaction(**transaction_data)
+                    successful_imports += 1
+                    
+                except Exception as e:
+                    failed_imports += 1
+                    logger.error(
+                        f"Row {row_num}: Failed to parse - {str(e)}",
+                        exc_info=True
                     )
-
-                    if parsed_transaction:
-                        parsed_transaction["import_id"] = import_record.id
-                        parsed_transaction["status"] = EZPassTransactionStatus.IMPORTED
-                        transactions_to_insert.append(parsed_transaction)
-                    else:
-                        excluded_count += 1
-
-                except CSVParseError as e:
-                    failed_count += 1
-                    logger.warning(f"Row {row_num} failed validation: {e}")
-
-            # Bulk insert
-            if transactions_to_insert:
-                self.repo.bulk_insert_transactions(transactions_to_insert)
-                self.db.commit()
-
-            # Update import record
-            successful_count = len(transactions_to_insert)
-            self.repo.update_import_record_status(
-                import_record.id,
-                status=EZPassImportStatus.COMPLETED,
-                successful=successful_count,
-                failed=failed_count + excluded_count
+                    continue
+            
+            # Update import batch status
+            batch_status = EZPassImportStatus.COMPLETED
+            if successful_imports == 0:
+                batch_status = EZPassImportStatus.FAILED
+            
+            self.repo.update_import_batch(
+                import_batch.id,
+                {
+                    "status": batch_status,
+                    "total_records": total_rows,
+                    "successful_records": successful_imports,
+                    "failed_records": failed_imports + excluded_count,
+                }
             )
+            
             self.db.commit()
-
-            # ====== Trigger combined task ======
-            from app.ezpass.tasks import associate_and_post_ezpass_transactions_task
-
-            associate_and_post_ezpass_transactions_task.delay()
-
+            
             logger.info(
-                f"EZPass CSV import completed for {file_name}. "
-                f"Triggered combined association and posting task. "
-                f"Total: {len(rows)}, Success: {successful_count}, "
-                f"Failed: {failed_count}, Excluded: {excluded_count}"
+                f"CSV import completed: {successful_imports} imported, "
+                f"{excluded_count} excluded, {failed_imports} failed"
             )
-
+            
             return {
-                "message": "File uploaded and import initiated successfully",
-                "import_id": import_record.id,
-                "file_name": file_name,
-                "total_rows": len(rows),
-                "successful": successful_count,
-                "failed": failed_count,
-                "excluded": excluded_count,
+                "import_id": import_batch.id,
+                "total_rows": total_rows,
+                "successful_imports": successful_imports,
+                "excluded_count": excluded_count,
+                "failed_imports": failed_imports,
+                "exclusion_details": exclusion_details[:10],  # First 10 for logging
             }
-        
+            
+        except CSVParseError as e:
+            logger.error(f"CSV parsing error: {str(e)}")
+            raise
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Unexpected error during CSV import: {str(e)}", exc_info=True)
+            raise CSVParseError(f"Failed to import CSV: {str(e)}") from e
         finally:
             IMPORT_IN_PROGRESS_FLAG = False
 
-    def associate_and_post_transactions(self) -> Dict[str, int]:
+    def _extract_plate_from_tag(self, tag_or_plate: str) -> Optional[str]:
         """
-        Associates EZPass transactions with drivers and IMMEDIATELY posts to ledger.
-
-        This replaces the previous two-step process (associate, then post) with a single
-        atomic operation that:
-        1. Associates the transaction with driver/lease via CURB trip matching
-        2. Immediately posts to ledger if association is successful
-        3. Updates status to POSTED_TO_LEDGER on success
-
-        Returns:
-            Dict with counts: {
-                "processed": int,
-                "associated": int,
-                "posted": int,
-                "failed": int
-            }
+        Extracts the license plate number from the tag_or_plate field.
+        
+        Examples:
+        - "NY Y204273C" -> "Y204273C"
+        - "NY 8M20B" -> "8M20B"
         """
-        logger.info("Starting EZPass association and immediate ledger posting task.")
-
-        transactions_to_process = self.repo.get_transactions_by_status(
-            EZPassTransactionStatus.IMPORTED
+        parts = tag_or_plate.strip().split()
+        if len(parts) >= 2:
+            return parts[1]
+        return None
+    
+    def _find_matching_curb_trip(
+        self,
+        vehicle_id: int,
+        transaction_datetime: datetime
+    ) -> Optional[CurbTrip]:
+        """
+        Find CURB trip within ±30 minutes of toll transaction time.
+        """
+        time_window_start = transaction_datetime - timedelta(minutes=30)
+        time_window_end = transaction_datetime + timedelta(minutes=30)
+        
+        curb_trip = (
+            self.db.query(CurbTrip)
+            .filter(
+                CurbTrip.vehicle_id == vehicle_id,
+                CurbTrip.transaction_date >= time_window_start,
+                CurbTrip.transaction_date <= time_window_end,
+            )
+            .first()
         )
 
-        if not transactions_to_process:
-            logger.info("No imported EZPass transactions to process")
-            return {
-                "processed": 0,
-                "associated": 0,
-                "posted": 0,
-                "failed": 0
-            }
+        if not curb_trip:
+            curb_trip = (
+                self.db.query(CurbTrip)
+                .filter(CurbTrip.vehicle_id == vehicle_id)
+                .order_by(CurbTrip.transaction_date.desc())
+                .first()
+            )
         
-        associated_count = 0
+        return curb_trip
+    
+    def associate_and_post_transactions(self, import_id: Optional[int] = None) -> Dict:
+        """
+        Associate IMPORTED transactions with entities AND immediately post to ledger.
+        
+        **NEW ATOMIC WORKFLOW:**
+        1. Find vehicle by plate
+        2. Find CURB trip within ±30 min window
+        3. Extract driver, lease, medallion from trip
+        4. Post to ledger immediately based on amount sign:
+           - Negative amount: Create obligation (DEBIT)
+           - Positive amount: Create refund/credit (CREDIT)
+        5. Update status to POSTED_TO_LEDGER
+        
+        This replaces the old two-step process (associate → post).
+        
+        Args:
+            import_id: Optional import batch ID to process. If None, process all IMPORTED transactions.
+            
+        Returns:
+            Dict with processing statistics
+        """
+        if import_id:
+            transactions = self.repo.get_transactions_by_import_id(import_id)
+            transactions = [t for t in transactions if t.status == EZPassTransactionStatus.IMPORTED]
+        else:
+            transactions = self.repo.get_transactions_by_status(EZPassTransactionStatus.IMPORTED)
+        
+        if not transactions:
+            logger.info("No IMPORTED transactions to process")
+            return {"processed": 0, "posted": 0, "failed": 0}
+        
+        processed_count = 0
         posted_count = 0
         failed_count = 0
-
-        for trans in transactions_to_process:
-            updates = {
-                "status": EZPassTransactionStatus.ASSOCIATION_FAILED
-            }
-
+        
+        for trans in transactions:
+            updates = {}
+            
             try:
-                # Step 1: Extract plate from tag_or_plate field
-                plate_number_full = trans.tag_or_plate.strip()
-                # Extract just the plate number (remove state prefix if present)
-                plate = plate_number_full.split(' ')[1] if ' ' in plate_number_full else plate_number_full
-                
-                if not plate:
+                # Step 1: Extract plate number
+                plate_number = self._extract_plate_from_tag(trans.tag_or_plate)
+                if not plate_number:
                     raise AssociationError(
-                        trans.transaction_id, "Empty plate number in tag_or_plate field"
+                        f"Could not extract plate from tag_or_plate: {trans.tag_or_plate}",
+                        "INVALID_PLATE_FORMAT"
                     )
                 
-                # Step 2: Find vehicle by plate number
-                vehicle_reg = self.db.query(VehicleRegistration).filter(
-                    VehicleRegistration.plate_number.ilike(f"%{plate}%")
-                ).first()
-
-                logger.info("Looking up vehicle for plate", plate=plate, transaction_id=trans.transaction_id, vehicle_reg=vehicle_reg.vehicle)
-
-                if not vehicle_reg or not vehicle_reg.vehicle:
+                # Step 2: Find vehicle by plate
+                vehicle_reg = (
+                    self.db.query(VehicleRegistration)
+                    .filter(VehicleRegistration.license_plate == plate_number)
+                    .first()
+                )
+                
+                if not vehicle_reg:
                     raise AssociationError(
-                        trans.transaction_id, f"No vehicle found for plate '{plate}'"
+                        f"No vehicle found with plate: {plate_number}",
+                        "PLATE_NOT_FOUND"
                     )
                 
-                vehicle = vehicle_reg.vehicle
-                updates["vehicle_id"] = vehicle.id
-
-                # Step 3: Find CURB trip within time window
-                time_buffer = timedelta(minutes=30)
-                trip_start = trans.transaction_datetime - time_buffer
-                trip_end = trans.transaction_datetime + time_buffer
-
-                curb_trip = self.db.query(CurbTrip).filter(
-                    CurbTrip.vehicle_id == vehicle.id,
-                    CurbTrip.start_time <= trip_end,
-                    CurbTrip.end_time >= trip_start
-                ).order_by(CurbTrip.start_time.desc()).first()
-
-                # Fallback to most recent trip if no trip in window
-                if not curb_trip or not curb_trip.driver_id:
-                    curb_trip = self.db.query(CurbTrip).filter(
-                        CurbTrip.vehicle_id == vehicle.id
-                    ).order_by(CurbTrip.start_time.desc()).first()
-
-                if not curb_trip or not curb_trip.driver_id:
+                # Step 3: Find CURB trip within ±30 minutes
+                curb_trip = self._find_matching_curb_trip(
+                    vehicle_reg.vehicle_id,
+                    trans.transaction_datetime
+                )
+                
+                if not curb_trip:
                     raise AssociationError(
-                        trans.transaction_id,
-                        f"No active CURB trip found for vehicle {vehicle.id} "
-                        f"around {trans.transaction_datetime}"
+                        f"No CURB trip found within ±30 min of {trans.transaction_datetime}",
+                        "NO_TRIP_DATA"
                     )
                 
-                # Step 4: Update transaction with association details
-                updates.update({
+                # Step 4: Validate required fields
+                if not all([curb_trip.driver_id, curb_trip.lease_id]):
+                    raise AssociationError(
+                        "CURB trip missing driver_id or lease_id",
+                        "INVALID_TRIP_DATA"
+                    )
+                
+                # Step 5: Update transaction associations
+                updates = {
                     "driver_id": curb_trip.driver_id,
                     "lease_id": curb_trip.lease_id,
+                    "vehicle_id": vehicle_reg.vehicle_id,
                     "medallion_id": curb_trip.medallion_id,
-                    "status": EZPassTransactionStatus.ASSOCIATED,
-                    "failure_reason": None
-                })
-                associated_count += 1
-
-                # Step 5: Immediately Post to Ledger
-                if not all([
-                    curb_trip.driver_id, curb_trip.lease_id, trans.amount != 0
-                ]):
-                    raise LedgerPostingError(
-                        trans.transaction_id, "Missing required driver, lease or valid amount for posting"
+                }
+                
+                # Step 6: Post to ledger immediately
+                amount = abs(trans.amount)
+                
+                if trans.amount < 0:
+                    # Negative amount = Obligation (DEBIT to driver)
+                    self.ledger_service.create_obligation(
+                        category=PostingCategory.EZPASS,
+                        amount=amount,
+                        reference_id=trans.transaction_id,
+                        driver_id=curb_trip.driver_id,
+                        lease_id=curb_trip.lease_id,
+                        vehicle_id=vehicle_reg.vehicle_id,
+                        medallion_id=curb_trip.medallion_id,
+                    )
+                    logger.info(
+                        f"Posted DEBIT obligation ${amount} for transaction {trans.transaction_id}"
+                    )
+                    
+                elif trans.amount > 0:
+                    # Positive amount = Refund (CREDIT to driver)
+                    self.ledger_service.create_manual_credit(
+                        category=PostingCategory.EZPASS,
+                        amount=amount,
+                        reference_id=trans.transaction_id,
+                        driver_id=curb_trip.driver_id,
+                        lease_id=curb_trip.lease_id,
+                        vehicle_id=vehicle_reg.vehicle_id,
+                        medallion_id=curb_trip.medallion_id,
+                        description=f"EZPass refund from {trans.transaction_datetime}"
+                    )
+                    logger.info(
+                        f"Posted CREDIT refund ${amount} for transaction {trans.transaction_id}"
+                    )
+                else:
+                    # Zero amount - still mark as posted but no ledger entry
+                    logger.warning(
+                        f"Transaction {trans.transaction_id} has zero amount, skipping ledger posting"
                     )
                 
-                # Ensure amount is positive for obligation
-                amount = abs(trans.amount)
-
-                # Create obligation in ledger (atomic operation)
-                self.ledger_service.create_obligation(
-                    category=PostingCategory.EZPASS,
-                    amount=amount,
-                    reference_id=trans.transaction_id,
-                    driver_id=curb_trip.driver_id,
-                    lease_id=curb_trip.lease_id,
-                    vehicle_id=vehicle.id,
-                    medallion_id=curb_trip.medallion_id,
-                )
-
-                # Update to Posted_to_ledger status
+                # Step 7: Update transaction status
                 updates["status"] = EZPassTransactionStatus.POSTED_TO_LEDGER
+                updates["failure_reason"] = None
                 updates["posting_date"] = datetime.now(timezone.utc)
+                
                 posted_count += 1
-
+                processed_count += 1
+                
                 logger.info(
-                    f"Successfully associated and posted EZPass transaction "
-                    f"{trans.transaction_id} to ledger",
+                    f"Successfully associated and posted transaction {trans.transaction_id}",
                     driver_id=curb_trip.driver_id,
                     lease_id=curb_trip.lease_id,
-                    amount=amount
+                    amount=float(amount),
+                    type="DEBIT" if trans.amount < 0 else "CREDIT"
                 )
+                
             except AssociationError as e:
+                updates["status"] = EZPassTransactionStatus.ASSOCIATION_FAILED
                 updates["failure_reason"] = e.reason
                 failed_count += 1
+                processed_count += 1
                 logger.warning(
-                    f"Association failed for transaction {trans.transaction_id}: "
-                    f"{e.reason}"
+                    f"Association failed for transaction {trans.transaction_id}: {e.reason}"
                 )
+                
             except LedgerPostingError as e:
-                # Association succeeded but posting failed
                 updates["status"] = EZPassTransactionStatus.POSTING_FAILED
-                updates["failure_reason"] = f"Ledger Posting Error: {e.reason}"
+                updates["failure_reason"] = f"Ledger Error: {e.reason}"
                 failed_count += 1
+                processed_count += 1
                 logger.error(
-                    f"Ledger posting failed for transaction {trans.transaction_id}: "
-                    f"{e.reason}",
+                    f"Ledger posting failed for transaction {trans.transaction_id}: {e.reason}",
                     exc_info=True
                 )
-
+                
             except Exception as e:
+                updates["status"] = EZPassTransactionStatus.ASSOCIATION_FAILED
                 updates["failure_reason"] = f"Unexpected error: {str(e)}"
                 failed_count += 1
+                processed_count += 1
                 logger.error(
-                    f"Unexpected error processing transaction {trans.transaction_id}: "
-                    f"{e}",
+                    f"Unexpected error processing transaction {trans.transaction_id}: {e}",
                     exc_info=True
                 )
             
             finally:
-                self.repo.update_transaction(trans.id, updates)
-
+                if updates:
+                    self.repo.update_transaction(trans.id, updates)
+        
         self.db.commit()
-
+        
         logger.info(
-            f"EZPass association and posting task finished. "
-            f"Processed: {len(transactions_to_process)}, "
-            f"Associated: {associated_count}, "
-            f"Posted: {posted_count}, "
-            f"Failed: {failed_count}"
+            f"Association and posting completed: "
+            f"{processed_count} processed, {posted_count} posted, {failed_count} failed"
         )
-
+        
         return {
-            "processed": len(transactions_to_process),
-            "associated": associated_count,
+            "processed": processed_count,
             "posted": posted_count,
             "failed": failed_count
         }
@@ -794,46 +546,30 @@ class EZPassService:
         """
         Reassign EZPass transactions to a different driver/lease.
         
-        **CRITICAL: Works for ALL transaction statuses**
-        - IMPORTED: Simple association update
-        - ASSOCIATION_FAILED: Association update + status change to ASSOCIATED
-        - ASSOCIATED: Simple association update
-        - POSTED_TO_LEDGER: Balance-driven ledger operations + association update
-        
-        **Late Arrival Handling:**
-        When transactions arrive late (weeks/months after transaction date):
-        - They can be reassigned at any status
-        - For POSTED_TO_LEDGER: Full ledger reversal and reposting
-        - For other statuses: Simple association updates
-        - DTR consideration: Transaction date determines which week's DTR includes it
-        
-        **Status-Specific Logic:**
+        **UNIVERSAL REASSIGNMENT - Works for ALL statuses:**
         
         1. IMPORTED Status:
-        - Update: driver_id, lease_id, medallion_id, vehicle_id
-        - No ledger operations (not yet posted)
-        - Status: Remains IMPORTED
-        - Next step: Normal association/posting workflow continues
+           - Simple association update
+           - No ledger operations (not yet posted)
+           - Status: Remains IMPORTED
         
         2. ASSOCIATION_FAILED Status:
-        - Update: driver_id, lease_id, medallion_id, vehicle_id
-        - No ledger operations (not yet posted)
-        - Status: Changes to ASSOCIATED (manual correction complete)
-        - Next step: Can be posted to ledger with corrected associations
+           - Update associations
+           - Status: Changes to IMPORTED (ready for reprocessing)
         
-        3. ASSOCIATED Status:
-        - Update: driver_id, lease_id, medallion_id, vehicle_id
-        - No ledger operations (not yet posted)
-        - Status: Remains ASSOCIATED
-        - Next step: Can be posted to ledger with new associations
+        3. POSTED_TO_LEDGER Status:
+           - Check current balance from ledger
+           - If balance = 0 (fully paid): Update associations only
+           - If balance > 0: Perform full ledger reversal and reposting
+             * Create CREDIT on old lease (refund)
+             * Create DEBIT on new lease (new charge)
+           - Update associations
+           - Status: Remains POSTED_TO_LEDGER
         
-        4. POSTED_TO_LEDGER Status:
-        - Retrieve current outstanding balance
-        - If balance > 0:
-            * Create CREDIT (reversal) on source lease
-            * Create DEBIT (new charge) on target lease
-        - Update: driver_id, lease_id, medallion_id, vehicle_id
-        - Status: Remains POSTED_TO_LEDGER
+        **Late Arrival Handling:**
+        Transactions can arrive weeks/months after the toll date.
+        - Can be reassigned at any status
+        - DTR inclusion based on transaction_datetime, not reassignment date
         
         Args:
             transaction_ids: List of transaction IDs to reassign
@@ -841,65 +577,20 @@ class EZPassService:
             new_lease_id: Target lease ID
             new_medallion_id: Optional target medallion ID
             new_vehicle_id: Optional target vehicle ID
-            user_id: User performing the reassignment
+            user_id: User performing reassignment
             reason: Optional reason for reassignment
             
         Returns:
-            Dict with reassignment results:
-            {
-                "success_count": int,
-                "failed_count": int,
-                "total_processed": int,
-                "errors": [{"transaction_id": int, "error": str}],
-                "by_status": {
-                    "IMPORTED": {"count": int, "action": "association_update"},
-                    "ASSOCIATED": {"count": int, "action": "association_update"},
-                    "ASSOCIATION_FAILED": {"count": int, "action": "association_update_with_status_fix"},
-                    "POSTED_TO_LEDGER": {"count": int, "action": "ledger_operations"}
-                }
-            }
-            
-        Raises:
-            ReassignmentError: If validation fails
+            Dict with reassignment results
         """
-        logger.info(
-            f"Starting reassignment of {len(transaction_ids)} EZPass transactions",
-            new_driver_id=new_driver_id,
-            new_lease_id=new_lease_id
-        )
-        
-        # ================================================================
-        # VALIDATION: Driver and Lease
-        # ================================================================
-        from app.drivers.models import Driver
-        from app.leases.models import Lease
-        
-        new_driver = self.db.query(Driver).filter(Driver.id == new_driver_id).first()
-        if not new_driver:
-            raise ReassignmentError(f"Driver with ID {new_driver_id} not found")
-        
-        new_lease = self.db.query(Lease).filter(Lease.id == new_lease_id).first()
-        if not new_lease:
-            raise ReassignmentError(f"Lease with ID {new_lease_id} not found")
-        
-        # Verify new driver is the primary driver on new lease
-        if new_lease.driver_id != new_driver_id:
-            raise ReassignmentError(
-                f"Driver {new_driver_id} is not the primary driver on lease {new_lease_id}. "
-                f"Lease primary driver is {new_lease.driver_id}"
-            )
-        
-        # ================================================================
-        # REASSIGNMENT PROCESSING
-        # ================================================================
         success_count = 0
         failed_count = 0
         errors = []
+        
         status_breakdown = {
-            "IMPORTED": {"count": 0, "action": "association_update"},
-            "ASSOCIATED": {"count": 0, "action": "association_update"},
-            "ASSOCIATION_FAILED": {"count": 0, "action": "association_update_with_status_fix"},
-            "POSTED_TO_LEDGER": {"count": 0, "action": "ledger_operations"}
+            "IMPORTED": {"count": 0, "with_ledger_ops": 0},
+            "ASSOCIATION_FAILED": {"count": 0, "with_ledger_ops": 0},
+            "POSTED_TO_LEDGER": {"count": 0, "with_ledger_ops": 0},
         }
         
         for txn_id in transaction_ids:
@@ -907,15 +598,6 @@ class EZPassService:
                 transaction = self.repo.get_transaction_by_id(txn_id)
                 if not transaction:
                     raise ReassignmentError(f"Transaction {txn_id} not found")
-                
-                # Block no-op reassignment (same driver and lease)
-                if (transaction.driver_id == new_driver_id and 
-                    transaction.lease_id == new_lease_id):
-                    logger.info(
-                        f"Skipping no-op reassignment for transaction {txn_id} "
-                        f"(already assigned to driver {new_driver_id}, lease {new_lease_id})"
-                    )
-                    continue
                 
                 current_status = transaction.status
                 
@@ -925,7 +607,6 @@ class EZPassService:
                 if current_status == EZPassTransactionStatus.IMPORTED:
                     logger.info(
                         f"Reassigning IMPORTED transaction {transaction.transaction_id}",
-                        old_driver=transaction.driver_id,
                         new_driver=new_driver_id
                     )
                     
@@ -934,7 +615,8 @@ class EZPassService:
                         "lease_id": new_lease_id,
                         "medallion_id": new_medallion_id,
                         "vehicle_id": new_vehicle_id or transaction.vehicle_id,
-                        "updated_on": datetime.now(timezone.utc)
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
                     })
                     
                     status_breakdown["IMPORTED"]["count"] += 1
@@ -942,7 +624,7 @@ class EZPassService:
                     
                     logger.info(
                         f"Successfully reassigned IMPORTED transaction {transaction.transaction_id}. "
-                        f"Status remains IMPORTED. Will be processed normally."
+                        f"Status remains IMPORTED. Will be posted with new associations."
                     )
                 
                 # ============================================================
@@ -951,19 +633,19 @@ class EZPassService:
                 elif current_status == EZPassTransactionStatus.ASSOCIATION_FAILED:
                     logger.info(
                         f"Reassigning ASSOCIATION_FAILED transaction {transaction.transaction_id}",
-                        old_driver=transaction.driver_id,
                         new_driver=new_driver_id
                     )
                     
-                    # Update associations AND fix status to ASSOCIATED
+                    # Update associations AND reset status to IMPORTED for reprocessing
                     self.repo.update_transaction(transaction.id, {
                         "driver_id": new_driver_id,
                         "lease_id": new_lease_id,
                         "medallion_id": new_medallion_id,
                         "vehicle_id": new_vehicle_id or transaction.vehicle_id,
-                        "status": EZPassTransactionStatus.ASSOCIATED,  # Fix status
-                        "failure_reason": None,  # Clear failure reason
-                        "updated_on": datetime.now(timezone.utc)
+                        "status": EZPassTransactionStatus.IMPORTED,
+                        "failure_reason": None,
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
                     })
                     
                     status_breakdown["ASSOCIATION_FAILED"]["count"] += 1
@@ -971,37 +653,11 @@ class EZPassService:
                     
                     logger.info(
                         f"Successfully reassigned ASSOCIATION_FAILED transaction {transaction.transaction_id}. "
-                        f"Status changed to ASSOCIATED. Ready for posting."
+                        f"Status changed to IMPORTED. Ready for reprocessing."
                     )
                 
                 # ============================================================
-                # CASE 3: ASSOCIATED Status
-                # ============================================================
-                elif current_status == EZPassTransactionStatus.ASSOCIATED:
-                    logger.info(
-                        f"Reassigning ASSOCIATED transaction {transaction.transaction_id}",
-                        old_driver=transaction.driver_id,
-                        new_driver=new_driver_id
-                    )
-                    
-                    self.repo.update_transaction(transaction.id, {
-                        "driver_id": new_driver_id,
-                        "lease_id": new_lease_id,
-                        "medallion_id": new_medallion_id,
-                        "vehicle_id": new_vehicle_id or transaction.vehicle_id,
-                        "updated_on": datetime.now(timezone.utc)
-                    })
-                    
-                    status_breakdown["ASSOCIATED"]["count"] += 1
-                    success_count += 1
-                    
-                    logger.info(
-                        f"Successfully reassigned ASSOCIATED transaction {transaction.transaction_id}. "
-                        f"Status remains ASSOCIATED. Ready for posting with new associations."
-                    )
-                
-                # ============================================================
-                # CASE 4: POSTED_TO_LEDGER Status
+                # CASE 3: POSTED_TO_LEDGER Status
                 # ============================================================
                 elif current_status == EZPassTransactionStatus.POSTED_TO_LEDGER:
                     logger.info(
@@ -1023,7 +679,7 @@ class EZPassService:
                             f"Transaction shows POSTED_TO_LEDGER but has no ledger entry."
                         )
                     
-                    outstanding_balance = balance.balance
+                    outstanding_balance = Decimal(str(balance.balance))
                     
                     # If fully paid (balance = 0), only update associations
                     if outstanding_balance == Decimal('0.00'):
@@ -1037,59 +693,98 @@ class EZPassService:
                             "lease_id": new_lease_id,
                             "medallion_id": new_medallion_id,
                             "vehicle_id": new_vehicle_id or transaction.vehicle_id,
-                            "updated_on": datetime.now(timezone.utc)
+                            "updated_on": datetime.now(timezone.utc),
+                            "updated_by": user_id
                         })
                         
                         status_breakdown["POSTED_TO_LEDGER"]["count"] += 1
                         success_count += 1
                         continue
                     
-                    # Balance > 0: Perform ledger operations
+                    # Balance > 0: Perform full ledger reversal and reposting
                     logger.info(
                         f"Transaction {transaction.transaction_id} has outstanding balance: "
                         f"${outstanding_balance}. Performing ledger reversal and reposting."
                     )
                     
-                    # Step 1: Create reversal (CREDIT) on source lease
-                    reversal_description = (
-                        f"Reassignment reversal: EZPass toll from {transaction.transaction_datetime}. "
-                        f"Original charge on lease {transaction.lease_id} reversed. "
-                        f"Reassigned to lease {new_lease_id}."
-                    )
+                    # Determine if original was debit or credit based on transaction amount
+                    was_debit = transaction.amount < 0
                     
+                    # Step 1: Create reversal on old lease
                     reversal_reference_id = f"REASSIGN-REV-{transaction.transaction_id}"
                     
-                    self.ledger_service.create_obligation(
-                        driver_id=transaction.driver_id,
-                        lease_id=transaction.lease_id,
-                        amount=outstanding_balance,
-                        category=PostingCategory.EZPASS,
-                        reference_id=reversal_reference_id,
-                    )
+                    if was_debit:
+                        # Original was obligation (DEBIT), so reverse with CREDIT
+                        self.ledger_service.create_manual_credit(
+                            category=PostingCategory.EZPASS,
+                            amount=outstanding_balance,
+                            reference_id=reversal_reference_id,
+                            driver_id=transaction.driver_id,
+                            lease_id=transaction.lease_id,
+                            vehicle_id=transaction.vehicle_id,
+                            medallion_id=transaction.medallion_id,
+                            description=(
+                                f"Reassignment reversal: EZPass toll from {transaction.transaction_datetime}. "
+                                f"Original charge on lease {transaction.lease_id} reversed. "
+                                f"Reassigned to lease {new_lease_id}."
+                                + (f" Reason: {reason}" if reason else "")
+                            ),
+                            user_id=user_id
+                        )
+                        logger.info(
+                            f"Created reversal CREDIT of ${outstanding_balance} on lease {transaction.lease_id}"
+                        )
+                    else:
+                        # Original was refund (CREDIT), so reverse with DEBIT
+                        self.ledger_service.create_obligation(
+                            category=PostingCategory.EZPASS,
+                            amount=outstanding_balance,
+                            reference_id=reversal_reference_id,
+                            driver_id=transaction.driver_id,
+                            lease_id=transaction.lease_id,
+                            vehicle_id=transaction.vehicle_id,
+                            medallion_id=transaction.medallion_id,
+                        )
+                        logger.info(
+                            f"Created reversal DEBIT of ${outstanding_balance} on lease {transaction.lease_id}"
+                        )
                     
-                    logger.info(
-                        f"Created reversal CREDIT of ${outstanding_balance} on lease {transaction.lease_id}"
-                    )
-                    
-                    # Step 2: Create new posting (DEBIT) on target lease
-                    new_posting_description = (
-                        f"Reassigned EZPass toll from {transaction.transaction_datetime}. "
-                        f"Originally charged to lease {transaction.lease_id}. "
-                        f"Reassigned to lease {new_lease_id}."
-                        + (f" Reason: {reason}" if reason else "")
-                    )
-                    
-                    self.ledger_service.create_obligation(
-                        driver_id=new_driver_id,
-                        lease_id=new_lease_id,
-                        amount=outstanding_balance,
-                        category=PostingCategory.EZPASS,
-                        reference_id=transaction.transaction_id,  # Use original reference
-                    )
-                    
-                    logger.info(
-                        f"Created new DEBIT of ${outstanding_balance} on lease {new_lease_id}"
-                    )
+                    # Step 2: Create new posting on new lease (same type as original)
+                    if was_debit:
+                        # Repost as obligation (DEBIT) on new lease
+                        self.ledger_service.create_obligation(
+                            category=PostingCategory.EZPASS,
+                            amount=outstanding_balance,
+                            reference_id=transaction.transaction_id,
+                            driver_id=new_driver_id,
+                            lease_id=new_lease_id,
+                            vehicle_id=new_vehicle_id or transaction.vehicle_id,
+                            medallion_id=new_medallion_id or transaction.medallion_id,
+                        )
+                        logger.info(
+                            f"Created new DEBIT of ${outstanding_balance} on lease {new_lease_id}"
+                        )
+                    else:
+                        # Repost as refund (CREDIT) on new lease
+                        self.ledger_service.create_manual_credit(
+                            category=PostingCategory.EZPASS,
+                            amount=outstanding_balance,
+                            reference_id=transaction.transaction_id,
+                            driver_id=new_driver_id,
+                            lease_id=new_lease_id,
+                            vehicle_id=new_vehicle_id or transaction.vehicle_id,
+                            medallion_id=new_medallion_id or transaction.medallion_id,
+                            description=(
+                                f"Reassigned EZPass refund from {transaction.transaction_datetime}. "
+                                f"Originally credited to lease {transaction.lease_id}. "
+                                f"Reassigned to lease {new_lease_id}."
+                                + (f" Reason: {reason}" if reason else "")
+                            ),
+                            user_id=user_id
+                        )
+                        logger.info(
+                            f"Created new CREDIT of ${outstanding_balance} on lease {new_lease_id}"
+                        )
                     
                     # Step 3: Update transaction associations
                     self.repo.update_transaction(transaction.id, {
@@ -1097,10 +792,12 @@ class EZPassService:
                         "lease_id": new_lease_id,
                         "medallion_id": new_medallion_id,
                         "vehicle_id": new_vehicle_id or transaction.vehicle_id,
-                        "updated_on": datetime.now(timezone.utc)
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
                     })
                     
                     status_breakdown["POSTED_TO_LEDGER"]["count"] += 1
+                    status_breakdown["POSTED_TO_LEDGER"]["with_ledger_ops"] += 1
                     success_count += 1
                     
                     logger.info(
@@ -1158,160 +855,92 @@ class EZPassService:
         )
         
         return result
-
-    def manual_post_to_ledger(self, transaction_ids: List[int]) -> Dict[str, any]:
+    
+    def retry_failed_associations(self, transaction_ids: Optional[List[int]] = None) -> dict:
         """
-        Manually post ASSOCIATED transactions to ledger.
+        Retry association and posting for ASSOCIATION_FAILED transactions.
         
-        This method is for backward compatibility and edge cases where
-        transactions might be in ASSOCIATED status without being posted.
-        Under the new flow, this should rarely be needed since posting
-        happens immediately after association.
-        
-        Args:
-            transaction_ids: List of transaction IDs to post
-            
-        Returns:
-            Dict with posting results
+        This uses the same immediate posting workflow as the main import process.
         """
-        logger.info(
-            f"Manual posting of {len(transaction_ids)} EZPass transactions to ledger"
-        )
+        if transaction_ids:
+            transactions = [
+                self.repo.get_transaction_by_id(tid) for tid in transaction_ids
+            ]
+            transactions = [t for t in transactions if t and t.status == EZPassTransactionStatus.ASSOCIATION_FAILED]
+        else:
+            transactions = self.repo.get_transactions_by_status(
+                EZPassTransactionStatus.ASSOCIATION_FAILED
+            )
         
-        success_count = 0
-        failed_count = 0
-        errors = []
+        if not transactions:
+            logger.info("No ASSOCIATION_FAILED transactions to retry")
+            return {"processed": 0, "posted": 0, "failed": 0}
         
-        for txn_id in transaction_ids:
-            try:
-                transaction = self.repo.get_transaction_by_id(txn_id)
-                if not transaction:
-                    raise LedgerPostingError(str(txn_id), "Transaction not found")
-                
-                # Validate transaction status
-                if transaction.status == EZPassTransactionStatus.POSTED_TO_LEDGER:
-                    errors.append({
-                        "transaction_id": txn_id,
-                        "error": "Already posted to ledger"
-                    })
-                    failed_count += 1
-                    continue
-                
-                if transaction.status != EZPassTransactionStatus.ASSOCIATED:
-                    errors.append({
-                        "transaction_id": txn_id,
-                        "error": f"Cannot post - status is {transaction.status.value}"
-                    })
-                    failed_count += 1
-                    continue
-                
-                if not all([
-                    transaction.driver_id,
-                    transaction.lease_id,
-                    transaction.amount != 0
-                ]):
-                    errors.append({
-                        "transaction_id": txn_id,
-                        "error": "Missing required fields (driver_id, lease_id, or valid amount)"
-                    })
-                    failed_count += 1
-                    continue
-                
-                # Post to ledger
-                amount = abs(transaction.amount)
-                self.ledger_service.create_obligation(
-                    category=PostingCategory.EZPASS,
-                    amount=amount,
-                    reference_id=transaction.transaction_id,
-                    driver_id=transaction.driver_id,
-                    lease_id=transaction.lease_id,
-                    vehicle_id=transaction.vehicle_id,
-                    medallion_id=transaction.medallion_id,
-                )
-                
-                # Update transaction status
-                self.repo.update_transaction(transaction.id, {
-                    "status": EZPassTransactionStatus.POSTED_TO_LEDGER,
-                    "failure_reason": None,
-                    "posting_date": datetime.now(timezone.utc)
-                })
-                
-                success_count += 1
-                logger.info(
-                    f"Successfully posted EZPass transaction {transaction.transaction_id} "
-                    f"to ledger"
-                )
-                
-            except Exception as e:
-                failed_count += 1
-                errors.append({
-                    "transaction_id": txn_id,
-                    "error": str(e)
-                })
-                logger.error(
-                    f"Failed to post transaction {txn_id} to ledger: {e}",
-                    exc_info=True
-                )
+        # Temporarily update status to IMPORTED so they'll be processed
+        for trans in transactions:
+            self.repo.update_transaction(trans.id, {
+                "status": EZPassTransactionStatus.IMPORTED,
+                "failure_reason": None
+            })
         
         self.db.commit()
         
-        result = {
-            "success_count": success_count,
-            "failed_count": failed_count,
-            "total_processed": len(transaction_ids),
-            "errors": errors if errors else None
-        }
-        
-        logger.info(
-            f"Manual EZPass posting completed. "
-            f"Success: {success_count}, Failed: {failed_count}"
+        # Run the normal association and posting process
+        return self.associate_and_post_transactions()
+    
+    def get_paginated_transactions(
+        self,
+        page: int = 1,
+        per_page: int = 50,
+        status: Optional[EZPassTransactionStatus] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        plate_number: Optional[str] = None,
+        driver_id: Optional[int] = None,
+        lease_id: Optional[int] = None,
+        agency: Optional[str] = None,
+    ) -> dict:
+        """
+        Get paginated list of transactions with filters.
+        """
+        return self.repo.get_paginated_transactions(
+            page=page,
+            per_page=per_page,
+            status=status,
+            start_date=start_date,
+            end_date=end_date,
+            plate_number=plate_number,
+            driver_id=driver_id,
+            lease_id=lease_id,
+            agency=agency,
+        )
+
+    def get_import_logs(
+        self,
+        page: int = 1,
+        per_page: int = 50,
+        log_type: Optional[str] = None,
+        log_status: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> dict:
+        """
+        Get paginated import logs with filters.
+        """
+        logs = self.repo.get_paginated_import_logs(
+            page=page,
+            per_page=per_page,
+            log_type=log_type,
+            log_status=log_status,
+            start_date=start_date,
+            end_date=end_date,
         )
         
-        return result
-    
-
-# --- Celery Tasks ---
-from app.worker.app import app as celery_app
-
-@celery_app.task(name="ezpass.associate_transactions")
-def associate_ezpass_transactions_task():
-    """
-    Background task to find the correct driver/lease for imported EZPass transactions.
-    """
-    logger.info("Executing Celery task: associate_ezpass_transactions_task")
-    db: Session = SessionLocal()
-    try:
-        service = EZPassService(db)
-        result = service.associate_transactions()
-        return result
-    except Exception as e:
-        logger.error(f"Celery task associate_ezpass_transactions_task failed: {e}", exc_info=True)
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-    
-
-@celery_app.task(name="ezpass.post_tolls_to_ledger")
-def post_ezpass_tolls_to_ledger_task():
-    """
-    Background task to post successfully associated EZPass tolls to the ledger.
-    """
-    logger.info("Executing Celery task: post_ezpass_tolls_to_ledger_task")
-    db: Session = SessionLocal()
-    try:
-        # ledger_service = LedgerService(db)
-        ezpass_service = EZPassService(db)
-        result = ezpass_service.post_tolls_to_ledger()
-        return result
-    except Exception as e:
-        logger.error(f"Celery task post_ezpass_tolls_to_ledger_task failed: {e}", exc_info=True)
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
+        return {
+            **logs,
+            "available_log_types": AVAILABLE_LOG_TYPES,
+            "available_log_statuses": AVAILABLE_LOG_STATUSES,
+        }
 
 
 

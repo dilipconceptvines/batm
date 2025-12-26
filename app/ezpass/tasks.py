@@ -1,63 +1,39 @@
-### app/ezpass/tasks.py
-
-"""
-Celery Task Definitions for the EZPass Module.
-
-This file ensures that tasks defined within the ezpass module are discoverable
-by the Celery worker. By importing them here, we provide a single entry point
-for Celery's autodiscovery mechanism.
-"""
+# app/ezpass/tasks.py
 
 from celery import shared_task
-from sqlalchemy.orm import Session
 
-from app.worker.app import app as celery_app
 from app.core.db import SessionLocal
+from app.ezpass.services import EZPassService
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-@celery_app.task(name="ezpass.associate_and_post_transactions")
-def associate_and_post_ezpass_transactions_task():
+
+@shared_task(name="ezpass.associate_and_post_transactions")
+def associate_and_post_transactions_task():
     """
-    Background task to associate EZPass transactions and immediately post to ledger.
+    Celery task to associate IMPORTED transactions and immediately post to ledger.
     
-    This replaces the previous two-step process:
-    - OLD: associate_ezpass_transactions_task + post_ezpass_tolls_to_ledger_task
-    - NEW: Single combined task that does both atomically
+    This task runs on a schedule to process all IMPORTED transactions.
+    Replaces the old two-task workflow (associate → post).
     
-    Process:
-    1. Find all IMPORTED transactions
-    2. Match plate → vehicle → CURB trip → driver/lease
-    3. If match found, immediately post to ledger
-    4. Update status to POSTED_TO_LEDGER
-    
-    Returns:
-        Dict with processing statistics
+    Schedule: Every 3 hours
     """
-    logger.info("Executing Celery task: associate_and_post_ezpass_transactions")
-    db: Session = SessionLocal()
-    
+    db = SessionLocal()
     try:
-        from app.ezpass.services import EZPassService
-        
-        service = EZPassService(db)
-        result = service.associate_and_post_transactions()
+        ezpass_service = EZPassService(db)
+        result = ezpass_service.associate_and_post_transactions()
         
         logger.info(
-            f"EZPass association and posting task completed successfully",
-            **result
+            "EZPass associate and post task completed",
+            processed=result["processed"],
+            posted=result["posted"],
+            failed=result["failed"]
         )
         
         return result
-        
     except Exception as e:
-        logger.error(
-            f"Celery task associate_and_post_ezpass_transactions failed: {e}",
-            exc_info=True
-        )
-        db.rollback()
+        logger.error(f"Error in associate_and_post_transactions_task: {e}", exc_info=True)
         raise
-        
     finally:
         db.close()

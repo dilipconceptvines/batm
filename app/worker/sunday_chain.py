@@ -54,12 +54,10 @@ def sunday_financial_processing_chain():
     logger.info("Triggered on", datetime=datetime.now().isoformat())
     logger.info("="*80)
 
-    from app.curb.tasks import post_earnings_to_ledger_task
     # Create the sequential chain
     # .s() creates a signature (immutable) - each task runs independently
     # .si() creates signature immutable - ignores previous task result
     workflow = chain(
-        post_earnings_to_ledger_task.s(),           # Step 1: CURB earnings
         post_pvb_violations_to_ledger_task.si(),    # Step 3: PVB violations
         post_weekly_lease_fees_task.si(),           # Step 4: Lease fees
         post_due_loan_installments_task.si(),       # Step 5: Loan installments
@@ -81,7 +79,6 @@ def sunday_financial_processing_chain():
         "start_time": datetime.now().isoformat(),
         "status": "dispatched",
         "tasks": [
-            "post_earnings_to_ledger_task",
             "post_pvb_violations_to_ledger_task",
             "post_weekly_lease_fees_task",
             "post_due_loan_installments_task",

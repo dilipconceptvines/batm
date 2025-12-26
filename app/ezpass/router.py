@@ -50,16 +50,16 @@ async def upload_ezpass_csv(
 
     try:
         file_stream = BytesIO(await file.read())
-        result = ezpass_service.process_uploaded_csv(
+        result = ezpass_service.import_csv(
             file_stream, file.filename, current_user.id
         )
         return JSONResponse(content=result, status_code=fast_status.HTTP_202_ACCEPTED)
     except EZPassError as e:
         logger.warning("Business logic error during EZPass CSV upload: %s", e)
-        raise HTTPException(status_code=fast_status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise HTTPException(status_code=fast_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except Exception as e:
         logger.error("Error processing EZPass CSV: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during file processing.")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during file processing.") from e
 
 @router.get("", response_model=PaginatedEZPassTransactionResponse, summary="List EZPass Transactions")
 def list_ezpass_transactions(
@@ -93,7 +93,7 @@ def list_ezpass_transactions(
     matching the UI requirements.
     """
     try:
-        transactions, total_items = ezpass_service.repo.list_transactions(
+        transactions, total_items = ezpass_service.repo.get_paginated_transactions(
             page=page,
             per_page=per_page,
             sort_by=sort_by,
@@ -152,7 +152,7 @@ def list_ezpass_transactions(
 
     except Exception as e:
         logger.error("Error fetching EZPass transactions: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred while fetching EZPass data.")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while fetching EZPass data.") from e
 
 
 @router.get("/export", summary="Export EZPass Transaction Data")
@@ -185,8 +185,8 @@ def export_ezpass_transactions(
     Exports filtered EZPass transaction data to the specified format (Excel or PDF).
     """
     try:
-        transactions, _ = ezpass_service.repo.list_transactions(
-            page=1, per_page=10000, sort_by=sort_by, sort_order=sort_order,
+        transactions, _ = ezpass_service.repo.get_paginated_transactions(
+            page=1, per_page=100000, sort_by=sort_by, sort_order=sort_order,
             from_transaction_date=from_transaction_date,
             to_transaction_date=to_transaction_date,
             from_transaction_time=from_transaction_time,
@@ -259,45 +259,6 @@ def export_ezpass_transactions(
             status_code=500,
             detail="An error occurred during the export process.",
         ) from e
-    
-
-@router.post("/post-to-batm", summary="Manually post transactions to ledger", status_code=fast_status.HTTP_200_OK)
-def manual_post_to_batm(
-    request: ManualPostRequest,
-    ezpass_service: EZPassService = Depends(get_ezpass_service),
-    _current_user: User = Depends(get_current_user)
-):
-   """
-    Manually post EZPass transactions to the centralized ledger.
-    Used to force posting of ASSOCIATED transactions without waiting for automatic Celery task.
-    
-    This endpoint allows staff to:
-    - Immediately post ASSOCIATED transactions to ledger
-    - Retry failed postings (POSTING_FAILED status)
-    - Process specific transactions urgently
-    
-    **Restrictions:**
-    - Only ASSOCIATED status transactions can be posted
-    - Cannot re-post transactions already POSTED_TO_LEDGER
-    - Requires valid driver_id, lease_id, and positive amount
-    
-    **Process:**
-    1. Validates transaction is ASSOCIATED
-    2. Creates DEBIT obligation in centralized ledger (category: EZPASS)
-    3. Updates transaction status to POSTED_TO_LEDGER
-    4. Sets posting_date to current timestamp
-   """
-   try:
-        result = ezpass_service.manual_post_to_ledger(
-            transaction_ids=request.transaction_ids
-        )
-        return JSONResponse(content=result, status_code=fast_status.HTTP_200_OK)
-   except EZPassError as e:
-        logger.warning("Business logic error during manual posting: %s", e)
-        raise HTTPException(status_code=fast_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-   except Exception as e:
-        logger.error("Error during manual posting: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during manual posting.")  from e
    
 @router.post("/reassign", summary="Reassign Transactions to Different Driver", status_code=fast_status.HTTP_200_OK)
 def reassign_ezpass_transactions(
@@ -462,7 +423,7 @@ def list_ezpass_import_logs(
     - Maximum: 100 items per page
     """
     try:
-        import_logs, total_items = ezpass_service.repo.list_import_logs(
+        import_logs, total_items = ezpass_service.repo.get_paginated_import_logs(
             page=page,
             per_page=per_page,
             sort_by=sort_by,
