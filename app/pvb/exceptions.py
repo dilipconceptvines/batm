@@ -13,6 +13,24 @@ class PVBCSVParseError(PVBError):
         else:
             super().__init__(f"PVB CSV parsing error: {message}")
 
+
+class ReassignmentError(PVBError):
+    """
+    Raised when violation reassignment fails.
+    
+    This exception is used for all reassignment validation and processing errors including:
+    - Source/target driver or lease not found
+    - Violation not in valid status for reassignment
+    - No-op reassignment (source equals target)
+    - Ledger balance not found
+    - Ledger reversal or posting failures
+    """
+    
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Reassignment failed: {reason}")
+
+
 class PVBAssociationError(PVBError):
     """Raised when a PVB violation cannot be associated with a valid lease/driver."""
     def __init__(self, summons_number: str, reason: str):

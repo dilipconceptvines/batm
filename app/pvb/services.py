@@ -12,20 +12,13 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 from app.curb.models import CurbTrip
 from app.pvb.exceptions import (
-    PVBAssociationError,
-    PVBCSVParseError,
-    PVBError,
-    PVBImportInProgressError,
-    PVBLedgerPostingError,
+    PVBAssociationError, ReassignmentError, PVBError,
+    PVBImportInProgressError, PVBLedgerPostingError,
     PVBValidationError,
 )
 from app.pvb.models import (
-    PVBImport,
-    PVBImportStatus,
-    PVBSource,
-    PVBViolation,
-    PVBViolationStatus,
-    PVBDisposition
+    PVBImport, PVBImportStatus, PVBSource,
+    PVBViolation, PVBViolationStatus, PVBDisposition
 )
 from app.pvb.repository import PVBRepository
 from app.ledger.models import PostingCategory
@@ -471,104 +464,326 @@ class PVBService:
         }
 
     def reassign_transactions(
-            self, transaction_ids: List[int], new_driver_id: int, new_lease_id: int,
-            new_medallion_id: Optional[int] = None, new_vehicle_id: Optional[int] = None
-        ) -> dict:
-            """
-            Reassign EZPass transactions from one driver to another.
-            This allows correcting incorrect associations.
-            Can only reassign transactions that haven't been posted to ledger.
-            """
-            from app.drivers.models import Driver
-            from app.leases.models import Lease
+        self,
+        transaction_ids: List[int],
+        new_driver_id: int,
+        new_lease_id: int,
+        new_medallion_id: Optional[int] = None,
+        new_vehicle_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        reason: Optional[str] = None
+    ) -> Dict:
+        """
+        Reassign PVB violations to a different driver/lease.
+        
+        **UNIVERSAL REASSIGNMENT - Works for ALL statuses:**
+        
+        1. IMPORTED Status:
+        - Simple association update
+        - No ledger operations (not yet posted)
+        - Status: Remains IMPORTED
+        
+        2. ASSOCIATION_FAILED Status:
+        - Update associations
+        - Status: Changes to ASSOCIATED (ready for reprocessing)
+        
+        3. ASSOCIATED Status:
+        - Update associations
+        - Status: Remains ASSOCIATED
+        
+        4. POSTED_TO_LEDGER Status:
+        - Check current balance from ledger
+        - If balance = 0 (fully paid): Update associations only
+        - If balance > 0: Perform full ledger reversal and reposting
+            * Create CREDIT on old lease (reversal)
+            * Create DEBIT on new lease (new charge)
+        - Update associations
+        - Status: Remains POSTED_TO_LEDGER
+        
+        Args:
+            transaction_ids: List of violation IDs to reassign
+            new_driver_id: Target driver ID
+            new_lease_id: Target lease ID
+            new_medallion_id: Optional target medallion ID
+            new_vehicle_id: Optional target vehicle ID
+            user_id: Optional user performing the reassignment
+            reason: Optional reason for reassignment
+        
+        Returns:
+            Dictionary with success/failure counts and error details
+        """
+        from app.drivers.models import Driver
+        from app.leases.models import Lease
+        from app.ledger.services import LedgerService
+        from app.ledger.repository import LedgerRepository
+        from app.ledger.models import PostingCategory
+        from decimal import Decimal
+        from datetime import datetime, timezone
 
-            logger.info("Reassigning transactions for driver", transactions_count=len(transaction_ids), driver_id=new_driver_id)
+        logger.info(
+            f"Reassigning {len(transaction_ids)} PVB violations to driver {new_driver_id}, "
+            f"lease {new_lease_id}"
+        )
 
-            # Validate new driver and lease
-            new_driver = self.db.query(Driver).filter(Driver.id == new_driver_id).first()
-            if not new_driver:
-                raise PVBError(f"New driver with ID {new_driver_id} not found.")
-            
-            new_lease = self.db.query(Lease).filter(Lease.id == new_lease_id).first()
-            if not new_lease:
-                raise PVBError(f"New lease with ID {new_lease_id} not found.")
-            
-            # Validate new lease is an active lease for the new driver
-            lease_drivers = new_lease.lease_driver
-            is_primary_driver = False
-            for ld in lease_drivers:
-                if ld.driver_id == new_driver.driver_id and not ld.is_additional_driver:
-                    is_primary_driver = True
-                    break
+        # Validate new driver exists
+        new_driver = self.db.query(Driver).filter(Driver.id == new_driver_id).first()
+        if not new_driver:
+            raise PVBError(f"New driver with ID {new_driver_id} not found.")
+        
+        # Validate new lease exists
+        new_lease = self.db.query(Lease).filter(Lease.id == new_lease_id).first()
+        if not new_lease:
+            raise PVBError(f"New lease with ID {new_lease_id} not found.")
+        
+        # Validate new lease belongs to new driver (primary driver check)
+        lease_drivers = new_lease.lease_driver
+        is_primary_driver = False
+        for ld in lease_drivers:
+            if ld.driver_id == new_driver.driver_id and not ld.is_additional_driver:
+                is_primary_driver = True
+                break
 
-            if not is_primary_driver:
-                raise PVBError(f"Lease {new_lease_id} does not belong to the driver {new_driver_id}")
-            
-            success_count = 0
-            failed_count = 0
-            errors = []
+        if not is_primary_driver:
+            raise PVBError(
+                f"Lease {new_lease_id} does not belong to driver {new_driver_id} as primary driver"
+            )
+        
+        # Initialize ledger service for POSTED_TO_LEDGER transactions
+        ledger_repo = LedgerRepository(self.db)
+        ledger_service = LedgerService(ledger_repo)
+        
+        # Track results
+        success_count = 0
+        failed_count = 0
+        errors = []
+        status_breakdown = {
+            "IMPORTED": {"count": 0, "description": "Simple association update"},
+            "ASSOCIATION_FAILED": {"count": 0, "description": "Association update, status changed to ASSOCIATED"},
+            "ASSOCIATED": {"count": 0, "description": "Association update only"},
+            "POSTED_TO_LEDGER": {"count": 0, "description": "Balance-driven reassignment with ledger operations"}
+        }
 
-            for txn_id in transaction_ids:
-                try:
-                    transaction = self.repo.get_violation_by_id(txn_id)
-                    if not transaction:
-                        errors.append({
-                            "transaction_id": txn_id,
-                            "error": "Transaction not found"
-                        })
-                        failed_count += 1
-                        continue
+        for txn_id in transaction_ids:
+            try:
+                violation = self.repo.get_violation_by_id(txn_id)
+                if not violation:
+                    errors.append({
+                        "transaction_id": txn_id,
+                        "error": "Violation not found"
+                    })
+                    failed_count += 1
+                    continue
 
-                    # Cannot reassign if already posted to ledger
-                    if transaction.status == PVBViolationStatus.POSTED_TO_LEDGER:
-                        errors.append({
-                            "transaction_id": txn_id,
-                            "error": "Cannot reassign - transaction already posted to ledger"
-                        })
-                        failed_count += 1
-                        continue
+                # Check for no-op reassignment (source equals target)
+                if (violation.driver_id == new_driver_id and 
+                    violation.lease_id == new_lease_id):
+                    errors.append({
+                        "transaction_id": txn_id,
+                        "summons": violation.summons,
+                        "error": "Source and target driver/lease are the same (no-op reassignment)"
+                    })
+                    failed_count += 1
+                    continue
 
-                    # Store old assignment for logging
-                    old_driver_id = transaction.driver_id
-                    old_lease_id = transaction.lease_id
-
-                    # Reassign to new driver/lease
-                    updates = {
+                old_driver_id = violation.driver_id
+                old_lease_id = violation.lease_id
+                
+                # Handle based on current status
+                if violation.status == PVBViolationStatus.IMPORTED:
+                    # Simple association update - no ledger involvement
+                    self.repo.update_violation(violation.id, {
+                        "driver_id": new_driver_id,
+                        "lease_id": new_lease_id,
+                        "medallion_id": new_medallion_id or new_lease.medallion_id,
+                        "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
+                    })
+                    
+                    status_breakdown["IMPORTED"]["count"] += 1
+                    success_count += 1
+                    logger.info(
+                        f"IMPORTED violation {violation.summons} reassigned: "
+                        f"driver {old_driver_id} → {new_driver_id}, lease {old_lease_id} → {new_lease_id}"
+                    )
+                    
+                elif violation.status == PVBViolationStatus.ASSOCIATION_FAILED:
+                    # Update associations and change status to ASSOCIATED for reprocessing
+                    self.repo.update_violation(violation.id, {
                         "driver_id": new_driver_id,
                         "lease_id": new_lease_id,
                         "medallion_id": new_medallion_id or new_lease.medallion_id,
                         "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
                         "status": PVBViolationStatus.ASSOCIATED,
-                        "failure_reason": None
-                    }
-
-                    self.repo.update_violation(transaction.id, updates)
+                        "failure_reason": None,
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
+                    })
+                    
+                    status_breakdown["ASSOCIATION_FAILED"]["count"] += 1
                     success_count += 1
                     logger.info(
-                        f"Transaction {transaction.id} reassigned from "
-                        f"driver {old_driver_id}/lease {old_lease_id} to "
-                        f"driver {new_driver_id}/lease {new_lease_id}"
+                        f"ASSOCIATION_FAILED violation {violation.summons} reassigned and set to ASSOCIATED: "
+                        f"driver {old_driver_id} → {new_driver_id}, lease {old_lease_id} → {new_lease_id}"
                     )
-
-                    if success_count > 0:
-                        self.post_violations_to_ledger()
+                    
+                elif violation.status == PVBViolationStatus.ASSOCIATED:
+                    # Simple association update - already associated but not posted
+                    self.repo.update_violation(violation.id, {
+                        "driver_id": new_driver_id,
+                        "lease_id": new_lease_id,
+                        "medallion_id": new_medallion_id or new_lease.medallion_id,
+                        "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
+                    })
+                    
+                    status_breakdown["ASSOCIATED"]["count"] += 1
+                    success_count += 1
+                    logger.info(
+                        f"ASSOCIATED violation {violation.summons} reassigned: "
+                        f"driver {old_driver_id} → {new_driver_id}, lease {old_lease_id} → {new_lease_id}"
+                    )
+                    
+                elif violation.status == PVBViolationStatus.POSTED_TO_LEDGER:
+                    # Balance-driven reassignment with ledger operations
+                    
+                    # Get current balance from ledger
+                    balance = ledger_service.repo.get_balance_by_reference_id(violation.summons)
+                    
+                    if not balance:
+                        raise ReassignmentError(
+                            f"Violation shows POSTED_TO_LEDGER but has no ledger entry."
+                        )
+                    
+                    outstanding_balance = Decimal(str(balance.balance))
+                    
+                    # If fully paid (balance = 0), only update associations
+                    if outstanding_balance == Decimal('0.00'):
+                        logger.info(
+                            f"Violation {violation.summons} is fully paid (balance: $0.00). "
+                            f"Updating associations only, no ledger changes needed."
+                        )
                         
-                except Exception as e:
+                        self.repo.update_violation(violation.id, {
+                            "driver_id": new_driver_id,
+                            "lease_id": new_lease_id,
+                            "medallion_id": new_medallion_id or new_lease.medallion_id,
+                            "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                            "updated_on": datetime.now(timezone.utc),
+                            "updated_by": user_id
+                        })
+                        
+                        status_breakdown["POSTED_TO_LEDGER"]["count"] += 1
+                        success_count += 1
+                        continue
+                    
+                    # Balance > 0: Perform full ledger reversal and reposting
+                    logger.info(
+                        f"Violation {violation.summons} has outstanding balance: "
+                        f"${outstanding_balance}. Performing ledger reversal and reposting."
+                    )
+                    
+                    # Step 1: Create reversal on old lease (CREDIT)
+                    reversal_reference_id = f"REASSIGN-REV-{violation.summons}"
+                    
+                    ledger_service.create_manual_credit(
+                        category=PostingCategory.PVB,
+                        amount=outstanding_balance,
+                        reference_id=reversal_reference_id,
+                        driver_id=old_driver_id,
+                        lease_id=old_lease_id,
+                        vehicle_id=violation.vehicle_id,
+                        medallion_id=violation.medallion_id,
+                        description=(
+                            f"Reassignment reversal: PVB summons {violation.summons} "
+                            f"from {violation.issue_date}. "
+                            f"Original charge on lease {old_lease_id} reversed. "
+                            f"Reassigned to lease {new_lease_id}."
+                        ),
+                        user_id=user_id
+                    )
+                    
+                    logger.info(
+                        f"Created reversal (CREDIT) on old lease {old_lease_id} for ${outstanding_balance}"
+                    )
+                    
+                    # Step 2: Create new charge on new lease (DEBIT)
+                    new_reference_id = f"REASSIGN-NEW-{violation.summons}"
+                    
+                    ledger_service.create_obligation(
+                        category=PostingCategory.PVB,
+                        amount=outstanding_balance,
+                        reference_id=new_reference_id,
+                        driver_id=new_driver_id,
+                        lease_id=new_lease_id,
+                        vehicle_id=new_vehicle_id or new_lease.vehicle_id,
+                        medallion_id=new_medallion_id or new_lease.medallion_id,
+                    )
+                    
+                    logger.info(
+                        f"Created new charge (DEBIT) on new lease {new_lease_id} for ${outstanding_balance}"
+                    )
+                    
+                    # Step 3: Update violation associations
+                    self.repo.update_violation(violation.id, {
+                        "driver_id": new_driver_id,
+                        "lease_id": new_lease_id,
+                        "medallion_id": new_medallion_id or new_lease.medallion_id,
+                        "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                        "updated_on": datetime.now(timezone.utc),
+                        "updated_by": user_id
+                    })
+                    
+                    status_breakdown["POSTED_TO_LEDGER"]["count"] += 1
+                    success_count += 1
+                    logger.info(
+                        f"POSTED_TO_LEDGER violation {violation.summons} fully reassigned with ledger operations: "
+                        f"driver {old_driver_id} → {new_driver_id}, lease {old_lease_id} → {new_lease_id}, "
+                        f"balance: ${outstanding_balance}"
+                    )
+                
+                else:
+                    # Unknown status - should not happen
                     errors.append({
                         "transaction_id": txn_id,
-                        "error": str(e)
+                        "summons": violation.summons,
+                        "error": f"Unknown violation status: {violation.status}"
                     })
                     failed_count += 1
-                    logger.error(f"Failed to reassign transaction {txn_id}: {e}", exc_info=True)
+                    continue
 
-            self.db.commit()
+            except ReassignmentError as e:
+                errors.append({
+                    "transaction_id": txn_id,
+                    "error": str(e)
+                })
+                failed_count += 1
+                logger.error(f"Reassignment error for violation {txn_id}: {e}", exc_info=True)
+                
+            except Exception as e:
+                errors.append({
+                    "transaction_id": txn_id,
+                    "error": f"Unexpected error: {str(e)}"
+                })
+                failed_count += 1
+                logger.error(f"Unexpected error reassigning violation {txn_id}: {e}", exc_info=True)
 
-            return {
-                "success_count": success_count,
-                "failed_count": failed_count,
-                "errors": errors,
-                "message": f"Successfully reassigned {success_count} transactions, {failed_count} failed"
-            }
+        # Commit all changes
+        self.db.commit()
+        
+        logger.info(
+            f"PVB reassignment completed: {success_count} successful, {failed_count} failed. "
+            f"Breakdown: {status_breakdown}"
+        )
+
+        return {
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "errors": errors,
+            "status_breakdown": status_breakdown,
+            "message": f"Successfully reassigned {success_count} violations, {failed_count} failed."
+        }
     
     def retry_failed_associations(self, transaction_ids: Optional[List[int]] = None) -> dict:
         """
@@ -680,7 +895,11 @@ class PVBService:
         
         # If successful associations exist, trigger posting task
         if successful_count > 0:
-            self.post_violations_to_ledger()
+            from app.ledger.services import LedgerService
+            from app.ledger.repository import LedgerRepository
+            ledger_repo = LedgerRepository(self.db)
+            ledger_service = LedgerService(ledger_repo)
+            self.post_violations_to_ledger(ledger_service=ledger_service)
         
         return {
             "processed": len(transactions_to_process),
