@@ -10,6 +10,7 @@ from app.utils.logger import setup_app_logging, get_logger
 from app.bpm.step_info import STEP_REGISTRY, import_bpm_flows
 
 # Import all models to ensure SQLAlchemy class registry is populated
+import app.bpm.models
 import app.users.models
 import app.audit_trail.models
 import app.entities.models
@@ -17,6 +18,7 @@ import app.medallions.models
 import app.vehicles.models
 import app.drivers.models
 import app.leases.models
+import app.deposits.models
 import app.esign.models
 import app.ledger.models
 import app.curb.models
@@ -59,6 +61,7 @@ from app.misc_expenses.router import router as misc_expense_routes
 from app.driver_payments.router import router as driver_payments_routes
 from app.dtr.router import router as dtr_routes
 from app.current_balances.router import router as current_balances_routes
+from app.deposits.router import router as deposits_routes
 
 
 @asynccontextmanager
@@ -135,6 +138,7 @@ bat_app.include_router(misc_expense_routes)
 bat_app.include_router(driver_payments_routes)
 bat_app.include_router(dtr_routes)
 bat_app.include_router(current_balances_routes)
+bat_app.include_router(deposits_routes)
 
 
 # Root API to check if the server is up
@@ -145,3 +149,11 @@ async def health_check():
     """
     logger.info("Calling root API for testing")
     return {"status": "ok"}
+
+
+@bat_app.get("/version", tags=["Base"])
+async def get_version():
+    """
+    Get application version from .version file
+    """
+    return {"version": settings.app_version}

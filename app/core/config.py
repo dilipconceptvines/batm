@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import boto3
@@ -106,7 +107,7 @@ class Settings(BaseSettings):
     s3_bucket_name: str = None
 
     # Logging configuration
-    uvicorn_log_level: str = "INFO"
+    uvicorn_log_level: str = "DEBUG"
 
     claude_model_id: str = None
     app_base_url: str = None
@@ -194,7 +195,7 @@ class Settings(BaseSettings):
     shift_lease_renewal_period: int = 6
     short_term_lease_renewal_period: int = 6
 
-    lease_renewal_reminder_days: int = 30
+    lease_renewal_reminder_days: int = 29
 
     admin_renewal_notification_template_key: str = (
         "email_sms_templates/admin_renewal_notification.html"
@@ -207,6 +208,9 @@ class Settings(BaseSettings):
     super_admin_email_id: str = "superadmin@bat.com"
 
     tlc_service_fee: int = 10
+
+    # Version file path
+    version_path: str = ".version"
 
     #
     # ---------------------------
@@ -392,6 +396,35 @@ class Settings(BaseSettings):
             logger.info("🔑 AWS_SECRET_ACCESS_KEY source: .env / environment variables")
 
         return data.get("AWS_SECRET_ACCESS_KEY") or self.aws_secret_access_key_base
+
+    #
+    # ---------------------------
+    #  APPLICATION VERSION
+    # ---------------------------
+    #
+    @property
+    def app_version(self) -> str:
+        """
+        Read application version from JSON file specified in VERSION_PATH.
+        Returns '-' if file not found or error occurs.
+        This is read once and cached by the property.
+        """
+        try:
+            version_file = Path(self.version_path)
+            if version_file.exists():
+                version_data = json.loads(version_file.read_text())
+                version = version_data.get("version", "-")
+                logger.info(
+                    f"📦 Application version: {version} (from {self.version_path})"
+                )
+                return version
+            else:
+                logger.warning(f"Version file not found at: {version_file}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse version file as JSON: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to read version file: {e}")
+        return "-"
 
 
 #

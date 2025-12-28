@@ -13,6 +13,7 @@ from app.audit_trail.models import AuditTrail
 # Import models to ensure they're available for SQLAlchemy relationship resolution
 from app.dtr.models import DTR  # Import DTR to resolve Vehicle.dtrs relationship
 from app.driver_payments.models import *
+from app.deposits.models import *
 
 from app.seeder.bat.parse_address import parse_address
 from app.seeder.bat.parse_bank_accounts import parse_bank_accounts

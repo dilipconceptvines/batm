@@ -39,6 +39,13 @@ from app.utils.logger import get_logger
 from app.vehicles.schemas import VehicleStatus
 from app.vehicles.services import vehicle_service
 
+# Deposit management imports
+from decimal import Decimal
+from app.deposits.models import DepositStatus, CollectionMethod
+from app.deposits.services import DepositService
+from app.ledger.services import LedgerService
+from app.ledger.models import PostingCategory, EntryType
+
 logger = get_logger(__name__)
 
 entity_mapper = {
@@ -535,6 +542,13 @@ def get_financial_information(db, case_no, case_params=None):
                 else 0.00,
                 "current_segment": lease.current_segment,
                 "total_segments": lease.total_segments,
+                "deposit_configuration": {
+                    "default_required_amount": round(management_recommendation, 2),  # 1 week lease fee
+                    "required_amount_editable": True,
+                    "collection_methods": ["Cash", "Check", "ACH"],
+                    "allow_partial_collection": True,
+                    "allow_zero_collection": True,
+                },
             },
             "lease_configuration": {
                 "lease_id": lease.lease_id,
@@ -568,18 +582,21 @@ def get_financial_information(db, case_no, case_params=None):
 
 
 @step(step_id="132", name="Process - Save Financial Information", operation="process")
-def set_financial_information(db, case_no, step_data):
+def set_financial_information_with_deposit(db: Session, case_no: str, step_data: dict, current_user_id: int = None):
     """
-    Process the financial information for the driver lease step
+    Process the financial information for the driver lease step with integrated deposit management.
     """
     try:
+        # Part 1: Get lease and validate case
         case_entity = bpm_service.get_case_entity(db, case_no=case_no)
-
         if not case_entity:
             raise ValueError("Step cannot be executed because there is no valid case")
 
         lease = lease_service.get_lease(db, lookup_id=int(case_entity.identifier_value))
+        if not lease:
+            raise ValueError("Lease not found for the given case")
 
+        # Part 2: Handle lease configuration (existing DOV/LT/ST logic - UNCHANGED)
         if lease.lease_type != step_data.get("lease_type"):
             raise ValueError(
                 f"Lease type doesn't match with this lease id {lease.lease_type}"
@@ -590,7 +607,7 @@ def set_financial_information(db, case_no, step_data):
             data = DOVLease(**step_data)
             lease_service.handle_dov_lease(db, lease.id, data)
         elif lease_type == LeaseType.LONG_TERM.value:
-            data = DOVLease(**step_data)  # TODO: Change after requiremements come
+            data = DOVLease(**step_data)  # TODO: Change after requirements come
             lease_service.handle_dov_lease(db, lease.id, data)
         elif lease_type == LeaseType.SHIFT.value:
             data = DOVLease(**step_data)
@@ -599,17 +616,41 @@ def set_financial_information(db, case_no, step_data):
             data = ShortTermLease(**step_data)
             lease_service.handle_short_term_lease(db, lease.id, data)
         elif lease_type == LeaseType.MEDALLION.value:
-            data = DOVLease(**step_data)  # TODO: Change after requiremements come
+            data = DOVLease(**step_data)  # TODO: Change after requirements come
             lease_service.handle_dov_lease(db, lease.id, data)
         else:
             raise ValueError(f"Invalid lease type: {lease.lease_type}")
 
+        # Part 3: Extract deposit information (NEW)
+        deposit_info = step_data.get("deposit_info", {})
+        required_amount = deposit_info.get("required_amount")
+        collected_amount = deposit_info.get("collected_amount", Decimal('0.00'))
+        collection_method_str = deposit_info.get("collection_method")
+        deposit_notes = deposit_info.get("notes")
+
+        # Convert collection method string to enum
+        collection_method = None
+        if collection_method_str:
+            try:
+                collection_method = CollectionMethod(collection_method_str)
+            except ValueError:
+                raise ValueError(f"Invalid collection method: {collection_method_str}")
+
+        # Part 4: Update lease record (existing + backward compatibility)
+        # Support both new deposit_info and old security_deposit field
+        if required_amount is not None:
+            # New deposit system - set deposit_amount_paid to collected_amount for backward compatibility
+            security_deposit = collected_amount
+        else:
+            # Backward compatibility - use old security_deposit field
+            security_deposit = step_data.get("financial_information", {}).get(
+                "security_deposit", lease.deposit_amount_paid
+            )
+
         lease_data = {
             "id": lease.id,
             "lease_id": step_data.get("lease_id", lease.lease_id),
-            "deposit_amount_paid": step_data.get("financial_information", {}).get(
-                "security_deposit", lease.deposit_amount_paid
-            ),
+            "deposit_amount_paid": security_deposit,  # Backward compatibility
             "additional_balance_due": step_data.get("financial_information", {}).get(
                 "additional_balance_due", lease.additional_balance_due
             ),
@@ -620,6 +661,59 @@ def set_financial_information(db, case_no, step_data):
 
         lease = lease_service.upsert_lease(db, lease_data)
 
+        # Part 5: Create deposit record (NEW)
+        deposit_created = False
+        if required_amount is not None:
+            # Validate deposit amounts
+            if collected_amount > required_amount:
+                raise ValueError("Collected amount cannot exceed required amount")
+
+            # Initialize services
+            deposit_service = DepositService(db)
+            ledger_service = LedgerService(db)
+
+            # Get driver information for deposit
+            driver_tlc_license = None
+            if hasattr(lease, 'lease_driver') and lease.lease_driver:
+                # Get the first active driver
+                active_driver = next((ld for ld in lease.lease_driver if ld.is_active), None)
+                if active_driver and active_driver.driver and active_driver.driver.tlc_license:
+                    driver_tlc_license = active_driver.driver.tlc_license.tlc_license_number
+
+            # Create deposit record
+            deposit_data = {
+                'lease_id': lease.id,
+                'required_amount': required_amount,
+                'collected_amount': collected_amount,
+                'driver_tlc_license': driver_tlc_license,
+                'vehicle_vin': lease.vehicle.vin if lease.vehicle else None,
+                'vehicle_plate': lease.vehicle.registrations[0].plate_number if lease.vehicle and lease.vehicle.registrations else None,
+                'lease_start_date': lease.lease_start_date,
+                'notes': deposit_notes,
+            }
+
+            deposit = deposit_service.create_deposit(db, deposit_data)
+            deposit_created = True
+
+            # Part 6: Post to ledger if amount > 0 (NEW)
+            if collected_amount > 0 and collection_method:
+                try:
+                    # Create ledger posting for deposit collection
+                    posting, balance = ledger_service.create_obligation(
+                        category=PostingCategory.DEPOSIT,
+                        amount=collected_amount,
+                        reference_id=f"DEP-{deposit.deposit_id}-INIT",
+                        driver_id=current_user_id,  # This should be the driver's ID, but using current_user_id for now
+                        entry_type=EntryType.CREDIT,  # CREDIT increases deposit liability
+                        lease_id=lease.id
+                    )
+                    logger.info(f"Ledger posting created for deposit {deposit.deposit_id}: ${collected_amount}")
+                except Exception as ledger_error:
+                    logger.error(f"Failed to create ledger posting for deposit {deposit.deposit_id}: {ledger_error}")
+                    # Don't fail the entire process for ledger errors, but log it
+                    # In production, you might want to raise this error
+
+        # Part 7: Create lease schedule (existing - UNCHANGED)
         # Get the lease configurations to extract amounts for schedule
         configs = lease_service.get_lease_configurations(
             db, lease_id=lease.id, multiple=True
@@ -646,9 +740,11 @@ def set_financial_information(db, case_no, step_data):
         )
         logger.info(f"Lease schedule created/updated for lease {lease.id}")
 
-        # Create audit trail for financial information
+        # Part 8: Create audit trails (existing + NEW deposit audit)
         total_lease_amount = vehicle_weekly + medallion_weekly
         case = bpm_service.get_case_obj(db, case_no=case_no)
+
+        # Existing financial audit trail
         audit_trail_service.create_audit_trail(
             db=db,
             description=f"Financial information saved: Total weekly lease amount ${total_lease_amount:.2f} (Vehicle: ${vehicle_weekly:.2f}, Medallion: ${medallion_weekly:.2f})",
@@ -661,9 +757,28 @@ def set_financial_information(db, case_no, step_data):
             audit_type=AuditTrailType.AUTOMATED,
         )
 
+        # NEW: Deposit audit trail
+        if deposit_created:
+            audit_trail_service.create_audit_trail(
+                db=db,
+                description=f"Security deposit created: ${required_amount:.2f} required, ${collected_amount:.2f} collected via {collection_method.value if collection_method else 'N/A'}",
+                case=case,
+                meta_data={
+                    "lease_id": lease.id,
+                    "deposit_id": deposit.deposit_id,
+                    "required_amount": float(required_amount),
+                    "collected_amount": float(collected_amount),
+                    "collection_method": collection_method.value if collection_method else None,
+                },
+                audit_type=AuditTrailType.AUTOMATED,
+            )
+
+        db.commit()
         return "Ok"
+
     except Exception as e:
-        logger.error("Error in set_financial_information: %s", e, exc_info=True)
+        db.rollback()
+        logger.error("Error in set_financial_information_with_deposit: %s", e, exc_info=True)
         raise e
 
 

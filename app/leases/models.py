@@ -349,7 +349,7 @@ class Lease(Base, AuditMixin):
         String(15), nullable=True, comment="Behind or Advanced"
     )
     deposit_amount_paid: Mapped[Optional[int]] = mapped_column(
-        Integer, nullable=True, comment="Amount for lease payments type"
+        Integer, nullable=True, comment="DEPRECATED: Amount for lease payments type - migrated to deposits table"
     )
     management_recommendation_amount: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True, comment="Amount recommended for management"
@@ -425,6 +425,10 @@ class Lease(Base, AuditMixin):
         viewonly=True
     )
 
+    deposit: Mapped["Deposit"] = relationship(
+        "Deposit", back_populates="lease", uselist=False
+    )
+
     def to_dict(self):
         """Convert the Lease model to a dictionary"""
         # Check if lease has any active drivers
@@ -476,6 +480,7 @@ class Lease(Base, AuditMixin):
             ]
             if self.lease_schedule
             else None,
+            "deposit": self.deposit.to_dict() if self.deposit else None,
             "created_on": self.created_on,
             "updated_on": self.updated_on,
             "created_by": self.created_by,

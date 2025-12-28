@@ -42,6 +42,7 @@ from app.tlc.models import TLCViolation
 from app.ledger.models import LedgerBalance, BalanceStatus, PostingCategory
 from app.repairs.models import RepairInstallment, RepairInvoice, RepairInstallmentStatus
 from app.loans.models import LoanInstallment, DriverLoan, LoanInstallmentStatus
+from app.deposits.models import Deposit
 
 from app.current_balances.schemas import (
     WeeklyBalanceRow,
@@ -679,6 +680,14 @@ class CurrentBalancesServiceOptimized:
         
         return prior_balance_map
     
+    def _get_deposit_amount_for_lease(self, lease_id: Optional[int]) -> Decimal:
+        """Get deposit amount from deposits table for a lease"""
+        if not lease_id:
+            return Decimal("0")
+        
+        deposit = self.db.query(Deposit).filter(Deposit.lease_id == lease_id).first()
+        return deposit.collected_amount if deposit else Decimal("0")
+    
     def _calculate_balance_from_prefetched_data(
         self,
         lease: Lease,
@@ -722,8 +731,8 @@ class CurrentBalancesServiceOptimized:
         misc_charges = misc_map.get(lease.id, Decimal("0"))
         prior_balance = prior_balance_map.get(lease.id, Decimal("0"))
         
-        # Get deposit amount
-        deposit_amount = lease.deposit_amount_paid or Decimal("0")
+        # Get deposit amount from deposits table
+        deposit_amount = self._get_deposit_amount_for_lease(lease.id)
         
         # Calculate subtotal and net
         subtotal = (
@@ -966,7 +975,7 @@ class CurrentBalancesServiceOptimized:
             misc_charges=dtr.misc_charges or Decimal("0"),
             subtotal_deductions=dtr.subtotal_deductions or Decimal("0"),
             prior_balance=dtr.prior_balance or Decimal("0"),
-            deposit_amount=lease.deposit_amount_paid if lease else Decimal("0"),
+            deposit_amount=self._get_deposit_amount_for_lease(lease.id if lease else None),
             net_earnings=dtr.net_earnings or Decimal("0"),
             last_updated=dtr.generation_date or datetime.now(timezone.utc)
         )

@@ -6,6 +6,7 @@ from app.bpm.services import bpm_service
 from app.bpm.step_info import step
 from app.bpm_flows.terminatelease import utils as terminate_lease_utils
 from app.core.config import settings
+from app.deposits.services import DepositService
 from app.drivers.schemas import DriverStatus
 from app.drivers.services import driver_service
 from app.drivers.utils import format_driver_response
@@ -219,6 +220,22 @@ def process_lease_termination(db, case_no, step_data):
             vehicle_id=lease.vehicle_id,
             medallion_id=lease.medallion_id,
         )
+
+        # Initiate deposit hold period if lease has a paid deposit
+        deposit_service = DepositService(db)
+        deposit = deposit_service.repo.get_by_lease_id(lease.id)
+        
+        if deposit and deposit.deposit_status.value == "PAID":
+            deposit_service.initiate_hold_period(
+                db=db,
+                lease_id=lease.id,
+                termination_date=lease.termination_date
+            )
+            logger.info(
+                f"Deposit hold period initiated for lease {lease.lease_id}",
+                deposit_id=deposit.deposit_id,
+                hold_expiry_date=deposit.hold_expiry_date
+            )
 
         # Handle notes if provided
         if step_data.get("notes"):

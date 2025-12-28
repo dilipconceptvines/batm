@@ -5,6 +5,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.bpm.services import bpm_service
+from app.deposits.services import DepositService
 from app.interim_payments.exceptions import (
     InterimPaymentLedgerError,
     InvalidAllocationError,
@@ -12,6 +13,7 @@ from app.interim_payments.exceptions import (
 from app.interim_payments.models import InterimPayment
 from app.interim_payments.repository import InterimPaymentRepository
 from app.interim_payments.schemas import InterimPaymentCreate
+from app.ledger.models import PostingCategory
 from app.ledger.services import LedgerService
 from app.utils.logger import get_logger
 
@@ -29,6 +31,7 @@ class InterimPaymentService:
         self.repo = InterimPaymentRepository(db)
         # Use an async session for the ledger service as required by its repository
         self.ledger_service = LedgerService(db)
+        self.deposit_service = DepositService(db)
 
     def _generate_next_payment_id(self) -> str:
         """Generates a new, unique Interim Payment ID in the format INTPAY-YYYY-#####."""
@@ -54,6 +57,28 @@ class InterimPaymentService:
             total_allocated = sum(alloc.amount for alloc in payment_data.allocations)
             if total_allocated > payment_data.total_amount:
                 raise InvalidAllocationError("Total allocated amount cannot exceed the total payment amount.")
+            
+            # Validate deposit allocations
+            for alloc in payment_data.allocations:
+                if alloc.category.upper() == "DEPOSIT":
+                    try:
+                        deposit_id = alloc.reference_id
+                        deposit = self.deposit_service.repo.get_by_deposit_id(deposit_id)
+                        
+                        if not deposit:
+                            raise InvalidAllocationError(f"Deposit with ID {deposit_id} not found.")
+                        
+                        if deposit.lease_id != payment_data.lease_id:
+                            raise InvalidAllocationError(f"Deposit {deposit_id} belongs to lease {deposit.lease_id}, not lease {payment_data.lease_id}.")
+                        
+                        outstanding_amount = deposit.required_amount - deposit.collected_amount
+                        if alloc.amount > outstanding_amount:
+                            raise InvalidAllocationError(f"Allocation amount ${alloc.amount} exceeds outstanding deposit amount ${outstanding_amount}.")
+                            
+                    except InvalidAllocationError:
+                        raise
+                    except Exception as e:
+                        raise InvalidAllocationError(f"Error validating deposit allocation: {str(e)}")
 
             # --- Create Master Interim Payment Record ---
             payment_id = self._generate_next_payment_id()
@@ -71,8 +96,43 @@ class InterimPaymentService:
             )
             created_payment = self.repo.create_payment(new_payment)
 
-            # --- Apply Payments to Ledger ---
-            allocation_dict = {alloc.reference_id: alloc.amount for alloc in payment_data.allocations}
+            # --- Process Deposit Allocations ---
+            deposit_allocations = [alloc for alloc in payment_data.allocations if alloc.category.upper() == "DEPOSIT"]
+            non_deposit_allocations = [alloc for alloc in payment_data.allocations if alloc.category.upper() != "DEPOSIT"]
+            
+            # Process deposit allocations
+            for alloc in deposit_allocations:
+                try:
+                    # Extract deposit_id from reference_id
+                    deposit_id = alloc.reference_id
+                    
+                    # Update deposit collection
+                    deposit = self.deposit_service.update_deposit_collection(
+                        db=self.db,
+                        deposit_id=deposit_id,
+                        additional_amount=alloc.amount,
+                        collection_method=payment_data.payment_method,
+                        notes=f"Interim payment {payment_id}"
+                    )
+                    
+                    # Create ledger posting for deposit
+                    await self.ledger_service.create_manual_credit(
+                        category=PostingCategory.DEPOSIT,
+                        amount=alloc.amount,
+                        reference_id=deposit_id,
+                        driver_id=payment_data.driver_id,
+                        lease_id=payment_data.lease_id,
+                        description=f"Deposit payment via interim payment {payment_id}"
+                    )
+                    
+                    logger.info(f"Applied ${alloc.amount} to deposit {deposit_id} via interim payment {payment_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process deposit allocation for deposit {alloc.reference_id}: {e}")
+                    raise InterimPaymentLedgerError(payment_id, f"Deposit allocation failed: {str(e)}") from e
+
+            # --- Apply Non-Deposit Payments to Ledger ---
+            allocation_dict = {alloc.reference_id: alloc.amount for alloc in non_deposit_allocations}
 
             # The ledger service handles the creation of credit postings and balance updates
             await self.ledger_service.apply_interim_payment(
