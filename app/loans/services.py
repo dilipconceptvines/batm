@@ -157,6 +157,9 @@ class LoanService:
         """
         Calculates and stores the full weekly installment schedule for a loan,
         including principal and interest.
+        
+        Interest is calculated based on accrual days from loan date (or last installment) 
+        to the START of the current payment period (Sunday), as per documentation.
         """
         try:
             total_principal = loan.principal_amount
@@ -166,7 +169,7 @@ class LoanService:
             weekly_principal_payment = self._get_weekly_principal(total_principal)
             
             remaining_principal = total_principal
-            current_start_date = loan.start_week
+            current_start_date = loan.start_week  # This is a Sunday
             last_installment_date = loan.loan_date
             installments = []
             seq = 1
@@ -174,20 +177,25 @@ class LoanService:
             while remaining_principal > 0:
                 principal_due = min(weekly_principal_payment, remaining_principal)
                 
-                due_date = current_start_date + timedelta(days=6) # Due at the end of the week
-                accrual_days = (due_date - last_installment_date).days
+                # FIX: Calculate accrual days to START of payment period (Sunday)
+                # This is the due date for interest calculation purposes
+                interest_due_date = current_start_date  # Sunday
+                accrual_days = (interest_due_date - last_installment_date).days
                 
-                # Interest = Outstanding Principal * (Annual Rate / 100) * (Accrual Days / 365)
+                # Calculate interest based on accrual to Sunday
                 interest_due = (remaining_principal * (loan.interest_rate / Decimal("100")) * Decimal(accrual_days)) / Decimal("365")
                 interest_due = interest_due.quantize(Decimal("0.01"))
 
                 total_due = principal_due + interest_due
+                
+                # Week end date is Saturday for display purposes
+                week_end_date = current_start_date + timedelta(days=6)  # Saturday
 
                 installment = LoanInstallment(
                     loan_id=loan.id,
                     installment_id=f"{loan.loan_id}-{str(seq).zfill(2)}",
-                    week_start_date=current_start_date,
-                    week_end_date=due_date,
+                    week_start_date=current_start_date,  # Sunday
+                    week_end_date=week_end_date,  # Saturday (for display)
                     principal_amount=principal_due,
                     interest_amount=interest_due,
                     total_due=total_due,
@@ -196,7 +204,8 @@ class LoanService:
                 installments.append(installment)
 
                 remaining_principal -= principal_due
-                last_installment_date = due_date
+                # FIX: Update last_installment_date to Sunday for next calculation
+                last_installment_date = interest_due_date  # Sunday, not Saturday
                 current_start_date += timedelta(weeks=1)
                 seq += 1
 
