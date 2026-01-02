@@ -27,6 +27,7 @@ from app.curb.exceptions import (
 from app.curb.models import CurbAccount, CurbTrip, CurbTripStatus, PaymentType, ReconciliationMode
 from app.curb.repository import CurbRepository
 from app.drivers.models import Driver
+from app.deposits.models import *
 from app.leases.services import lease_service
 from app.ledger.models import PostingCategory, EntryType
 from app.ledger.repository import LedgerRepository

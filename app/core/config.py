@@ -1,22 +1,22 @@
 # app/core/config.py
 
 import json
-import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 import boto3
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-logger = logging.getLogger("uvicorn")
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 #
 # =====================================================
-#  GENERIC SECRET FETCH FUNCTION (DB, Redis, DocuSign, CURB, AWS)
+#  GENERIC SECRET FETCH FUNCTION (DB, Redis, DocuSign, AWS)
 # =====================================================
 #
 
@@ -35,13 +35,13 @@ def cached_secret_values(secret_id: str | None, region: str | None) -> dict:
         return {}
 
     region = region or os.getenv("AWS_REGION", "us-east-1")
-    logger.info(f"🔐 Loading secret → {secret_id} (region={region})")
+    logger.info("Loading secret", secret_id=secret_id, region=region)
 
     client = boto3.client("secretsmanager", region_name=region)
     resp = client.get_secret_value(SecretId=secret_id)
     data = json.loads(resp["SecretString"])
 
-    logger.info(f"✅ Loaded secret from Secrets Manager: {secret_id}")
+    logger.info("Loaded secret from Secrets Manager", secret_id=secret_id)
     return data
 
 
@@ -71,12 +71,12 @@ class Settings(BaseSettings):
     db_secret_id: str = None  # e.g. bat/staging/db
     redis_secret_id: str = None  # e.g. bat/staging/redis
     docusign_secret_id: str = None  # e.g. bat/staging/docusign
-    curb_secret_id: str = None  # e.g. bat/staging/curb
     aws_credentials_secret_id: str = None  # e.g. bat/staging/aws
 
     # AWS credentials base fields (for .env / local)
     aws_access_key_id_base: str = None
     aws_secret_access_key_base: str = None
+    aws_ses_configuration_set: str = None
 
     # Redis base fields (for .env / local)
     redis_host: str
@@ -108,6 +108,22 @@ class Settings(BaseSettings):
 
     # Logging configuration
     uvicorn_log_level: str = "DEBUG"
+    # Email and SMS control flags
+    enable_email_sending: bool = True
+    enable_sms_sending: bool = True
+
+    # Email override recipients (comma-separated)
+    # When set, ALL emails will go to these addresses instead of actual recipients
+    override_email_to: str  # e.g., "test@example.com,admin@example.com"
+    override_email_cc: str  # e.g., "manager@example.com"
+
+    # SMS override recipient (E.164 format)
+    # When set, ALL SMS will go to this phone number instead of actual recipients
+    override_sms_to: str = None  # e.g., "+11234567890"
+
+    # SMS override recipient (E.164 format)
+    # When set, ALL SMS will go to this phone number instead of actual recipients
+    override_sms_to: str = None  # e.g., "+11234567890"
 
     claude_model_id: str = None
     app_base_url: str = None
@@ -212,6 +228,28 @@ class Settings(BaseSettings):
     # Version file path
     version_path: str = ".version"
 
+    dmv_license_expiry_reminder_subject_template: str
+    dmv_license_expiry_subject_template: str
+    tlc_license_expiry_reminder_subject_template: str
+    tlc_license_expiry_subject_template: str
+
+    driver_license_expiry_email_template: str
+    driver_license_expiry_sms_template: str
+    
+    lease_creation_welcome_template: str
+    lease_creation_welcome_subject_template: str
+
+    events_config_path: str
+    driver_license_expiry_email_template: str
+    driver_license_expiry_sms_template: str
+
+    lease_creation_welcome_template: str
+    lease_creation_welcome_subject_template: str
+
+    # Password reset email configuration
+    password_reset_email_template_key: str = None
+    password_reset_email_subject_template: str = None
+
     #
     # ---------------------------
     #  DB ACCESS PROPERTIES
@@ -228,7 +266,7 @@ class Settings(BaseSettings):
 
         if data:
             logger.info(
-                f"💾 DB config source: Secrets Manager (secret_id={self.db_secret_id})"
+                "DB config source: Secrets Manager", secret_id=self.db_secret_id
             )
         else:
             logger.info("💾 DB config source: .env / environment variables")
@@ -243,11 +281,13 @@ class Settings(BaseSettings):
 
     @property
     def db_url(self) -> str:
+        """Construct the synchronous database URL."""
         host, user, password, database, port = self._db_tuple
         return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
 
     @property
     def async_db_url(self) -> str:
+        """Construct the asynchronous database URL."""
         host, user, password, database, port = self._db_tuple
         return f"mysql+asyncmy://{user}:{password}@{host}:{port}/{database}"
 
@@ -267,10 +307,10 @@ class Settings(BaseSettings):
 
         if data:
             logger.info(
-                f"🧠 Redis config source: Secrets Manager (secret_id={self.redis_secret_id})"
+                "Redis config source: Secrets Manager", secret_id=self.redis_secret_id
             )
         else:
-            logger.info("🧠 Redis config source: .env / environment variables")
+            logger.info("Redis config source: .env / environment variables")
 
         # Use explicit defaults for localhost development
         host = data.get("REDIS_HOST") or self.redis_host or "localhost"
@@ -282,6 +322,7 @@ class Settings(BaseSettings):
 
     @property
     def redis_url(self) -> str:
+        """Construct the Redis URL."""
         host, port, username, password = self._redis_tuple
 
         if username and password:
@@ -293,64 +334,18 @@ class Settings(BaseSettings):
 
     @property
     def cache_manager(self) -> str:
+        """Construct the Redis URL for cache manager (DB 0)."""
         return f"{self.redis_url}/0"
 
     @property
     def celery_broker(self) -> str:
+        """Construct the Redis URL for Celery broker (DB 1)."""
         return f"{self.redis_url}/1"
 
     @property
     def celery_backend(self) -> str:
+        """Construct the Redis URL for Celery backend (DB 2)."""
         return f"{self.redis_url}/2"
-
-    #
-    # ---------------------------
-    #  CURB ACCESS PROPERTIES (override in-place)
-    # ---------------------------
-    #
-    @property
-    def curb_url(self):
-        data = cached_secret_values(self.curb_secret_id, self.aws_region)
-        if data:
-            logger.info(
-                f"🚕 CURB_URL source: Secrets Manager (secret_id={self.curb_secret_id})"
-            )
-        else:
-            logger.info("🚕 CURB_URL source: .env / environment variables")
-        return data.get("CURB_URL") or self.__dict__.get("curb_url")
-
-    @property
-    def curb_merchant(self):
-        data = cached_secret_values(self.curb_secret_id, self.aws_region)
-        if data:
-            logger.info(
-                f"🚕 CURB_MERCHANT source: Secrets Manager (secret_id={self.curb_secret_id})"
-            )
-        else:
-            logger.info("🚕 CURB_MERCHANT source: .env / environment variables")
-        return data.get("CURB_MERCHANT") or self.__dict__.get("curb_merchant")
-
-    @property
-    def curb_username(self):
-        data = cached_secret_values(self.curb_secret_id, self.aws_region)
-        if data:
-            logger.info(
-                f"🚕 CURB_USERNAME source: Secrets Manager (secret_id={self.curb_secret_id})"
-            )
-        else:
-            logger.info("🚕 CURB_USERNAME source: .env / environment variables")
-        return data.get("CURB_USERNAME") or self.__dict__.get("curb_username")
-
-    @property
-    def curb_password(self):
-        data = cached_secret_values(self.curb_secret_id, self.aws_region)
-        if data:
-            logger.info(
-                f"🚕 CURB_PASSWORD source: Secrets Manager (secret_id={self.curb_secret_id})"
-            )
-        else:
-            logger.info("🚕 CURB_PASSWORD source: .env / environment variables")
-        return data.get("CURB_PASSWORD") or self.__dict__.get("curb_password")
 
     #
     # ---------------------------
@@ -370,10 +365,11 @@ class Settings(BaseSettings):
         data = cached_secret_values(self.aws_credentials_secret_id, self.aws_region)
         if data:
             logger.info(
-                f"🔑 AWS_ACCESS_KEY_ID source: Secrets Manager (secret_id={self.aws_credentials_secret_id})"
+                "AWS_ACCESS_KEY_ID source: Secrets Manager",
+                secret_id=self.aws_access_key_id_base,
             )
         else:
-            logger.info("🔑 AWS_ACCESS_KEY_ID source: .env / environment variables")
+            logger.info("AWS_ACCESS_KEY_ID source: .env / environment variables")
 
         return data.get("AWS_ACCESS_KEY_ID") or self.aws_access_key_id_base
 
@@ -390,10 +386,11 @@ class Settings(BaseSettings):
         data = cached_secret_values(self.aws_credentials_secret_id, self.aws_region)
         if data:
             logger.info(
-                f"🔑 AWS_SECRET_ACCESS_KEY source: Secrets Manager (secret_id={self.aws_secret_access_key_base})"
+                "AWS_SECRET_ACCESS_KEY source: Secrets Manager",
+                secret_id=self.aws_secret_access_key_base,
             )
         else:
-            logger.info("🔑 AWS_SECRET_ACCESS_KEY source: .env / environment variables")
+            logger.info("AWS_SECRET_ACCESS_KEY source: .env / environment variables")
 
         return data.get("AWS_SECRET_ACCESS_KEY") or self.aws_secret_access_key_base
 
@@ -412,18 +409,18 @@ class Settings(BaseSettings):
         try:
             version_file = Path(self.version_path)
             if version_file.exists():
-                version_data = json.loads(version_file.read_text())
+                version_data = json.loads(version_file.read_text(encoding="utf-8"))
                 version = version_data.get("version", "-")
                 logger.info(
-                    f"📦 Application version: {version} (from {self.version_path})"
+                    f"Application version found {version} from path {self.version_path}"
                 )
                 return version
             else:
-                logger.warning(f"Version file not found at: {version_file}")
+                logger.warning("Version file not found", version_path=self.version_path)
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse version file as JSON: {e}")
+            logger.warning("Failed to parse version file as JSON", error=str(e))
         except Exception as e:
-            logger.warning(f"Failed to read version file: {e}")
+            logger.warning("Failed to read version file", error=str(e))
         return "-"
 
 
@@ -450,12 +447,11 @@ def get_docusign_private_key_s3_key():
     data = cached_secret_values(settings.docusign_secret_id, settings.aws_region)
     if data:
         logger.info(
-            f"📄 DOCUSIGN_PRIVATE_KEY_S3_KEY source: Secrets Manager (secret_id={settings.docusign_secret_id})"
+            "DOCUSIGN_PRIVATE_KEY_S3_KEY source: Secrets Manager",
+            secret_id=settings.docusign_secret_id,
         )
     else:
-        logger.info(
-            "📄 DOCUSIGN_PRIVATE_KEY_S3_KEY source: .env / environment variables"
-        )
+        logger.info("DOCUSIGN_PRIVATE_KEY_S3_KEY source: .env / environment variables")
     return (
         data.get("DOCUSIGN_PRIVATE_KEY_S3_KEY") or settings.docusign_private_key_s3_key
     )

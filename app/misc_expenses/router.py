@@ -120,6 +120,7 @@ def list_misc_expenses(
                 reference_number=exp.reference_number,
                 category=exp.category,
                 expense_date=exp.expense_date,
+                payment_type=exp.payment_type.value,
                 amount=exp.amount,
                 notes=exp.notes,
                 driver_name=exp.driver.full_name if exp.driver else "N/A",

@@ -8,7 +8,7 @@ from typing import List, Optional, Dict
 
 from sqlalchemy.orm import Session
 
-from app.curb.models import CurbTrip
+from app.audit_trail.services import audit_trail_service
 from app.ezpass.exceptions import (
     AssociationError,
     CSVParseError,
@@ -24,6 +24,7 @@ from app.ezpass.repository import EZPassRepository
 from app.ledger.models import PostingCategory
 from app.ledger.services import LedgerService
 from app.ledger.repository import LedgerRepository
+from app.curb.models import CurbTrip
 from app.utils.logger import get_logger
 from app.vehicles.models import VehicleRegistration
 
@@ -281,6 +282,9 @@ class EZPassService:
                 f"CSV import completed: {successful_imports} imported, "
                 f"{excluded_count} excluded, {failed_imports} failed"
             )
+
+            # Immediately associate and post imported transactions
+            self.associate_and_post_transactions(import_batch.id)
             
             return {
                 "import_id": import_batch.id,
@@ -395,7 +399,7 @@ class EZPassService:
                 # Step 2: Find vehicle by plate
                 vehicle_reg = (
                     self.db.query(VehicleRegistration)
-                    .filter(VehicleRegistration.license_plate == plate_number)
+                    .filter(VehicleRegistration.plate_number == plate_number)
                     .first()
                 )
                 
@@ -583,6 +587,10 @@ class EZPassService:
         Returns:
             Dict with reassignment results
         """
+        from app.drivers.models import Driver
+        from app.leases.models import Lease
+        import uuid
+        
         success_count = 0
         failed_count = 0
         errors = []
@@ -593,11 +601,77 @@ class EZPassService:
             "POSTED_TO_LEDGER": {"count": 0, "with_ledger_ops": 0},
         }
         
+        # Generate Batch ID for bulk operations (Section 9.3)
+        batch_id = str(uuid.uuid4()) if len(transaction_ids) > 1 else None
+        if batch_id:
+            logger.info(f"Bulk reassignment batch created: {batch_id}, size: {len(transaction_ids)}")
+        
+        # Validate target lease and driver (Section 4.3, 4.4)
+        new_driver = self.db.query(Driver).filter(Driver.id == new_driver_id).first()
+        if not new_driver:
+            raise ReassignmentError(f"Target driver {new_driver_id} not found")
+
+        new_lease = self.db.query(Lease).filter(Lease.id == new_lease_id).first()
+        if not new_lease:
+            raise ReassignmentError(f"Target lease {new_lease_id} not found")
+
+        # Validate target driver is associated with target lease
+        lease_drivers = new_lease.lease_driver
+        is_valid_driver = False
+        for ld in lease_drivers:
+            if ld.driver_id == new_driver.driver_id:
+                is_valid_driver = True
+                break
+
+        if not is_valid_driver:
+            raise ReassignmentError(
+                f"Target lease {new_lease_id} is not associated with target driver {new_driver_id}. "
+                f"Cannot reassign entries to invalid driver/lease combination."
+            )
+        
+        # Validate bulk source consistency (Section 4.2)
+        # All selected entries must originate from EXACTLY one source lease
+        source_leases = set()
+        for txn_id in transaction_ids:
+            transaction = self.repo.get_transaction_by_id(txn_id)
+            if transaction and transaction.lease_id:
+                source_leases.add(transaction.lease_id)
+        
+        if len(source_leases) > 1:
+            raise ReassignmentError(
+                f"Bulk reassignment failed: All entries must originate from exactly one source lease. "
+                f"Found entries from {len(source_leases)} different leases: {sorted(source_leases)}"
+            )
+        
+        if source_leases:
+            source_lease_id = list(source_leases)[0]
+            logger.info(f"Bulk reassignment validated: All {len(transaction_ids)} entries from source lease {source_lease_id}")
+
         for txn_id in transaction_ids:
             try:
                 transaction = self.repo.get_transaction_by_id(txn_id)
                 if not transaction:
                     raise ReassignmentError(f"Transaction {txn_id} not found")
+                
+                # Validate source entry has valid associations (Section 4.1)
+                if not transaction.driver_id or not transaction.lease_id:
+                    raise ReassignmentError(
+                        f"Transaction {txn_id} has invalid source associations. "
+                        f"driver_id={transaction.driver_id}, lease_id={transaction.lease_id}. "
+                        f"Entry must be linked to valid source lease and driver."
+                    )
+                
+                # Check for no-op reassignment (Section 4.8)
+                # Block when source = target for both lease AND driver
+                # BUT allow vehicle-only changes (Section 6.3)
+                if (transaction.driver_id == new_driver_id and 
+                    transaction.lease_id == new_lease_id and
+                    (new_vehicle_id is None or transaction.vehicle_id == new_vehicle_id)):
+                    raise ReassignmentError(
+                        f"Transaction {txn_id}: Source and target are identical (no-op reassignment). "
+                        f"driver_id={transaction.driver_id}, lease_id={transaction.lease_id}, "
+                        f"vehicle_id={transaction.vehicle_id}"
+                    )
                 
                 current_status = transaction.status
                 
@@ -626,6 +700,41 @@ class EZPassService:
                         f"Successfully reassigned IMPORTED transaction {transaction.transaction_id}. "
                         f"Status remains IMPORTED. Will be posted with new associations."
                     )
+
+                    # Create audit trail record (Section 9.2)
+                    audit_trail_service.create_audit_trail(
+                        db=self.db,
+                        case_no=None,
+                        step_id=None,
+                        description=f"EZPass transaction reassigned: {transaction.transaction_id}",
+                        driver_id=new_driver_id,
+                        medallion_id=new_medallion_id,
+                        vehicle_id=new_vehicle_id or transaction.vehicle_id,
+                        lease_id=new_lease_id,
+                        medallion_owner_id=None,
+                        vehicle_owner_id=None,
+                        ledger_id=None,
+                        pvb_id=None,
+                        correspondence_id=None,
+                        meta_data={
+                            "entry_type": "EZPASS_TRANSACTION",
+                            "entry_id": transaction.id,
+                            "entry_reference": transaction.transaction_id,
+                            "batch_id": batch_id,
+                            "batch_size": len(transaction_ids) if batch_id else 1,
+                            "source_lease_id": transaction.lease_id,
+                            "source_driver_id": transaction.driver_id,
+                            "target_lease_id": new_lease_id,
+                            "target_driver_id": new_driver_id,
+                            "reassignment_type": "IMPORTED_STATUS_UPDATE",
+                            "total_payable": None,  # Not applicable for non-posted entries
+                            "collected_to_date": None,
+                            "user_id": user_id,
+                            "reason": reason
+                        }
+                    )
+
+                    self.associate_and_post_transactions()
                 
                 # ============================================================
                 # CASE 2: ASSOCIATION_FAILED Status
@@ -655,6 +764,41 @@ class EZPassService:
                         f"Successfully reassigned ASSOCIATION_FAILED transaction {transaction.transaction_id}. "
                         f"Status changed to IMPORTED. Ready for reprocessing."
                     )
+
+                    # Create audit trail record (Section 9.2)
+                    audit_trail_service.create_audit_trail(
+                        db=self.db,
+                        case_no=None,
+                        step_id=None,
+                        description=f"EZPass transaction reassigned: {transaction.transaction_id}",
+                        driver_id=new_driver_id,
+                        medallion_id=new_medallion_id,
+                        vehicle_id=new_vehicle_id or transaction.vehicle_id,
+                        lease_id=new_lease_id,
+                        medallion_owner_id=None,
+                        vehicle_owner_id=None,
+                        ledger_id=None,
+                        pvb_id=None,
+                        correspondence_id=None,
+                        meta_data={
+                            "entry_type": "EZPASS_TRANSACTION",
+                            "entry_id": transaction.id,
+                            "entry_reference": transaction.transaction_id,
+                            "batch_id": batch_id,
+                            "batch_size": len(transaction_ids) if batch_id else 1,
+                            "source_lease_id": transaction.lease_id,
+                            "source_driver_id": transaction.driver_id,
+                            "target_lease_id": new_lease_id,
+                            "target_driver_id": new_driver_id,
+                            "reassignment_type": "ASSOCIATION_FAILED_TO_IMPORTED",
+                            "total_payable": None,  # Not applicable for non-posted entries
+                            "collected_to_date": None,
+                            "user_id": user_id,
+                            "reason": reason
+                        }
+                    )
+
+                    self.associate_and_post_transactions()
                 
                 # ============================================================
                 # CASE 3: POSTED_TO_LEDGER Status
@@ -668,7 +812,7 @@ class EZPassService:
                         new_lease=new_lease_id
                     )
                     
-                    # Get current outstanding balance from ledger
+                    # Get current balance from ledger
                     balance = self.ledger_service.repo.get_balance_by_reference_id(
                         transaction.transaction_id
                     )
@@ -679,45 +823,30 @@ class EZPassService:
                             f"Transaction shows POSTED_TO_LEDGER but has no ledger entry."
                         )
                     
-                    outstanding_balance = Decimal(str(balance.balance))
+                    # Derive financial values per specification (Section 7.2)
+                    total_payable = Decimal(str(balance.original_amount))  # TP
+                    current_balance = Decimal(str(balance.balance))        # B
+                    collected_to_date = total_payable - current_balance     # CD
                     
-                    # If fully paid (balance = 0), only update associations
-                    if outstanding_balance == Decimal('0.00'):
-                        logger.info(
-                            f"Transaction {transaction.transaction_id} is fully paid (balance: $0.00). "
-                            f"Updating associations only, no ledger changes needed."
-                        )
-                        
-                        self.repo.update_transaction(transaction.id, {
-                            "driver_id": new_driver_id,
-                            "lease_id": new_lease_id,
-                            "medallion_id": new_medallion_id,
-                            "vehicle_id": new_vehicle_id or transaction.vehicle_id,
-                            "updated_on": datetime.now(timezone.utc),
-                            "updated_by": user_id
-                        })
-                        
-                        status_breakdown["POSTED_TO_LEDGER"]["count"] += 1
-                        success_count += 1
-                        continue
-                    
-                    # Balance > 0: Perform full ledger reversal and reposting
                     logger.info(
-                        f"Transaction {transaction.transaction_id} has outstanding balance: "
-                        f"${outstanding_balance}. Performing ledger reversal and reposting."
+                        f"Financial snapshot for transaction {transaction.transaction_id}: "
+                        f"TP=${total_payable}, CD=${collected_to_date}, B=${current_balance}"
                     )
+                    
+                    # ALWAYS perform full reversal and reposting per specification (Section 7.3)
+                    # This reconstructs entire financial responsibility regardless of payment status
                     
                     # Determine if original was debit or credit based on transaction amount
                     was_debit = transaction.amount < 0
                     
-                    # Step 1: Create reversal on old lease
+                    # Step 1: Create reversal on old lease (CREDIT for full TP)
                     reversal_reference_id = f"REASSIGN-REV-{transaction.transaction_id}"
                     
                     if was_debit:
                         # Original was obligation (DEBIT), so reverse with CREDIT
-                        self.ledger_service.create_manual_credit(
+                        reversal_posting = self.ledger_service.create_manual_credit(
                             category=PostingCategory.EZPASS,
-                            amount=outstanding_balance,
+                            amount=total_payable,  # Always use full TP
                             reference_id=reversal_reference_id,
                             driver_id=transaction.driver_id,
                             lease_id=transaction.lease_id,
@@ -732,13 +861,13 @@ class EZPassService:
                             user_id=user_id
                         )
                         logger.info(
-                            f"Created reversal CREDIT of ${outstanding_balance} on lease {transaction.lease_id}"
+                            f"Created reversal CREDIT of ${total_payable} on lease {transaction.lease_id}"
                         )
                     else:
                         # Original was refund (CREDIT), so reverse with DEBIT
-                        self.ledger_service.create_obligation(
+                        reversal_posting = self.ledger_service.create_obligation(
                             category=PostingCategory.EZPASS,
-                            amount=outstanding_balance,
+                            amount=total_payable,  # Always use full TP
                             reference_id=reversal_reference_id,
                             driver_id=transaction.driver_id,
                             lease_id=transaction.lease_id,
@@ -746,15 +875,15 @@ class EZPassService:
                             medallion_id=transaction.medallion_id,
                         )
                         logger.info(
-                            f"Created reversal DEBIT of ${outstanding_balance} on lease {transaction.lease_id}"
+                            f"Created reversal DEBIT of ${total_payable} on lease {transaction.lease_id}"
                         )
                     
-                    # Step 2: Create new posting on new lease (same type as original)
+                    # Step 2: Create new posting on new lease (same type as original, full TP)
                     if was_debit:
                         # Repost as obligation (DEBIT) on new lease
-                        self.ledger_service.create_obligation(
+                        new_posting = self.ledger_service.create_obligation(
                             category=PostingCategory.EZPASS,
-                            amount=outstanding_balance,
+                            amount=total_payable,  # Always use full TP
                             reference_id=transaction.transaction_id,
                             driver_id=new_driver_id,
                             lease_id=new_lease_id,
@@ -762,13 +891,13 @@ class EZPassService:
                             medallion_id=new_medallion_id or transaction.medallion_id,
                         )
                         logger.info(
-                            f"Created new DEBIT of ${outstanding_balance} on lease {new_lease_id}"
+                            f"Created new DEBIT of ${total_payable} on lease {new_lease_id}"
                         )
                     else:
                         # Repost as refund (CREDIT) on new lease
-                        self.ledger_service.create_manual_credit(
+                        new_posting = self.ledger_service.create_manual_credit(
                             category=PostingCategory.EZPASS,
-                            amount=outstanding_balance,
+                            amount=total_payable,  # Always use full TP
                             reference_id=transaction.transaction_id,
                             driver_id=new_driver_id,
                             lease_id=new_lease_id,
@@ -783,7 +912,7 @@ class EZPassService:
                             user_id=user_id
                         )
                         logger.info(
-                            f"Created new CREDIT of ${outstanding_balance} on lease {new_lease_id}"
+                            f"Created new CREDIT of ${total_payable} on lease {new_lease_id}"
                         )
                     
                     # Step 3: Update transaction associations
@@ -802,8 +931,45 @@ class EZPassService:
                     
                     logger.info(
                         f"Successfully reassigned POSTED_TO_LEDGER transaction {transaction.transaction_id}. "
-                        f"Ledger operations complete. Outstanding balance ${outstanding_balance} moved "
+                        f"Full financial responsibility (${total_payable}) moved "
                         f"from lease {transaction.lease_id} to lease {new_lease_id}."
+                    )
+
+                    # Create audit trail record (Section 9.2)
+                    audit_trail_service.create_audit_trail(
+                        db=self.db,
+                        case_no=None,
+                        step_id=None,
+                        description=f"EZPass transaction reassigned: {transaction.transaction_id}",
+                        driver_id=new_driver_id,
+                        medallion_id=new_medallion_id,
+                        vehicle_id=new_vehicle_id or transaction.vehicle_id,
+                        lease_id=new_lease_id,
+                        medallion_owner_id=None,
+                        vehicle_owner_id=None,
+                        ledger_id=None,
+                        pvb_id=None,
+                        correspondence_id=None,
+                        meta_data={
+                            "entry_type": "EZPASS_TRANSACTION",
+                            "entry_id": transaction.id,
+                            "entry_reference": transaction.transaction_id,
+                            "batch_id": batch_id,
+                            "batch_size": len(transaction_ids) if batch_id else 1,
+                            "vehicle_id": transaction.vehicle_id,
+                            "medallion_id": transaction.medallion_id,
+                            "source_lease_id": transaction.lease_id,
+                            "source_driver_id": transaction.driver_id,
+                            "target_lease_id": new_lease_id,
+                            "target_driver_id": new_driver_id,
+                            "reassignment_type": "POSTED_TO_LEDGER_FULL_RECONSTRUCTION",
+                            "total_payable": float(total_payable),
+                            "collected_to_date": float(collected_to_date),
+                            "reversal_posting_id": reversal_posting.id if 'reversal_posting' in locals() else None,
+                            "new_posting_id": new_posting.id if 'new_posting' in locals() else None,
+                            "user_id": user_id,
+                            "reason": reason
+                        }
                     )
                 
                 else:

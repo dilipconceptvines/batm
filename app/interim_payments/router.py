@@ -332,3 +332,183 @@ def download_interim_payment_receipt(
     except Exception as e:
         logger.error(f"Error downloading receipt for payment {payment_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to download interim payment receipt") from e
+
+
+# --- Reset Allocation Endpoint ---
+
+@router.post(
+    "/case/{case_no}/reset-allocation",
+    summary="Reset allocation to edit payment",
+    status_code=status.HTTP_200_OK
+)
+def reset_allocation_step(
+    case_no: str,
+    db: Session = Depends(get_db_with_current_user),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Allow user to go back from Step 211 to Step 210 to edit payment details.
+    
+    **Effect:**
+    - Clears any draft allocations (if user had started allocating)
+    - Does NOT delete payment record
+    - User can modify amount, method, date in Step 210
+    - Can proceed to allocation again with new payment details
+    
+    **Use Case:**
+    User entered $600 in Step 210, proceeded to Step 211, then realized
+    they meant to enter $650. They click "Edit Payment Details" which
+    calls this endpoint, then navigates back to Step 210.
+    """
+    try:
+        case_entity = bpm_service.get_case_entity(db, case_no=case_no)
+        
+        if not case_entity:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Payment not found for case {case_no}"
+            )
+        
+        # Get payment record
+        service = InterimPaymentService(db)
+        payment = service.repo.get_payment_by_id(int(case_entity.identifier_value))
+        
+        if not payment:
+            raise HTTPException(
+                status_code=404,
+                detail="Payment record not found"
+            )
+        
+        # Clear allocations (draft state)
+        if payment.allocations:
+            logger.info(
+                f"Clearing {len(payment.allocations)} allocations for case {case_no}",
+                payment_id=payment.payment_id,
+                user_id=current_user.id
+            )
+            payment.allocations = []
+            db.commit()
+        
+        return {
+            "message": "Ready to edit payment details",
+            "case_no": case_no,
+            "payment_id": payment.payment_id,
+            "next_step": "210"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resetting allocation for case {case_no}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to reset allocation"
+        )
+
+
+# --- Void Payment Endpoint ---
+
+from pydantic import BaseModel, Field
+from app.interim_payments.exceptions import InterimPaymentNotFoundError, InvalidOperationError
+
+
+class VoidPaymentRequest(BaseModel):
+    """Request schema for voiding a payment"""
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description="Reason for voiding the payment (minimum 10 characters)",
+        example="Payment entered for wrong driver - should be John Smith not John Doe"
+    )
+
+
+class VoidPaymentResponse(BaseModel):
+    """Response schema after voiding a payment"""
+    message: str
+    payment_id: str
+    status: str
+    voided_at: str
+    voided_by: int
+    reason: str
+    postings_reversed: int
+
+
+@router.post(
+    "/void/{payment_id}",
+    summary="Void an Interim Payment",
+    response_model=VoidPaymentResponse,
+    status_code=status.HTTP_200_OK
+)
+def void_interim_payment(
+    payment_id: str,
+    void_request: VoidPaymentRequest,
+    db: Session = Depends(get_db_with_current_user),
+    current_user: User = Depends(get_current_user),
+    service: InterimPaymentService = Depends(get_interim_payment_service)
+):
+    """
+    Void an interim payment by reversing all associated ledger postings.
+
+    **Required Permission:** `void_interim_payment`
+
+    **Effect:**
+    - All ledger postings reversed (creates opposite DEBIT/CREDIT postings)
+    - Ledger balances reopened to original amounts
+    - Payment status changed to VOIDED
+    - Source modules notified (repair installments, loan installments revert to POSTED)
+    - Audit trail created
+
+    **Cannot be undone** - creates permanent reversal record
+
+    **Example:**
+    ```json
+    {
+      "reason": "Payment entered for wrong driver - should be Driver #123"
+    }
+    ```
+    """
+    # Check permissions
+    if not current_user.has_permission("void_interim_payment"):
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions to void interim payments. Contact your administrator."
+        )
+
+    try:
+        # Void the payment
+        voided_payment = service.void_interim_payment(
+            payment_id=payment_id,
+            reason=void_request.reason,
+            user_id=current_user.id
+        )
+
+        # Count reversed postings
+        postings_count = len(voided_payment.allocations) if voided_payment.allocations else 0
+
+        return VoidPaymentResponse(
+            message="Interim payment voided successfully",
+            payment_id=payment_id,
+            status=voided_payment.status.value,
+            voided_at=voided_payment.voided_at.isoformat(),
+            voided_by=voided_payment.voided_by,
+            reason=voided_payment.void_reason,
+            postings_reversed=postings_count
+        )
+
+    except InterimPaymentNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Payment {payment_id} not found"
+        )
+    except InvalidOperationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error voiding payment {payment_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to void payment. Please contact support."
+        )

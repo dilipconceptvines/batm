@@ -31,6 +31,7 @@ class LeaseStatus(str, PyEnum):
     TERMINATED = "Terminated"
     EXPIRED = "Expired"
     CANCELLED = "Cancelled"
+    TERMINATION_REQUESTED = "Termination Requested"
 
 
 class LongTermFinancialInfo(BaseModel):

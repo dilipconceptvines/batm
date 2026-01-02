@@ -33,6 +33,12 @@ def fetch_driver_and_lease_details(db: Session, case_no: str, case_params: Optio
     Fetches driver details and active leases for the interim payment workflow.
     User searches by TLC License number to find the driver and their associated leases.
     
+    NEW BEHAVIOR:
+    - If interim_payment exists for this case: Return payment data for pre-filling
+    - If no payment exists: Return empty form
+    
+    This enables "Edit Payment Details" functionality from Step 211.
+    
     1. Enters TLC License No
     2. Clicks Search
     3. Sees driver details and associated active leases
@@ -44,6 +50,7 @@ def fetch_driver_and_lease_details(db: Session, case_no: str, case_params: Optio
         # Check if the case entity already exists
         case_entity = bpm_service.get_case_entity(db, case_no=case_no)
         selected_interim_payment_id = None
+        existing_payment = None
 
         if case_entity:
             selected_interim_payment_id = str(case_entity.identifier_value)
@@ -58,7 +65,8 @@ def fetch_driver_and_lease_details(db: Session, case_no: str, case_params: Optio
             return {
                 "driver": None,
                 "leases": [],
-                "selected_interim_payment_id": selected_interim_payment_id
+                "selected_interim_payment_id": selected_interim_payment_id,
+                "existing_payment": existing_payment
             }
         
         tlc_license_no = case_params["tlc_license_no"]
@@ -108,12 +116,37 @@ def fetch_driver_and_lease_details(db: Session, case_no: str, case_params: Optio
             "email": driver.email_address or "N/A"
         }
 
+        # NEW: Check for existing payment (editing scenario)
+        if case_entity:
+            interim_payment_service = InterimPaymentService(db)
+            existing_payment_obj = interim_payment_service.repo.get_payment_by_id(
+                int(case_entity.identifier_value)
+            )
+            
+            if existing_payment_obj:
+                existing_payment = {
+                    "id": existing_payment_obj.id,
+                    "payment_amount": float(existing_payment_obj.total_amount),
+                    "payment_method": existing_payment_obj.payment_method.value,
+                    "payment_date": existing_payment_obj.payment_date.isoformat(),
+                    "notes": existing_payment_obj.notes or "",
+                    "driver_id": existing_payment_obj.driver_id,
+                    "lease_id": existing_payment_obj.lease_id
+                }
+                
+                logger.info(
+                    f"Returning existing payment for editing",
+                    payment_id=existing_payment_obj.payment_id,
+                    case_no=case_no
+                )
+
         logger.info("Successfully fetched driver with active leases", driver_id=driver.driver_id, leases=len(formatted_leases))
 
         return {
             "driver": driver_data,
             "leases": formatted_leases,
-            "selected_interim_payment_id": selected_interim_payment_id
+            "selected_interim_payment_id": selected_interim_payment_id,
+            "existing_payment": existing_payment  # ✅ Pre-fill data for editing
         }
     
     except HTTPException:
@@ -125,11 +158,17 @@ def fetch_driver_and_lease_details(db: Session, case_no: str, case_params: Optio
             detail=f"An error occurred while fetching driver details: {str(e)}"
         ) from e
     
-@step(step_id="210", name="Process - Create Interim Payment Record", operation="process")
+@step(step_id="210", name="Process - Create/Update Payment Details", operation="process")
 def create_interim_payment_record(db: Session, case_no: str, step_data: Dict[str, Any]) -> Dict[str, str]:
     """
     Creates or updates an interim payment entry record with the selected driver, lease,
     and complete payment details (amount, method, date, notes).
+    
+    LOGIC:
+    - If case_entity exists: UPDATE existing interim_payment
+    - If case_entity doesn't exist: CREATE new interim_payment
+    
+    IMPORTANT: When updating, clear any existing allocations to prevent inconsistency.
 
     1. Selects a lease from the list
     2. Enters Total payment amount
@@ -157,6 +196,12 @@ def create_interim_payment_record(db: Session, case_no: str, step_data: Dict[str
 
         # Validation: Required fields
         if not driver_id or not lease_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Driver and lease selection is required"
+            )
+        
+        if not payment_amount or payment_amount <= 0:
             raise HTTPException(
                 status_code=400,
                 detail="Payment amount must be greater than zero"
@@ -189,7 +234,7 @@ def create_interim_payment_record(db: Session, case_no: str, step_data: Dict[str
         except ValueError as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid payment method: {payment_method}. Must be one of: Cash, Check, ACh"
+                detail=f"Invalid payment method: {payment_method}. Must be one of: Cash, Check, ACH"
             ) from e
         
         # Validate driver existence
@@ -234,36 +279,56 @@ def create_interim_payment_record(db: Session, case_no: str, step_data: Dict[str
         interim_payment_service = InterimPaymentService(db)
 
         if case_entity:
-            # Entry already exists, update it with new payment details
+            # ✅ EDIT MODE: Update existing payment
             interim_payment = interim_payment_service.repo.get_payment_by_id(
                 int(case_entity.identifier_value)
             )
-
+            
             if interim_payment:
-                # Update existing record with ALL payment details
+                # Store original values for logging
+                original_amount = interim_payment.total_amount
+                original_method = interim_payment.payment_method.value
+                
+                # Update fields
                 interim_payment.driver_id = driver.driver_id
                 interim_payment.lease_id = lease.lease_id
                 interim_payment.total_amount = payment_amount
                 interim_payment.payment_method = payment_method_enum
                 interim_payment.payment_date = payment_date
                 interim_payment.notes = notes
-
+                
+                # ⚠️ CRITICAL: Clear allocations if they exist
+                # User is changing payment details, so allocations are no longer valid
+                if interim_payment.allocations:
+                    logger.warning(
+                        f"Clearing existing allocations for payment {interim_payment.payment_id} "
+                        f"because payment details were modified",
+                        allocations_count=len(interim_payment.allocations),
+                        case_no=case_no
+                    )
+                    interim_payment.allocations = []
+                
                 db.commit()
                 db.refresh(interim_payment)
-
+                
                 logger.info(
-                    "Updated existing interim payment with amount",
-                    interim_payment_id=interim_payment.id, payment_amount=payment_amount,
-                    payment_method=payment_method
+                    f"Updated interim payment {interim_payment.payment_id}",
+                    case_no=case_no,
+                    original_amount=float(original_amount),
+                    new_amount=float(payment_amount),
+                    original_method=original_method,
+                    new_method=payment_method
                 )
-
+                
                 return {
-                    "message": "Interim payment entry updated successfully",
+                    "message": "Payment details updated successfully",
                     "interim_payment_id": str(interim_payment.id),
+                    "operation": "UPDATE",
+                    "allocations_cleared": True,  # Inform UI
                     "total_outstanding": round(total_outstanding, 2)
                 }
-            
-        interim_payment_service = InterimPaymentService(db)
+
+        # ✅ CREATE MODE: New payment (existing logic)
         payment_id = interim_payment_service._generate_next_payment_id()
         # Create new interim payment entry with ALL payment details
         new_interim_payment = InterimPayment(
@@ -323,6 +388,7 @@ def create_interim_payment_record(db: Session, case_no: str, step_data: Dict[str
         return {
             "message": "Interim payment entry created successfully.",
             "interim_payment_id": str(new_interim_payment.id),
+            "operation": "CREATE",
             "total_outstanding": round(total_outstanding, 2)
         }
         
@@ -604,6 +670,14 @@ async def process_payment_allocation(db: Session, case_no: str, step_data: Dict[
                 raise HTTPException(
                     status_code=400,
                     detail=f"Balance ID {balance_id} does not belong to the selected lease. Cannot allocate payment."
+                )
+            
+            # Verify category matches (prevent category/reference mismatch)
+            allocation_category = alloc.get("category", "").upper()
+            if allocation_category != balance.category.value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Category mismatch for balance {balance_id}: allocation says '{allocation_category}' but balance is '{balance.category.value}'. Cannot proceed."
                 )
         
         # Format allocations for the service layer

@@ -6,8 +6,7 @@
   "properties": {
     "driver_id": {
       "description": "The primary key of the selected driver from the 'drivers' table.",
-      "type": "integer",
-      "minimum": 1
+      "type": "string"
     },
     "lease_id": {
       "description": "The primary key of the selected active lease from the 'leases' table.",
@@ -40,11 +39,11 @@
       "examples": [0, 10, 12]
     },
     "start_week": {
-      "description": "The Sunday date when the first installment is due. Must be a Sunday in YYYY-MM-DD format.",
+      "description": "the date representing the starting week for the loan schedule in this week or next week",
       "type": "string",
       "format": "date",
-      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-      "examples": ["2025-10-26", "2025-11-02"]
+      "examples": ["2024-07-01", "2024-07-08"]
+
     },
     "notes": {
       "description": "Optional notes or purpose for the loan.",

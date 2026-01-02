@@ -26,12 +26,12 @@ class SMSService:
     ) -> bool:
         """
         Send SMS using AWS SNS
-        
+
         Args:
             phone_number: Recipient phone number (E.164 format)
             message: SMS message content
             message_attributes: Optional SNS message attributes
-            
+
         Returns:
             bool: True if SMS sent successfully, False otherwise
         """
@@ -39,6 +39,26 @@ class SMSService:
             # Ensure phone number is in E.164 format
             if not phone_number.startswith('+'):
                 phone_number = f'+{phone_number}'
+
+            # Apply SMS override if configured (do this BEFORE the enable check so we can see it in logs)
+            original_phone_number = phone_number
+            if settings.override_sms_to:
+                phone_number = settings.override_sms_to
+                # Ensure override number is also in E.164 format
+                if not phone_number.startswith('+'):
+                    phone_number = f'+{phone_number}'
+                logger.info(
+                    f"SMS override active - Original TO: {original_phone_number} → "
+                    f"Override TO: {phone_number}"
+                )
+
+            # Check if SMS sending is enabled
+            if not settings.enable_sms_sending:
+                logger.warning(
+                    f"SMS sending is disabled via ENABLE_SMS_SENDING flag. "
+                    f"Would have sent to: {phone_number}, Message: {message[:50]}..."
+                )
+                return True  # Return True to not break workflows
 
             # Prepare message attributes
             attributes = {

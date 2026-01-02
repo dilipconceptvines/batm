@@ -40,7 +40,6 @@ def fetch_pvb_details(db: Session, case_no: str, case_params: dict = None):
         case_entity = bpm_service.get_case_entity(db, case_no=case_no)
         if case_entity:
             violation = pvb_service.repo.get_violation_by_id(int(case_entity.identifier_value))
-        
         if not violation and case_params and case_params.get("object_name") == "pvb":
             violation = pvb_service.repo.get_violation_by_id(int(case_params.get("object_lookup")))
 
@@ -52,17 +51,54 @@ def fetch_pvb_details(db: Session, case_no: str, case_params: dict = None):
                 db, case_no, ENTITY_MAPPER["PVB"], ENTITY_MAPPER["PVB_IDENTIFIER"], str(violation.id)
             )
 
+        pvb_document = upload_service.get_documents(
+            db=db,
+            object_type="pvb",
+            object_id=violation.id,
+            document_type="pvb_invoice"
+        )
+
+        altered_documents = upload_service.get_documents(
+            db=db,
+            object_type="pvb",
+            object_id=violation.id,
+            like_document_type="additional_document",
+            multiple=True
+        )
+
+        if not altered_documents:
+            altered_documents = [
+                 {
+                "document_id": "",
+                "document_name": "",
+                "document_note": "",
+                "document_path": "",
+                "document_type": "additional_document_1",
+                "document_date": "",
+                "document_object_type": "pvb",
+                "document_object_id": violation.id,
+                "document_size": "",
+                "document_uploaded_date": "",
+                "presigned_url": "",
+            }
+            ]
+            
+
+        logger.info("Successfully fetched driver and lease details for PVB case", case_no=case_no)
+
         pvb_data = format_pvb_violation(violation)
 
-        driver = driver_service.get_drivers(db, id=violation.driver_id)
-        active_lease = lease_service.get_lease(db,lookup_id=violation.lease_id, status= LeaseStatus.ACTIVE.value)
+        driver = driver_service.get_drivers(db, id=violation.driver_id) if violation.driver_id else None
+        active_lease = lease_service.get_lease(db,lookup_id=violation.lease_id, status= LeaseStatus.ACTIVE.value) if violation.lease_id else None
 
         if not driver:
             logger.info("No driver found for TLC case", case_no=case_no)
             return {
                 "driver": None,
                 "leases": [],
-                "pvb_violation": pvb_data
+                "pvb_violation": pvb_data,
+                "pvb_document": pvb_document,
+                "additional_documents": altered_documents
             }
         
         if not active_lease:
@@ -79,6 +115,8 @@ def fetch_pvb_details(db: Session, case_no: str, case_params: dict = None):
                 },
                 "lease": {},
                 "pvb_violation": pvb_data,
+                "pvb_document": pvb_document,
+                "additional_documents": altered_documents
             }
 
         medallion_owner = format_medallion_response(active_lease.medallion).get("medallion_owner") if active_lease.medallion else None
@@ -126,40 +164,6 @@ def fetch_pvb_details(db: Session, case_no: str, case_params: dict = None):
             "phone": driver.phone_number_1 or "N/A",
             "email": driver.email_address or "N/A",
         }
-
-        pvb_document = upload_service.get_documents(
-            db=db,
-            object_type="pvb",
-            object_id=violation.id,
-            document_type="pvb_invoice"
-        )
-
-        altered_documents = upload_service.get_documents(
-            db=db,
-            object_type="pvb",
-            object_id=violation.id,
-            like_document_type="additional_document",
-            multiple=True
-        )
-
-        if not altered_documents:
-            altered_documents = [
-                 {
-                "document_id": "",
-                "document_name": "",
-                "document_note": "",
-                "document_path": "",
-                "document_type": "additional_document_1",
-                "document_date": "",
-                "document_object_type": "pvb",
-                "document_object_id": violation.id,
-                "document_size": "",
-                "document_uploaded_date": "",
-                "presigned_url": "",
-            }
-            ]
-
-        logger.info("Successfully fetched driver and lease details for PVB case", case_no=case_no, driver_id=driver.id)
 
         return {
             "data": format_data,

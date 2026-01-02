@@ -20,6 +20,7 @@ from app.leases.schemas import (
 )
 from app.leases.services import lease_service
 from app.utils.logger import get_logger
+from app.utils.sms_service import normalize_phone_number, send_sms
 
 logger = get_logger(__name__)
 
@@ -238,76 +239,6 @@ def send_email_via_ses(
         return False
 
 
-def send_sms_via_sns(
-    phone_number: str, message: str, sender_id: Optional[str] = None
-) -> bool:
-    """
-    Send SMS via AWS SNS.
-
-    Args:
-        phone_number: Phone number in E.164 format (e.g., +1234567890)
-        message: SMS message content
-        sender_id: Optional sender ID
-
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        sns_client = boto3.client(
-            "sns",
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-        )
-
-        params = {
-            "PhoneNumber": phone_number,
-            "Message": message,
-            "MessageAttributes": {
-                "AWS.SNS.SMS.SMSType": {
-                    "DataType": "String",
-                    "StringValue": "Transactional",
-                }
-            },
-        }
-
-        if sender_id:
-            params["MessageAttributes"]["AWS.SNS.SMS.SenderID"] = {
-                "DataType": "String",
-                "StringValue": sender_id,
-            }
-
-        response = sns_client.publish(**params)
-        logger.info(f"SMS sent to {phone_number}, MessageId: {response['MessageId']}")
-        return True
-    except Exception as e:
-        logger.error(f"Error sending SMS to {phone_number}: {str(e)}")
-        return False
-
-
-def normalize_phone_number(phone: str) -> Optional[str]:
-    """
-    Normalize US phone number to E.164 format.
-
-    Args:
-        phone: Phone number in various formats
-
-    Returns:
-        Phone number in E.164 format (+1XXXXXXXXXX) or None
-    """
-    if not phone:
-        return None
-
-    # Remove all non-digit characters
-    digits = "".join(filter(str.isdigit, phone))
-
-    # Add country code if not present
-    if len(digits) == 10:
-        return f"+1{digits}"
-    elif len(digits) == 11 and digits.startswith("1"):
-        return f"+{digits}"
-
-    return None
 
 
 def send_admin_notification(renewal_summary: Dict[str, Any]) -> bool:
@@ -747,7 +678,7 @@ def send_renewal_reminders(
                 logger.info(f"{'=' * 80}\n")
 
                 result["sms_body"].append(sms_body)
-                if send_sms_via_sns(
+                if send_sms(
                     phone_number=phone,
                     message=sms_body,
                     sender_id=settings.aws_sns_sender_id,

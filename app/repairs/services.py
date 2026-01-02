@@ -106,6 +106,50 @@ class RepairService:
             new_invoice.status = RepairInvoiceStatus.OPEN
             self.db.flush()
 
+            # NEW: 4.5 Immediate posting of first installment if start_week is current week
+            try:
+                current_date = datetime.now(timezone.utc).date()
+                # Get the first installment
+                first_installment = (
+                    self.db.query(RepairInstallment)
+                    .filter(RepairInstallment.invoice_id == new_invoice.id)
+                    .order_by(RepairInstallment.week_start_date)
+                    .first()
+                )
+                
+                if first_installment and first_installment.week_start_date <= current_date:
+                    # First installment is due (current or past week) - post immediately
+                    ledger_repo = LedgerRepository(self.db)
+                    ledger_service = LedgerService(ledger_repo)
+                    
+                    ledger_posting, balance = ledger_service.create_obligation(
+                        category=PostingCategory.REPAIR,
+                        amount=first_installment.principal_amount,
+                        reference_id=first_installment.installment_id,
+                        driver_id=new_invoice.driver_id,
+                        lease_id=new_invoice.lease_id,
+                        vehicle_id=new_invoice.vehicle_id,
+                        medallion_id=new_invoice.medallion_id,
+                    )
+                    
+                    # Update first installment status to POSTED
+                    posted_on = datetime.now(timezone.utc)
+                    self.repo.update_installment(first_installment.id, {
+                        "status": RepairInstallmentStatus.POSTED,
+                        "posted_on": posted_on,
+                        "ledger_posting_ref": str(ledger_posting.id)
+                    })
+                    self.db.flush()
+                    
+                    logger.info(
+                        f"Immediately posted first installment {first_installment.installment_id} "
+                        f"to ledger for repair {repair_id} (start_week is current/past week)"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to immediately post first installment for repair {repair_id}: {e}", exc_info=True)
+                # Don't fail the entire invoice creation if immediate posting fails
+                # The installment can be posted later via scheduled task
+
             # 5. Link invoice to the BPM case
             bpm_service.create_case_entity(
                 self.db, case_no, "repair_invoice", "id", str(new_invoice.id)
@@ -290,7 +334,7 @@ class RepairService:
                         failed_count += 1
                         continue
 
-                    ledger_posting = ledger_service.create_obligation(
+                    ledger_posting, balance = ledger_service.create_obligation(
                                     category=PostingCategory.REPAIR,
                                     amount=installment.principal_amount,
                                     reference_id=installment.installment_id,

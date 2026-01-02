@@ -1,6 +1,8 @@
 ### app/interim_payments/services.py
 
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import List, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -9,11 +11,14 @@ from app.deposits.services import DepositService
 from app.interim_payments.exceptions import (
     InterimPaymentLedgerError,
     InvalidAllocationError,
+    InterimPaymentNotFoundError,
+    InvalidOperationError,
+    InterimPaymentError
 )
-from app.interim_payments.models import InterimPayment
+from app.interim_payments.models import InterimPayment, PaymentStatus
 from app.interim_payments.repository import InterimPaymentRepository
 from app.interim_payments.schemas import InterimPaymentCreate
-from app.ledger.models import PostingCategory
+from app.ledger.models import PostingCategory, LedgerPosting, EntryType, PostingStatus
 from app.ledger.services import LedgerService
 from app.utils.logger import get_logger
 
@@ -160,3 +165,148 @@ class InterimPaymentService:
             self.db.rollback()
             logger.error(f"Failed to create interim payment: {e}", exc_info=True)
             raise InterimPaymentLedgerError(payment_id if 'payment_id' in locals() else 'N/A', str(e)) from e
+
+    def void_interim_payment(
+        self,
+        payment_id: str,
+        reason: str,
+        user_id: int
+    ) -> InterimPayment:
+        """
+        Void an entire interim payment by reversing all associated ledger postings.
+
+        ALGORITHM:
+        1. Retrieve interim payment record
+        2. Validate payment is ACTIVE (not already voided)
+        3. Find all ledger postings for this payment's allocations
+        4. For each posting:
+           a. Call ledger_service.void_posting() to create reversal
+           b. Reopen affected ledger balances
+           c. Update source module statuses (repairs, loans)
+        5. Mark interim_payment as VOIDED
+        6. Generate voided receipt (optional)
+
+        ATOMIC: All postings reversed or none (transaction rollback on error)
+
+        Args:
+            payment_id: Unique payment identifier (e.g., "INTPAY-2025-00123")
+            reason: Reason for voiding (minimum 10 characters)
+            user_id: ID of user performing the void
+
+        Returns:
+            Updated InterimPayment with status=VOIDED
+
+        Raises:
+            InterimPaymentNotFoundError: Payment not found
+            InvalidOperationError: Payment already voided
+            InterimPaymentError: Failed to void payment
+        """
+        try:
+            # Step 1: Get payment record
+            payment = self.repo.get_payment_by_payment_id(payment_id)
+
+            if not payment:
+                raise InterimPaymentNotFoundError(payment_id)
+
+            # Step 2: Validate status
+            if payment.status == PaymentStatus.VOIDED:
+                raise InvalidOperationError(
+                    f"Payment {payment_id} is already voided on {payment.voided_at.isoformat()}"
+                )
+
+            # Validate reason
+            if not reason or len(reason.strip()) < 10:
+                raise InvalidOperationError("Void reason must be at least 10 characters")
+
+            logger.info(
+                f"Voiding interim payment {payment_id}",
+                reason=reason,
+                user_id=user_id,
+                total_amount=float(payment.total_amount),
+                allocations_count=len(payment.allocations) if payment.allocations else 0
+            )
+
+            # Step 3: Get all postings for this payment
+            # Find postings by reference_ids from allocations AND payment date
+            reference_ids = [alloc['reference_id'] for alloc in (payment.allocations or [])]
+
+            # Query ledger postings created around payment date
+            # (to avoid voiding postings from other payments with same reference_id)
+            time_window_start = payment.payment_date - timedelta(hours=12)
+            time_window_end = payment.payment_date + timedelta(hours=12)
+
+            postings_to_void = (
+                self.db.query(LedgerPosting)
+                .filter(
+                    LedgerPosting.reference_id.in_(reference_ids),
+                    LedgerPosting.driver_id == payment.driver_id,
+                    LedgerPosting.entry_type == EntryType.CREDIT,
+                    LedgerPosting.status == PostingStatus.POSTED,
+                    LedgerPosting.created_on >= time_window_start,
+                    LedgerPosting.created_on <= time_window_end
+                )
+                .all()
+            )
+
+            if not postings_to_void:
+                raise InvalidOperationError(
+                    f"No ledger postings found for payment {payment_id}. "
+                    f"Payment may have already been reversed or postings were created outside expected time window."
+                )
+
+            logger.info(
+                f"Found {len(postings_to_void)} ledger postings to void",
+                posting_ids=[p.id for p in postings_to_void]
+            )
+
+            # Step 4: Void each posting
+            voided_postings = []
+            for posting in postings_to_void:
+                try:
+                    original, reversal = self.ledger_service.void_posting(
+                        posting_id=str(posting.id),
+                        reason=f"Reversal of interim payment {payment_id}: {reason}",
+                        user_id=user_id
+                    )
+                    voided_postings.append((original, reversal))
+
+                    logger.info(
+                        f"Voided posting {posting.id}",
+                        category=posting.category.value,
+                        amount=float(posting.amount),
+                        reference_id=posting.reference_id
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to void posting {posting.id}: {e}")
+                    raise InvalidOperationError(f"Failed to void posting {posting.id}: {str(e)}") from e
+
+            # Step 5: Mark payment as VOIDED
+            payment.status = PaymentStatus.VOIDED
+            payment.voided_at = datetime.now(timezone.utc)
+            payment.voided_by = user_id
+            payment.void_reason = reason
+
+            self.db.commit()
+
+            logger.info(
+                f"Successfully voided interim payment {payment_id}",
+                postings_voided=len(voided_postings),
+                voided_by_user_id=user_id,
+                total_amount_reversed=float(payment.total_amount)
+            )
+
+            # Step 6: Generate voided receipt (optional - implement if needed)
+            # self._generate_voided_receipt(payment)
+
+            return payment
+
+        except (InterimPaymentNotFoundError, InvalidOperationError):
+            # Re-raise known errors
+            raise
+        except Exception as e:
+            self.db.rollback()
+            logger.error(
+                f"Failed to void interim payment {payment_id}: {e}",
+                exc_info=True
+            )
+            raise InterimPaymentError(f"Failed to void payment: {str(e)}") from e

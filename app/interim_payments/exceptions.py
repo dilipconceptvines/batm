@@ -10,6 +10,16 @@ class PaymentNotFoundError(InterimPaymentError):
         self.payment_id = payment_id
         super().__init__(f"InterimPayment with Payment ID '{payment_id}' not found.")
 
+class InterimPaymentNotFoundError(InterimPaymentError):
+    """Payment not found in database"""
+    def __init__(self, payment_id: str):
+        self.payment_id = payment_id
+        super().__init__(f"Payment {payment_id} not found")
+
+class InvalidOperationError(InterimPaymentError):
+    """Operation not allowed (e.g., void already voided payment)"""
+    pass
+
 class InvalidAllocationError(InterimPaymentError):
     """Raised for logical errors during the payment allocation process, such as over-allocating funds."""
     pass

@@ -26,9 +26,9 @@ class PaymentTypeEnum(str, Enum):
 
 class LeaseStatusEnum(str, Enum):
     """Lease Status"""
-    ACTIVE = "ACTIVE"
-    TERMINATED = "TERMINATED"
-    TERMINATION_REQUESTED = "TERMINATION_REQUESTED"
+    ACTIVE = "Active"
+    TERMINATED = "Terminated"
+    TERMINATION_REQUESTED = "Termination Requested"
 
 
 class DriverStatusEnum(str, Enum):

@@ -227,9 +227,19 @@ class LedgerService:
     ) -> List[LedgerPosting]:
         """
         Applies an interim payment by creating CREDIT postings and updating balances.
-
-        Any unallocated excess is automatically applied to the Lease balance.
-
+        
+        EXCESS HANDLING STRATEGY:
+        1. Calculate excess = payment_amount - sum(allocations)
+        2. If excess > 0:
+           a. Query lease_schedule for upcoming/current installments
+           b. Apply excess to installments in chronological order
+           c. Create ledger posting for each installment reference_id
+           d. Update installment status if fully paid
+           e. Create balance entries if they don't exist
+        3. If no lease installments available:
+           - FAIL transaction with clear error message
+           - Do NOT silently drop excess
+        
         Args:
             payment_amount: Total payment received.
             allocations: Dict mapping reference_id to amount to allocate.
@@ -272,10 +282,14 @@ class LedgerService:
                     amount=allocation_amount,
                     entry_type=EntryType.CREDIT,
                     status=PostingStatus.POSTED,
-                    reference_id=f"PAYMENT-{payment_method}-{reference_id}",
+                    reference_id=reference_id,  # ✅ Use original reference_id
                     driver_id=driver_id,
+                    lease_id=lease_id,
                     vehicle_id=balance.vehicle_id,
                     medallion_id=balance.medallion_id,
+                    description=f"Interim payment via {payment_method}",
+                    payment_source="INTERIM_PAYMENT",
+                    payment_method=payment_method
                 )
                 self.repo.create_posting(credit_posting)
                 created_postings.append(credit_posting)
@@ -289,67 +303,74 @@ class LedgerService:
                 if new_balance_amount <= 0:
                     self._notify_balance_paid(balance.reference_id, balance.category)
 
-            # Handle excess amount (auto allocate to lease)
+            # Handle excess amount (auto allocate to LEASE per specification Section 3.2.3)
             excess_amount = payment_amount - total_allocated
 
             if excess_amount > 0:
                 if not lease_id:
                     raise InvalidLedgerOperationError(
-                        f"lease_id is required to apply excess amount of ${excess_amount} "
+                        f"Cannot process payment with excess amount ${excess_amount} - lease_id required for excess handling"
                     )
                 
                 logger.info(
-                    f"Applying excess amount ${excess_amount} to lease balance",
+                    f"Applying ${excess_amount} excess to LEASE balance",
+                    driver_id=driver_id,
+                    lease_id=lease_id
+                )
+                
+                # Per specification: "Excess automatically applied to Lease"
+                # Find or create LEASE category balance for this lease
+                from app.leases.models import Lease
+                lease = self.repo.db.query(Lease).filter(Lease.id == lease_id).first()
+                if not lease:
+                    raise InvalidLedgerOperationError(f"Lease {lease_id} not found for excess allocation")
+                
+                # Get or create LEASE balance
+                lease_reference_id = lease.lease_id  # Use lease.lease_id as reference
+                lease_balance = self.repo.get_balance_by_reference_id(lease_reference_id)
+                
+                if not lease_balance:
+                    # Create LEASE balance if it doesn't exist
+                    lease_balance = LedgerBalance(
+                        category=PostingCategory.LEASE,
+                        reference_id=lease_reference_id,
+                        original_amount=Decimal("0.00"),
+                        balance=Decimal("0.00"),
+                        status=BalanceStatus.CLOSED,
+                        driver_id=driver_id,
+                        lease_id=lease_id,
+                        vehicle_id=lease.vehicle_id,
+                        medallion_id=lease.medallion_id
+                    )
+                    self.repo.create_balance(lease_balance)
+                    logger.info(f"Created LEASE balance for excess allocation: {lease_reference_id}")
+                
+                # Apply excess to LEASE balance
+                excess_posting = LedgerPosting(
+                    category=PostingCategory.LEASE,
+                    amount=excess_amount,
+                    entry_type=EntryType.CREDIT,
+                    status=PostingStatus.POSTED,
+                    reference_id=lease_reference_id,
                     driver_id=driver_id,
                     lease_id=lease_id,
-                    excess_amount=float(excess_amount)
+                    vehicle_id=lease_balance.vehicle_id,
+                    medallion_id=lease_balance.medallion_id,
+                    description=f"Excess from interim payment auto-applied to lease via {payment_method}",
+                    payment_source="INTERIM_PAYMENT_EXCESS",
+                    payment_method=payment_method
                 )
-
-                # Find the lease balance for this lease
-                lease_balance = self.repo.get_balance_by_lease_and_category(
-                    lease_id=lease_id,
-                    category=PostingCategory.LEASE
-                )
-
-                if lease_balance and lease_balance.status == BalanceStatus.OPEN:
-                    # Create credit posting for excess to lease
-                    excess_posting = LedgerPosting(
-                        category=PostingCategory.LEASE,
-                        amount=-excess_amount,
-                        entry_type=EntryType.CREDIT,
-                        status=PostingStatus.POSTED,
-                        reference_id=f"PAYMENT-{payment_method}-EXCESS-{lease_balance.reference_id}",
-                        driver_id=driver_id,
-                        lease_id=lease_id,
-                        vehicle_id=lease_balance.vehicle_id,
-                        medallion_id=lease_balance.medallion_id,
-                    )
-                    self.repo.create_posting(excess_posting)
-                    created_postings.append(excess_posting)
-
-                    # Update lease balance
+                self.repo.create_posting(excess_posting)
+                created_postings.append(excess_posting)
+                
+                # Update LEASE balance if it has outstanding amount
+                if lease_balance.balance > 0:
                     new_lease_balance = Decimal(lease_balance.balance) - excess_amount
-                    new_lease_status = BalanceStatus.CLOSED if new_lease_balance <= 0 else BalanceStatus.OPEN
-                    self.repo.update_balance(lease_balance, new_lease_balance, new_lease_status)
-
-                    logger.info(
-                        f"Successfully applied ${excess_amount} excess to lease balance",
-                        lease_balance_id=lease_balance.id,
-                        new_balance=float(new_lease_balance)
-                    )
-
-                    # Notify if lease balance is fully paid
-                    if new_lease_balance <= 0:
-                        self._notify_balance_paid(lease_balance.reference_id, PostingCategory.LEASE)
+                    new_status = BalanceStatus.CLOSED if new_lease_balance <= 0 else BalanceStatus.OPEN
+                    self.repo.update_balance(lease_balance, new_lease_balance, new_status)
+                    logger.info(f"Applied ${excess_amount} excess to LEASE balance {lease_reference_id}")
                 else:
-                    # No open lease balance exists - create warning but don't fail
-                    logger.warning(
-                        f"No open lease balance found for lease_id {lease_id}. "
-                        f"Excess amount ${excess_amount} cannot be applied.",
-                        driver_id=driver_id,
-                        lease_id=lease_id,
-                    )
-                    # Could optionally: create a credit balance or hold for future application
+                    logger.info(f"LEASE balance {lease_reference_id} has no outstanding amount, excess posting created for future offset")
 
             return created_postings
 
@@ -384,6 +405,165 @@ class LedgerService:
                 error=str(e),
                 exc_info=True
             )
+
+    def _apply_excess_to_lease_schedule(
+        self,
+        lease_id: int,
+        excess_amount: Decimal,
+        driver_id: int,
+        payment_method: str
+    ) -> List[LedgerPosting]:
+        """
+        Apply excess payment to lease schedule installments in chronological order.
+        
+        ALGORITHM:
+        1. Query lease_schedule for installments with status 'Scheduled' or 'Posted'
+        2. Order by installment_due_date ASC (earliest first)
+        3. For each installment:
+           a. Check if there's an existing ledger_balance for this installment
+           b. If not, create one (happens if installment not yet posted to ledger)
+           c. Apply min(excess_remaining, installment_balance) to this installment
+           d. Create CREDIT posting with reference_id = installment.installment_id
+           e. Update ledger balance
+           f. If balance reaches 0, mark installment as PAID
+           g. Continue to next installment if excess remains
+        4. If excess STILL remains after all installments: FAIL with error
+        
+        RETURNS: List of created LedgerPosting objects
+        RAISES: InvalidLedgerOperationError if excess cannot be fully allocated
+        """
+        from app.leases.models import LeaseSchedule
+        
+        created_postings = []
+        remaining_excess = excess_amount
+        
+        # Step 1: Get upcoming/current lease installments (not yet fully paid)
+        upcoming_installments = (
+            self.repo.db.query(LeaseSchedule)
+            .filter(
+                LeaseSchedule.lease_id == lease_id,
+                LeaseSchedule.installment_status.in_(['Scheduled', 'Posted']),
+                LeaseSchedule.installment_amount > 0
+            )
+            .order_by(LeaseSchedule.installment_due_date.asc())
+            .limit(10)  # Reasonable limit - excess unlikely to cover 10+ weeks
+            .all()
+        )
+        
+        if not upcoming_installments:
+            raise InvalidLedgerOperationError(
+                f"Cannot apply excess ${excess_amount} - no scheduled lease installments found for lease {lease_id}. "
+                f"This may indicate the lease has ended or all installments are already paid."
+            )
+        
+        logger.info(
+            f"Applying ${excess_amount} excess to {len(upcoming_installments)} lease installments",
+            lease_id=lease_id
+        )
+        
+        # Step 2: Apply excess to installments chronologically
+        for installment in upcoming_installments:
+            if remaining_excess <= 0:
+                break
+            
+            # Step 3: Get or create ledger balance for this installment
+            balance = self.repo.get_balance_by_reference_id(str(installment.id))
+            
+            if not balance:
+                # Installment not yet posted to ledger - create balance entry
+                balance = self._create_lease_installment_balance(
+                    installment=installment,
+                    driver_id=driver_id,
+                    lease_id=lease_id
+                )
+            
+            # Skip if already fully paid
+            if balance.status == BalanceStatus.CLOSED:
+                continue
+            
+            # Step 4: Calculate payment for this installment
+            installment_outstanding = Decimal(str(balance.balance))
+            payment_for_installment = min(remaining_excess, installment_outstanding)
+            
+            # Step 5: Create CREDIT posting
+            posting = LedgerPosting(
+                category=PostingCategory.LEASE,
+                amount=payment_for_installment,
+                entry_type=EntryType.CREDIT,
+                status=PostingStatus.POSTED,
+                reference_id=str(installment.id),  # ✅ CRITICAL: Use actual installment ID
+                driver_id=driver_id,
+                lease_id=lease_id,
+                vehicle_id=balance.vehicle_id,
+                medallion_id=balance.medallion_id,
+                description=f"Excess interim payment via {payment_method} - Installment #{installment.installment_number}",
+                payment_source="INTERIM_PAYMENT",
+                payment_method=payment_method
+            )
+            self.repo.create_posting(posting)
+            created_postings.append(posting)
+            
+            # Step 6: Update balance
+            new_balance = installment_outstanding - payment_for_installment
+            new_status = BalanceStatus.CLOSED if new_balance <= 0 else BalanceStatus.OPEN
+            self.repo.update_balance(balance, new_balance, new_status)
+            
+            # Step 7: Update installment status if fully paid
+            if new_balance <= 0:
+                installment.installment_status = 'Paid'
+                self.repo.db.add(installment)
+            
+            remaining_excess -= payment_for_installment
+            
+            logger.info(
+                f"Applied ${payment_for_installment} excess to lease installment {installment.id}",
+                installment_number=installment.installment_number,
+                remaining_balance=float(new_balance),
+                remaining_excess=float(remaining_excess)
+            )
+        
+        # Step 8: Final validation - all excess must be allocated
+        if remaining_excess > 0.01:  # Allow for small floating point differences
+            raise InvalidLedgerOperationError(
+                f"Unable to fully allocate excess payment. ${remaining_excess} remains after processing all available lease installments. "
+                f"This should not happen - contact system administrator."
+            )
+        
+        return created_postings
+
+
+    def _create_lease_installment_balance(
+        self,
+        installment: "LeaseSchedule",
+        driver_id: int,
+        lease_id: int
+    ) -> "LedgerBalance":
+        """
+        Create a ledger balance entry for a lease installment that hasn't been posted yet.
+        This allows interim payments to prepay future installments.
+        """
+        balance = LedgerBalance(
+            category=PostingCategory.LEASE,
+            reference_id=str(installment.id),
+            driver_id=driver_id,
+            lease_id=lease_id,
+            vehicle_id=installment.lease.vehicle_id if installment.lease else None,
+            medallion_id=installment.lease.medallion_id if installment.lease else None,
+            original_amount=Decimal(str(installment.installment_amount)),
+            balance=Decimal(str(installment.installment_amount)),
+            status=BalanceStatus.OPEN,
+            posted_on=datetime.now(timezone.utc)
+        )
+        
+        self.repo.db.add(balance)
+        self.repo.db.flush()
+        
+        logger.info(
+            f"Created ledger balance for lease installment {installment.id}",
+            amount=float(installment.installment_amount)
+        )
+        
+        return balance
 
     def apply_weekly_earnings(
         self, driver_id: int, earnings_amount: Decimal, lease_id: Optional[int] = None

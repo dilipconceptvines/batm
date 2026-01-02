@@ -4,6 +4,7 @@ import math
 from datetime import date , datetime , time
 from io import BytesIO
 from typing import Optional
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi import status as fast_status
@@ -113,7 +114,7 @@ def list_pvb_violations(
     use_stubs: bool = Query(False, description="Return stubbed data for testing."),
     page: int = Query(1, ge=1, description="Page number for pagination."),
     per_page: int = Query(10, ge=1, le=100, description="Items per page."),
-    sort_by: Optional[str] = Query(None, description="Field to sort by."),
+    sort_by: Optional[str] = Query(None, description="Field to sort by (driver_name, lease_id, ledger_balance, etc.)."),
     sort_order: Optional[str] = Query(None , description="Sort order (asc or desc)."),
     plate: Optional[str] = Query(None, description="Filter by Plate Number."),
     state: Optional[str] = Query(None, description="Filter by State."),
@@ -143,7 +144,10 @@ def list_pvb_violations(
     lease_id: Optional[str] = Query(None, description="Filter by associated Lease ID."),
     vin: Optional[str] = Query(None, description="Filter by associated Vehicle VIN."),
     driver_id: Optional[str] = Query(None, description="Filter by associated Driver ID."),
+    driver_name: Optional[str] = Query(None, description="Filter by associated Driver Name."),
     medallion_no: Optional[str] = Query(None, description="Filter by associated Medallion No."),
+    from_ledger_balance: Optional[Decimal] = Query(None, ge=0, description="Filter from ledger balance (inclusive)."),
+    to_ledger_balance: Optional[Decimal] = Query(None, ge=0, description="Filter to ledger balance (inclusive)."),
     status: Optional[str] = Query(None, description="Filter by Status."),
     source: Optional[str] = Query(None, description="Filter by Source."),
     violation_code: Optional[str] = Query(None, description="Filter by Violation Code."),
@@ -192,7 +196,10 @@ def list_pvb_violations(
             lease_id=lease_id,
             vin=vin,
             driver_id=driver_id,
+            driver_name=driver_name,
             medallion_no=medallion_no,
+            from_ledger_balance=from_ledger_balance,
+            to_ledger_balance=to_ledger_balance,
             status=status,
             source=source,
             violation_code = violation_code,
@@ -216,6 +223,7 @@ def list_pvb_violations(
                 lease_id=v.lease.lease_id if v.lease else None,
                 medallion_no=v.medallion.medallion_number if v.medallion else None,
                 driver_id=v.driver.driver_id if v.driver else None,
+                driver_name=v.driver.full_name if v.driver else None,
                 posting_date=v.posting_date,
                 status=v.status,
                 amount=v.amount_due,
@@ -224,6 +232,7 @@ def list_pvb_violations(
                 interest=v.interest,
                 reduction=v.reduction,
                 processing_fee=v.processing_fee,
+                ledger_balance=None,  # TODO: Calculate total outstanding balance for driver/lease
                 failure_reason=v.failure_reason,
                 violation_code= v.violation_code,
                 violation_country= v.violation_country,
@@ -430,17 +439,25 @@ def reassign_pvb_transactions(
     - Handle mid-lease driver changes
 
     **Restrictions:**
-    - Cannot reassign violations already POSTED_TO_LEDGER
     - New lease must be an active lease
     - New lease must belong to the specified new driver (valid primary driver)
     - Both new driver and new lease must exist in the system
-
+    - All entries in bulk must originate from exactly one source lease
+    - Source entries must have valid driver/lease associations
+    
     **Process:**
-    1. Validates new driver and new lease exist
-    2. Verifies new lease belongs to new driver
-    3. Updates violation with new associations
-    4. Sets status to ASSOCIATED
-    5. Clears any previous failure_reason
+    1. Validates source entries have valid associations
+    2. Validates bulk source consistency (all from same lease)
+    3. Validates new driver and new lease exist
+    4. Verifies new lease belongs to new driver
+    5. Updates violation associations and performs ledger operations as needed
+    6. Creates complete audit trail records
+    
+    **Supported Statuses:**
+    - IMPORTED: Simple association update
+    - ASSOCIATION_FAILED: Association update, status changed to ASSOCIATED
+    - ASSOCIATED: Association update only
+    - POSTED_TO_LEDGER: Full financial responsibility reconstruction with ledger reversal/reposting
     """
     try:
         result = pvb_service.reassign_transactions(
@@ -449,6 +466,8 @@ def reassign_pvb_transactions(
             new_lease_id=request.new_lease_id,
             new_medallion_id=request.new_medallion_id,
             new_vehicle_id=request.new_vehicle_id,
+            user_id=current_user.id,
+            reason=request.reason
         )
         return JSONResponse(content=result, status_code=fast_status.HTTP_200_OK)
     except PVBError as e:

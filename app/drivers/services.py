@@ -2,6 +2,8 @@
 
 # Standard library imports
 from typing import Optional, Union, List
+from datetime import date , datetime , timedelta
+
 
 # Third party imports
 from sqlalchemy.orm import Session
@@ -159,7 +161,11 @@ class DriverService:
         self, db: Session,
         dmv_license_number: Optional[str] = None,
         driver_id: Optional[int] = None,
-        license_id: Optional[int] = None, multiple: Optional[bool] = False
+        license_id: Optional[int] = None,
+        expiry_to: Optional[date] = None,
+        expiry_from: Optional[date] = None,
+        is_active: Optional[bool] = None,
+        multiple: Optional[bool] = False,
     ) -> Union[DMVLicense, List[DMVLicense], None]:
         """
         Get a dmv license by the provided filters
@@ -173,7 +179,15 @@ class DriverService:
                 query = query.filter(DMVLicense.driver.driver_id == driver_id)
             if license_id:
                 query = query.filter(DMVLicense.id == license_id)
-
+            if expiry_from:
+                expiry_date = datetime.combine(expiry_from, datetime.max.time())
+                query = query.filter(DMVLicense.dmv_license_expiry_date >= expiry_date)
+            if expiry_to:
+                expiry_date = datetime.combine(expiry_to, datetime.max.time())
+                query = query.filter(DMVLicense.dmv_license_expiry_date <= expiry_date)
+            if is_active is not None:
+                query = query.filter(DMVLicense.is_dmv_license_active == is_active)
+                
             if multiple:
                 return query.all()
             return query.first()
@@ -182,8 +196,13 @@ class DriverService:
             raise e
         
     def get_tlc_license(
-        self, db: Session, tlc_license_number: Optional[str] = None,
-        license_id: Optional[int] = None, multiple: Optional[bool] = False
+        self, db: Session,
+        tlc_license_number: Optional[str] = None,
+        license_id: Optional[int] = None,
+        expiry_from: Optional[date] = None,
+        expiry_to: Optional[date] = None,
+        is_active: Optional[bool] = None,
+        multiple: Optional[bool] = False
     ) -> Union[TLCLicense, List[TLCLicense], None]:
         """
         Get a tlc license by the provided filters
@@ -195,7 +214,15 @@ class DriverService:
                 query = query.filter(TLCLicense.tlc_license_number == tlc_license_number)
             if license_id:
                 query = query.filter(TLCLicense.id == license_id)
-
+            if expiry_from:
+                expiry_date = datetime.combine(expiry_from, datetime.max.time())
+                query = query.filter(TLCLicense.tlc_license_expiry_date >= expiry_date)
+            if expiry_to:
+                expiry_date = datetime.combine(expiry_to, datetime.max.time())
+                query = query.filter(TLCLicense.tlc_license_expiry_date <= expiry_date)
+            if is_active is not None:
+                query = query.filter(TLCLicense.is_tlc_license_active == is_active)
+            
             if multiple:
                 return query.all()
             return query.first()

@@ -507,6 +507,109 @@ ORDER BY lb.created_on ASC;
 - Only positive balances shown (balance > 0)
 - Sorted by creation date (oldest first)
 
+#### Edit Payment Details (Deviation #4)
+
+**Purpose**: Allow users to modify payment details after proceeding to allocation screen.
+
+**Problem Solved**:
+- User enters $600 in Step 210, proceeds to Step 211
+- Realizes payment should be $650
+- Previously: Forced to cancel entire case and restart
+- Now: Can click "Edit Payment Details" to return to Step 210
+
+**User Experience**:
+1. On Step 211 allocation screen, "Edit Payment Details" button visible
+2. User clicks button, sees confirmation: "Going back will clear allocations. Continue?"
+3. If confirmed, allocations cleared and user returns to Step 210
+4. Step 210 form pre-filled with existing payment data
+5. User modifies amount/method/date/notes
+6. Saves changes (allocations automatically cleared)
+7. Returns to Step 211 to re-allocate with new payment details
+
+**API Flow**:
+
+```http
+// 1. Reset allocations and return to Step 210
+POST /payments/interim-payments/case/INTPAY000477/reset-allocation
+Authorization: Bearer {token}
+
+Response:
+{
+  "message": "Ready to edit payment details",
+  "case_no": "INTPAY000477",
+  "payment_id": "INTPAY-2025-00001",
+  "next_step": "210"
+}
+
+// 2. Fetch Step 210 with existing payment data
+GET /bpm/case/INTPAY000477/210?tlc_license_no=00504124
+Authorization: Bearer {token}
+
+Response:
+{
+  "driver": { /* driver details */ },
+  "leases": [ /* lease list */ ],
+  "existing_payment": {
+    "id": 12345,
+    "payment_amount": 600.00,
+    "payment_method": "CASH",
+    "payment_date": "2025-10-21T00:00:00",
+    "notes": "Original payment",
+    "driver_id": 101,
+    "lease_id": 2054
+  }
+}
+
+// 3. Update payment details (clears allocations)
+POST /bpm/case/INTPAY000477
+Content-Type: application/json
+Authorization: Bearer {token}
+
+{
+  "step_id": "210",
+  "data": {
+    "driver_id": 101,
+    "lease_id": 2054,
+    "payment_amount": 650.00,  // Changed from 600
+    "payment_method": "CASH",
+    "payment_date": "2025-10-21",
+    "notes": "Updated payment amount"
+  }
+}
+
+Response:
+{
+  "message": "Payment details updated successfully",
+  "interim_payment_id": "12345",
+  "operation": "UPDATE",
+  "allocations_cleared": true,
+  "total_outstanding": 2156.50
+}
+```
+
+**Database Changes**:
+```sql
+-- Clear existing allocations
+UPDATE interim_payments 
+SET allocations = '[]'
+WHERE id = 12345;
+
+-- Update payment details
+UPDATE interim_payments 
+SET total_amount = 650.00,
+    payment_method = 'CASH',
+    payment_date = '2025-10-21',
+    notes = 'Updated payment amount'
+WHERE id = 12345;
+```
+
+**UI Implementation Notes**:
+- "Edit Payment Details" button in payment summary header on Step 211
+- Confirmation dialog warns about clearing allocations
+- Step 210 form detects edit mode when `existing_payment` present
+- Form fields pre-filled from `existing_payment` data
+- Success message indicates allocations were cleared
+
 #### Step 211 - Process (Submit Allocation)
 
 **Purpose**: Apply payment allocation to ledger and close case.
@@ -656,6 +759,98 @@ INSERT INTO audit_trails (
 - Ledger postings use CREDIT type (reduces outstanding balance)
 - Balances automatically marked as closed when balance reaches zero
 - Case marked as closed after successful allocation
+
+---
+
+## Excess Amount Handling (Updated)
+
+### Overview
+When the total allocated amount is less than the payment amount, the excess is automatically applied to upcoming lease schedule installments in chronological order.
+
+### Algorithm
+1. Calculate excess: `payment_amount - sum(allocations)`
+2. Query `lease_schedule` for installments with status 'Scheduled' or 'Posted'
+3. Order installments by `installment_due_date` ASC (earliest first)
+4. For each installment:
+   - Apply `min(remaining_excess, installment_balance)`
+   - Create CREDIT posting with `reference_id = installment.installment_id`
+   - Update installment status to 'Paid' if fully cleared
+5. If excess cannot be fully allocated: Transaction FAILS with error
+
+### Example
+**Scenario:**
+- Payment Amount: $1,000
+- Allocated: $400 (Repairs)
+- Excess: $600
+- Lease Schedule:
+  - Installment #5 (due 12/01): $300
+  - Installment #6 (due 12/08): $300
+  - Installment #7 (due 12/15): $300
+
+**Result:**
+- Repairs: $400 allocated explicitly
+- Lease Installment #5: $300 (fully paid, status → PAID)
+- Lease Installment #6: $300 (fully paid, status → PAID)
+- Total ledger postings: $1,000 ✅
+
+### Error Handling
+- If no lease installments available: Transaction FAILS with error
+- If excess cannot be fully allocated: Transaction FAILS with error
+- No silent failures - all excess MUST be accounted for
+
+### Prepayment Support
+Drivers can prepay future installments that haven't been posted to the ledger yet. The system automatically creates ledger balance entries for these future installments.
+
+---
+
+## Ledger Posting Reference ID Integrity
+
+### Critical Design Principle
+Ledger postings MUST use the **original reference_id** from the obligation. This maintains referential integrity and enables easy querying.
+
+### ✅ Correct Implementation
+```python
+# Posting for Repair Invoice INV-2457
+posting = LedgerPosting(
+    reference_id='INV-2457',  # ORIGINAL reference_id
+    description='Interim payment via CASH',
+    payment_source='INTERIM_PAYMENT',
+    payment_method='CASH'
+)
+```
+
+### ❌ Incorrect Implementation (Old)
+```python
+# DO NOT DO THIS
+posting = LedgerPosting(
+    reference_id='PAYMENT-CASH-INV-2457',  # Modified reference_id
+)
+```
+
+### Querying Payments
+```python
+# Get all payments for specific repair invoice
+payments = db.query(LedgerPosting).filter(
+    LedgerPosting.reference_id == 'INV-2457',
+    LedgerPosting.payment_source == 'INTERIM_PAYMENT'
+).all()
+
+# Get all payments by method
+cash_payments = db.query(LedgerPosting).filter(
+    LedgerPosting.payment_method == 'CASH'
+).all()
+```
+
+### Payment Tracking Fields
+- `payment_source`: Origin of payment (INTERIM_PAYMENT, WEEKLY_EARNINGS, etc.)
+- `payment_method`: Method used (CASH, CHECK, ACH, etc.)
+- `description`: Human-readable description with payment method
+
+### Database Migration
+The migration adds these fields and backfills existing data:
+- Identifies interim payments by reference_id pattern (`PAYMENT-%`)
+- Extracts payment method from reference_id
+- Sets appropriate payment_source and description
 
 ---
 

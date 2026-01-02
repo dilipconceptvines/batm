@@ -35,6 +35,18 @@ from app.utils.logger import get_logger
 from app.users.utils import get_current_user
 from app.users.models import User
 from app.uploads.services import upload_service
+from app.drivers.notification_services import (
+    get_dmv_license_expiry_notifications,
+    get_tlc_license_expiry_notifications,
+)
+from app.notifications.schemas import NotificationEvent
+from app.notifications.services import (
+    log_notification_details,
+    send_notification_emails,
+    send_notification_sms,
+)
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["Driver"])
@@ -592,3 +604,86 @@ def get_drivers_balances(
         raise HTTPException(
             status_code=500, detail="Error getting drivers balances"
         ) from e
+    
+
+@router.get("/license_expiry_notifications", summary="Trigger License Expiry Notifications (PRIOR, DATE, or POST)")
+def trigger_license_expiry_notifications(
+    type: str = Query("dmv", enum=["dmv", "tlc"], description="License type: dmv or tlc"),
+    offsets_days: str = Query("7", description="Comma-separated day offsets (e.g., '7,14' for PRIOR, '0' for DATE, '-1,-7' for POST)"),
+    db: Session = Depends(get_db),
+    logged_in_user: User = Depends(get_current_user)
+):
+    """
+    Trigger license expiry notifications with custom day offsets.
+
+    Examples:
+    - PRIOR notifications (future): offsets_days=7,14,30
+    - DATE notifications (today): offsets_days=0
+    - POST notifications (past): offsets_days=-1,-3,-7,-14
+    """
+    try:
+        # Parse comma-separated offsets
+        offsets = [int(offset.strip()) for offset in offsets_days.split(",")]
+
+        # Get current time in America/New_York timezone (matching YAML config)
+        run_at_tz = datetime.now(tz=ZoneInfo("America/New_York"))
+        today = run_at_tz.date()
+
+        # Collect all notifications for the given offsets
+        all_notifications = []
+
+        for offset in offsets:
+            target_date = today + timedelta(days=offset)
+
+            logger.info(
+                f"Collecting {type.upper()} license expiry notifications for {target_date} (today + {offset} days)"
+            )
+
+            if type == "dmv":
+                notifications = get_dmv_license_expiry_notifications(
+                    db,
+                    target_date,
+                    run_at_tz=run_at_tz,
+                    event=NotificationEvent.DMV_EXPIRY_PRIOR if offset > 0
+                          else NotificationEvent.DMV_EXPIRY_DATE if offset == 0
+                          else NotificationEvent.DMV_EXPIRY_POST,
+                )
+            elif type == "tlc":
+                notifications = get_tlc_license_expiry_notifications(
+                    db,
+                    target_date,
+                    run_at_tz=run_at_tz,
+                    event=NotificationEvent.TLC_EXPIRY_PRIOR if offset > 0
+                          else NotificationEvent.TLC_EXPIRY_DATE if offset == 0
+                          else NotificationEvent.TLC_EXPIRY_POST,
+                )
+
+            logger.info(
+                f"Found {len(notifications)} drivers with {type.upper()} license expiring on {target_date}"
+            )
+            all_notifications.extend(notifications)
+
+        logger.info(f"Collected {len(all_notifications)} total {type.upper()} notifications for offsets: {offsets}")
+
+        # Note: This API endpoint only collects notifications, it doesn't send them
+        # To send notifications, use the YAML-based scheduled jobs or call the notification service
+        return {
+            "status": "success",
+            "license_type": type.upper(),
+            "offsets_days": offsets,
+            "total_notifications": len(all_notifications),
+            "notifications": [n.model_dump() for n in all_notifications]
+        }
+
+    except ValueError as e:
+        logger.error(f"Invalid offsets_days format: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid offsets_days format. Use comma-separated integers (e.g., '7,14' or '-1,-7')"
+        )
+    except Exception as e:
+        logger.error(f"Error triggering {type.upper()} license expiry notifications: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to trigger {type.upper()} license expiry notifications"
+        )

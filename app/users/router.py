@@ -38,8 +38,19 @@ async def login(
             detail="Incorrect email or password."
         )
     
-    access_token = create_access_token(data={"sub": user.email_address, "id": user.id})
-    refresh_token = create_refresh_token(data={"sub": user.email_address, "id": user.id})
+    # Include roles in JWT for frontend RBAC (backend still validates from DB)
+    user_roles = [role.name for role in user.roles]
+
+    access_token = create_access_token(data={
+        "sub": user.email_address,
+        "id": user.id,
+        "roles": user_roles
+    })
+    refresh_token = create_refresh_token(data={
+        "sub": user.email_address,
+        "id": user.id,
+        "roles": user_roles
+    })
 
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
@@ -77,9 +88,20 @@ async def refresh_access_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid refresh token."
         )
-    
-    new_access_token = create_access_token(data={"sub": user.email_address, "id": user.id})
-    new_refresh_token = create_refresh_token(data={"sub": user.email_address, "id": user.id})
+
+    # Include current roles from DB (may have changed since last token)
+    user_roles = [role.name for role in user.roles]
+
+    new_access_token = create_access_token(data={
+        "sub": user.email_address,
+        "id": user.id,
+        "roles": user_roles
+    })
+    new_refresh_token = create_refresh_token(data={
+        "sub": user.email_address,
+        "id": user.id,
+        "roles": user_roles
+    })
 
     return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
 

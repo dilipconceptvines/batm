@@ -98,6 +98,49 @@ class LoanService:
             new_loan.status = LoanStatus.OPEN
             self.db.flush()
 
+            # NEW: Immediate posting of first installment if start_week is current week
+            try:
+                current_date = datetime.now(timezone.utc).date()
+                # Get the first installment
+                first_installment = (
+                    self.db.query(LoanInstallment)
+                    .filter(LoanInstallment.loan_id == new_loan.id)
+                    .order_by(LoanInstallment.week_start_date)
+                    .first()
+                )
+                
+                if first_installment and first_installment.week_start_date <= current_date:
+                    # First installment is due (current or past week) - post immediately
+                    ledger_repo = LedgerRepository(self.db)
+                    ledger_service = LedgerService(ledger_repo)
+                    
+                    ledger_posting, balance = ledger_service.create_obligation(
+                        category=PostingCategory.LOAN,
+                        amount=first_installment.total_due,
+                        reference_id=first_installment.installment_id,
+                        driver_id=new_loan.driver_id,
+                        lease_id=new_loan.lease_id,
+                        medallion_id=new_loan.medallion_id,
+                    )
+                    
+                    # Update first installment status to POSTED
+                    posted_on = datetime.now(timezone.utc)
+                    self.repo.update_installment(first_installment.id, {
+                        "status": LoanInstallmentStatus.POSTED,
+                        "posted_on": posted_on,
+                        "ledger_posting_ref": str(ledger_posting.id)
+                    })
+                    self.db.flush()
+                    
+                    logger.info(
+                        f"Immediately posted first installment {first_installment.installment_id} "
+                        f"to ledger for loan {loan_id} (start_week is current/past week)"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to immediately post first installment for loan {loan_id}: {e}", exc_info=True)
+                # Don't fail the entire loan creation if immediate posting fails
+                # The installment can be posted later via scheduled task
+
             bpm_service.create_case_entity(
                 self.db, case_no, "driver_loan", "id", str(new_loan.id)
             )
@@ -336,7 +379,7 @@ class LoanService:
                     ))
 
                 # Create obligation in ledger
-                ledger_posting = ledger_service.create_obligation(
+                ledger_posting, balance = ledger_service.create_obligation(
                     category=PostingCategory.LOAN,
                     amount=installment.total_due,
                     reference_id=installment.installment_id,

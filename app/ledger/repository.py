@@ -140,7 +140,8 @@ class LedgerRepository:
             (LedgerBalance.category == PostingCategory.TLC, 5),
             (LedgerBalance.category == PostingCategory.REPAIR, 6),
             (LedgerBalance.category == PostingCategory.LOAN, 7),
-            (LedgerBalance.category == PostingCategory.MISC, 8),
+            (LedgerBalance.category == PostingCategory.MISCELLANEOUS_EXPENSE, 8),
+            (LedgerBalance.category == PostingCategory.MISCELLANEOUS_CREDIT, 8),
             (LedgerBalance.category == PostingCategory.DEPOSIT, 9),
             else_=99,
         )

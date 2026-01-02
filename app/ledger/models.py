@@ -87,6 +87,24 @@ class LedgerPosting(Base, AuditMixin):
         comment="If this is a reversal, points to the original posting ID",
     )
 
+    # --- Payment Tracking Fields ---
+    payment_source: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        index=True,
+        comment="Origin of payment (INTERIM_PAYMENT, WEEKLY_EARNINGS, etc.)"
+    )
+    payment_method: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="Payment method (CASH, CHECK, ACH, etc.)"
+    )
+    description: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Human-readable description of the posting"
+    )
+
     # --- Denormalized Entity Linkage for Reporting ---
     driver_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("drivers.id"), index=True

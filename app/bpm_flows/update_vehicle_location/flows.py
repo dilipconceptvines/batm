@@ -1,15 +1,17 @@
 # Third party imports
-from sqlalchemy.orm import Session
 from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from app.audit_trail.services import audit_trail_service
+from app.bpm.services import bpm_service
+from app.bpm.step_info import step
+from app.bpm_flows.allocate_medallion_vehicle.utils import format_vehicle_details
 
 # Local imports
 from app.utils.logger import get_logger
-from app.bpm.step_info import step
-from app.audit_trail.services import audit_trail_service
-from app.bpm.services import bpm_service
+from app.vehicles.schemas import VehicleLocation, VehicleStatus
 from app.vehicles.services import vehicle_service
-from app.bpm_flows.allocate_medallion_vehicle.utils import format_vehicle_details
-from app.vehicles.schemas import VehicleStatus , VehicleLocation
 
 logger = get_logger(__name__)
 
@@ -35,7 +37,6 @@ VEHICLE_LOCATION_RULES = {
         "allow_free_text": False,
         "default_location": VehicleLocation.BAT_GARAGE.value,
     },
-
     VehicleStatus.HACKED_UP.value: {
         "editable": True,
         "allowed_locations": [
@@ -47,12 +48,11 @@ VEHICLE_LOCATION_RULES = {
         ],
         "allow_free_text": False,
     },
-
     VehicleStatus.OUT_OF_SERVICE.value: {
         "editable": True,
         "allowed_locations": None,  # free text
         "allow_free_text": True,
-    }
+    },
 }
 
 
@@ -95,9 +95,7 @@ def fetch_vehicle_info(db: Session, case_no, case_params=None):
             "comment": vehicle.comment_for_location_change,
         }
 
-        allowed_locations = VEHICLE_LOCATION_RULES.get(
-            vehicle.vehicle_status, {}
-        )
+        allowed_locations = VEHICLE_LOCATION_RULES.get(vehicle.vehicle_status, {})
 
         return {
             "vehicle_details": vehicle_details,
@@ -108,8 +106,8 @@ def fetch_vehicle_info(db: Session, case_no, case_params=None):
         logger.exception("Error in fetch_vehicle_info")
         raise
 
-    
-@step(step_id="224" , name="Update - Vehicle Info" , operation="process")
+
+@step(step_id="224", name="Update - Vehicle Info", operation="process")
 def update_vehicle_info(db: Session, case_no, step_data):
     """
     Update the vehicle info
@@ -118,55 +116,61 @@ def update_vehicle_info(db: Session, case_no, step_data):
         case_entity = bpm_service.get_case_entity(db, case_no=case_no)
         if not case_entity:
             return {}
-        
-        vehicle = vehicle_service.get_vehicles(db=db , vehicle_id=int(case_entity.identifier_value))
+
+        vehicle = vehicle_service.get_vehicles(
+            db=db, vehicle_id=int(case_entity.identifier_value)
+        )
         if not vehicle:
             raise ValueError("Vehicle not found")
-        
-        if vehicle.vehicle_status not in [VehicleStatus.AVAILABLE_FOR_HACK_UP.value, VehicleStatus.OUT_OF_SERVICE.value , VehicleStatus.HACKED_UP.value]:
-            raise ValueError(f"Update Location Not Allowed For status: {vehicle.vehicle_status}")
-        
+
+        if vehicle.vehicle_status not in [
+            VehicleStatus.AVAILABLE_FOR_HACK_UP.value,
+            VehicleStatus.OUT_OF_SERVICE.value,
+            VehicleStatus.HACKED_UP.value,
+        ]:
+            raise ValueError(
+                f"Update Location Not Allowed For status: {vehicle.vehicle_status}"
+            )
+
         past_location = vehicle.current_location
 
         if vehicle.vin != step_data.get("vin"):
-            raise ValueError(f"vehicle vin: {vehicle.vin} is not same as passed vin: {step_data.get('vin')}")
-        
-        new_location = step_data.get("new_location" , None)
+            raise ValueError(
+                f"vehicle vin: {vehicle.vin} is not same as passed vin: {step_data.get('vin')}"
+            )
+
+        new_location = step_data.get("new_location", None)
 
         if not new_location:
             raise ValueError("New location is required")
 
         if new_location == past_location:
             raise ValueError("New location is same as old location")
-        
+
         if new_location == "Other":
-            new_location = step_data.get("specific_location" , None)
+            new_location = step_data.get("specific_location", None)
 
         new_location_data = {
             "id": vehicle.id,
             "current_location": new_location,
-            "comment_for_location_change": step_data.get("comment" , None),
-            "location_changed_date": datetime.utcnow().date()
+            "comment_for_location_change": step_data.get("comment", None),
+            "location_changed_date": datetime.utcnow().date(),
         }
 
-        vehicle_service.upsert_vehicle(
-            db=db , vehicle_data=new_location_data
-        )
+        vehicle_service.upsert_vehicle(db=db, vehicle_data=new_location_data)
 
-        audit_comment = f"Vehicle vin {vehicle.vin} location changed from ({past_location}) to ({new_location}). Comment: {step_data.get('comment','')}"
+        audit_comment = f"Vehicle vin {vehicle.vin} location changed from ({past_location}) to ({new_location}). Comment: {step_data.get('comment', '')}"
 
-        case = bpm_service.get_cases(db=db , case_no= case_no)
+        case = bpm_service.get_cases(db=db, case_no=case_no)
         if case:
             audit_trail_service.create_audit_trail(
                 db=db,
                 case=case,
                 description=audit_comment,
-                meta_data={"vehicle_id": vehicle.id}
+                meta_data={"vehicle_id": vehicle.id},
             )
 
         return "Ok"
     except Exception as e:
         logger.error(f"Error in update_vehicle_info: {e}")
         raise e
-
-        

@@ -123,11 +123,17 @@ class EZPassRepository:
         vin: Optional[str] = None,
         medallion_no: Optional[str] = None,
         driver_id: Optional[str] = None,
+        driver_name: Optional[str] = None,
+        lease_id: Optional[str] = None,
         status: Optional[str] = None,
         
-        # Other filters
+        # Amount range filters
         from_amount: Optional[Decimal] = None,
         to_amount: Optional[Decimal] = None,
+        from_ledger_balance: Optional[Decimal] = None,
+        to_ledger_balance: Optional[Decimal] = None,
+        
+        # Other filters
         agency: Optional[str] = None,
         ezpass_class: Optional[str] = None,
     ) -> Tuple[List[EZPassTransaction], int]:
@@ -151,8 +157,9 @@ class EZPassRepository:
         
         # Track which joins we need
         needs_vehicle_join = vin is not None or plate_number is not None
-        needs_driver_join = driver_id is not None
+        needs_driver_join = driver_id is not None or driver_name is not None
         needs_medallion_join = medallion_no is not None
+        needs_lease_join = lease_id is not None
         
         # Always eager load these relationships for display
         query = query.options(
@@ -179,6 +186,10 @@ class EZPassRepository:
         
         if needs_medallion_join:
             query = query.outerjoin(Medallion, EZPassTransaction.medallion_id == Medallion.id)
+        
+        if needs_lease_join:
+            from app.leases.models import Lease
+            query = query.outerjoin(Lease, EZPassTransaction.lease_id == Lease.id)
         
         # ==================================================================
         # STEP 2: Apply filters using indexed columns where possible
@@ -275,7 +286,26 @@ class EZPassRepository:
         if driver_id:
             query = apply_multi_filter(query, Driver.driver_id, driver_id)
         
-        # 14. Status filter (comma-separated) - uses idx_ezpass_status
+        # 14. Driver name filter (comma-separated)
+        if driver_name:
+            query = apply_multi_filter(query, Driver.full_name, driver_name)
+        
+        # 15. Lease ID filter (comma-separated)
+        if lease_id:
+            from app.leases.models import Lease
+            query = apply_multi_filter(query, Lease.lease_id, lease_id)
+        
+        # 16. Ledger balance range filter
+        # TODO: Implement ledger balance filtering once balance calculation is available
+        if from_ledger_balance is not None:
+            # query = query.filter(...)  # Placeholder for balance filtering
+            pass
+        
+        if to_ledger_balance is not None:
+            # query = query.filter(...)  # Placeholder for balance filtering
+            pass
+        
+        # 17. Status filter (comma-separated) - uses idx_ezpass_status
         if status:
             statuses = [s.strip() for s in status.split(',') if s.strip()]
             if statuses:
@@ -317,6 +347,9 @@ class EZPassRepository:
             "entry_plaza": EZPassTransaction.entry_plaza,
             "exit_plaza": EZPassTransaction.exit_plaza,
             "agency": EZPassTransaction.agency,
+            "driver_name": Driver.full_name,
+            "lease_id": EZPassTransaction.lease_id,
+            # "ledger_balance": ...  # TODO: Add when balance calculation is implemented
         }
         
         sort_column = sort_column_map.get(sort_by, EZPassTransaction.transaction_datetime)

@@ -1249,6 +1249,7 @@ class LeaseService:
                                 "file_size": latest_document.document_actual_size
                                 if latest_document.document_actual_size
                                 else 0,
+                                "document_path": latest_document.document_path,
                                 "comments": latest_document.document_note,
                                 "document_type": latest_document.document_type,
                                 "object_type": latest_document.object_type,
@@ -1309,6 +1310,7 @@ class LeaseService:
                             if lease_driver_document
                             else None,
                             "document_date": latest_document.document_date,
+                            "document_path": latest_document.document_path,
                             "file_size": latest_document.document_actual_size
                             if latest_document.document_actual_size
                             else 0,

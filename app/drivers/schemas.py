@@ -3,6 +3,7 @@
 # Standard library imports
 from enum import Enum as PyEnum
 from typing import Optional
+from datetime import date
 
 # Third party imports
 from pydantic import BaseModel
@@ -16,6 +17,7 @@ class DriverStatus(str, PyEnum):
     IN_PROGRESS = "In Progress"
     REGISTERED = "Registered"
     ACTIVE = "Active"
+    SUSPENDED = "Suspended"
     INACTIVE = "Inactive"
 
 
@@ -54,3 +56,22 @@ class DOVLease(BaseModel):
 
     lease_type: str
     financial_information: DOVFinancialInfo
+
+
+class LicenseExpiryReminder(BaseModel):
+    """
+    Reminder details for a driver's license expiry.
+    """
+    driver_id: str
+    driver_name: Optional[str] = None
+    license_number: str
+    expiry_date: Optional[str] = None
+    remaining_days: int
+
+    email: Optional[str] = None
+    email_sent: Optional[bool] = False
+    sms_sent: Optional[bool] = False
+
+    phone_number: Optional[str] = None
+    reason_email_failed: Optional[str] = None
+    reason_sms_failed: Optional[str] = None

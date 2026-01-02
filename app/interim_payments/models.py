@@ -27,6 +27,12 @@ class PaymentMethod(str, PyEnum):
     DRIVER_CREDIT = "driver_credit"
 
 
+class PaymentStatus(str, PyEnum):
+    """Status of interim payment"""
+    ACTIVE = "ACTIVE"
+    VOIDED = "VOIDED"
+
+
 class InterimPayment(Base, AuditMixin):
     """
     Represents a single ad-hoc payment made by a driver outside the
@@ -54,9 +60,35 @@ class InterimPayment(Base, AuditMixin):
 
     receipt_s3_key: Mapped[Optional[str]] = mapped_column(String(500), nullable=True, comment="S3 key/path for the generated receipt PDF")
     
+    # --- Status Tracking ---
+    status: Mapped[PaymentStatus] = mapped_column(
+        Enum(PaymentStatus),
+        nullable=False,
+        default=PaymentStatus.ACTIVE,
+        index=True,
+        comment="Status of the payment (ACTIVE or VOIDED)"
+    )
+    voided_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when payment was voided"
+    )
+    voided_by: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=True,
+        comment="User who voided the payment"
+    )
+    void_reason: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Reason for voiding the payment"
+    )
+    
     # --- Relationships ---
     driver: Mapped["Driver"] = relationship()
     lease: Mapped["Lease"] = relationship()
+    voider: Mapped[Optional["User"]] = relationship(foreign_keys=[voided_by])
 
     def to_dict(self):
         """Converts the InterimPayment object to a dictionary."""
@@ -71,5 +103,9 @@ class InterimPayment(Base, AuditMixin):
             "payment_method": self.payment_method.value,
             "notes": self.notes,
             "allocations": self.allocations,
+            "status": self.status.value if self.status else None,
+            "voided_at": self.voided_at.isoformat() if self.voided_at else None,
+            "voided_by": self.voided_by,
+            "void_reason": self.void_reason,
             "created_on": self.created_on.isoformat() if self.created_on else None,
         }

@@ -44,6 +44,7 @@ class DMVLicense(Base, AuditMixin):
         "Driver",
         back_populates="dmv_license",
         foreign_keys="Driver.dmv_license_number_id",
+        uselist=False
     )
 
     def to_dict(self):
@@ -95,6 +96,7 @@ class TLCLicense(Base, AuditMixin):
         "Driver",
         back_populates="tlc_license",
         foreign_keys="Driver.tlc_license_number_id",
+        uselist=False
     )
 
     def to_dict(self):
@@ -278,11 +280,11 @@ class Driver(Base, AuditMixin):
     )
 
     tlc_license = relationship(
-        "TLCLicense", back_populates="driver", foreign_keys=[tlc_license_number_id]
+        "TLCLicense", back_populates="driver", foreign_keys=[tlc_license_number_id] , uselist=False
     )
 
     dmv_license = relationship(
-        "DMVLicense", back_populates="driver", foreign_keys=[dmv_license_number_id]
+        "DMVLicense", back_populates="driver", foreign_keys=[dmv_license_number_id] , uselist=False
     )
 
     lease_drivers = relationship("LeaseDriver", back_populates="driver")

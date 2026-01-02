@@ -21,10 +21,13 @@ class EZPassTransactionResponse(BaseModel):
     transaction_time: time = None
     medallion_no: Optional[str] = None
     driver_id: Optional[str] = None
+    driver_name: Optional[str] = None
+    lease_id: Optional[int] = None
     plate_number: str = Field(..., alias="tag_or_plate")
     posting_date: Optional[datetime] = None
     status: str = None
     total_amount: Decimal = Field(..., alias="amount")
+    ledger_balance: Optional[Decimal] = None
     vin: Optional[str] = None
     ezpass_class: Optional[str] = None
     
@@ -68,6 +71,7 @@ class ReassignRequest(BaseModel):
     new_lease_id: int
     new_medallion_id: Optional[int] = None
     new_vehicle_id: Optional[int] = None
+    reason: Optional[str] = None
 
 
 class BulkOperationResponse(BaseModel):

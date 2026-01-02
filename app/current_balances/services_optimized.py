@@ -639,7 +639,7 @@ class CurrentBalancesServiceOptimized:
             )
             .filter(
                 LedgerBalance.lease_id.in_(lease_ids),
-                LedgerBalance.category == PostingCategory.MISC,
+                LedgerBalance.category.in_([PostingCategory.MISCELLANEOUS_EXPENSE, PostingCategory.MISCELLANEOUS_CREDIT]),
                 LedgerBalance.status == BalanceStatus.OPEN,
                 LedgerBalance.created_on >= week_start,
                 LedgerBalance.created_on <= week_end

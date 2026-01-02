@@ -36,8 +36,10 @@ from app.utils.docusign_utils import Signer, docusign_client
 from app.utils.general import generate_random_6_digit
 from app.utils.lambda_utils import LambdaInvocationError
 from app.utils.logger import get_logger
+from app.utils.s3_utils import s3_utils
 from app.vehicles.schemas import VehicleStatus
 from app.vehicles.services import vehicle_service
+from app.utils.email_service import send_templated_email
 
 # Deposit management imports
 from decimal import Decimal
@@ -1556,6 +1558,8 @@ def complete_lease(db, case_no, step_data):
                         raise ValueError(
                             "Lease Documents have not been fully signed yet."
                         )
+        primary_driver_found = False
+        primary_driver = None
 
         for lease_driver in lease_drivers:
             if not lease_driver or not lease_driver.is_active:
@@ -1565,6 +1569,10 @@ def complete_lease(db, case_no, step_data):
 
             if not driver:
                 raise ValueError("No driver found with this lease")
+            
+            if lease_driver.is_additional_driver is False:
+                primary_driver_found = True
+                primary_driver = driver
 
             driver = driver_service.upsert_driver(
                 db, {"id": driver.id, "driver_status": DriverStatus.ACTIVE}
@@ -1596,6 +1604,73 @@ def complete_lease(db, case_no, step_data):
             db, {"id": lease.id, "lease_status": LeaseStatus.ACTIVE, "is_active": True}
         )
 
+        lease_confis = lease.lease_configuration
+        lease_amount = 0
+
+        if lease_confis:
+            config = config = next(
+                (c for c in lease_confis if c.lease_breakup_type == "lease_amount"),
+                None
+            )
+            if config and config.lease_limit:
+                lease_amount = float(config.lease_limit)
+
+        documents = None
+        if lease.lease_driver:
+            documents = lease_service.fetch_latest_driver_document_status_by_lease(
+                db, lease=lease
+            )
+
+        import mimetypes
+
+        attachments = []
+
+        if documents:
+            for document in documents:
+                document_path = document.get("document_path")
+                if not document_path:
+                    continue
+
+                content = s3_utils.download_file(document_path)
+
+                filename = document_path.split("/")[-1]
+
+                mime_type, _ = mimetypes.guess_type(filename)
+                if not mime_type:
+                    mime_type = "application/octet-stream"
+
+                attachments.append({
+                    "filename": filename,
+                    "content": content,
+                    "mime_type": mime_type,
+                })
+
+
+        template_data = {
+            "DriverFirstName": primary_driver.first_name if primary_driver else "",
+            "DriverLastName": primary_driver.last_name if primary_driver else "",
+            "LeaseType": (lease.lease_type).upper().replace("_", " "),
+            "MedallionNumber": lease.medallion.medallion_number if lease.medallion else "",
+            "VehiclePlate": vehicle.registrations[0].plate_number if vehicle.registrations else "",
+            "LeaseStartDate": lease.lease_start_date.isoformat() if lease.lease_start_date else "",
+            "LeaseEndDate": lease.lease_end_date.isoformat() if lease.lease_end_date else "",
+            "LeaseAmount": f"${lease_amount:,.2f}",
+            "recipient": "DRIVER"
+        }
+
+        success = send_templated_email(
+                            to_emails=[driver.email_address],
+                            subject_template=settings.lease_creation_welcome_subject_template,
+                            template_s3_key=settings.lease_creation_welcome_template,
+                            template_data=template_data,
+                            attachments=attachments
+                        )
+        
+        if success:
+            logger.info(f"Lease completion email sent to driver {primary_driver.full_name} ({primary_driver.email_address}) for lease {lease.lease_id}")
+        else:
+            logger.error(f"Failed to send lease completion email to driver {primary_driver.full_name} ({primary_driver.email_address}) for lease {lease.lease_id}")
+            
         # Create audit trail for lease completion
         case = bpm_service.get_case_obj(db, case_no=case_no)
         driver_count = len([ld for ld in lease_drivers if ld.is_active])

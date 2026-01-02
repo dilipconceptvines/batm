@@ -11,6 +11,7 @@ from sqlalchemy import desc
 # Local imports
 from app.drivers.models import Driver, TLCLicense, DMVLicense
 from app.leases.models import LeaseDriver, Lease
+from app.leases.schemas import LeaseStatus
 from app.entities.models import Address , BankAccount
 from app.drivers.schemas import DriverStatus
 from app.uploads.models import Document
@@ -368,10 +369,10 @@ def get_formatted_drivers(drivers: List[Driver], db: Session , is_additional_dri
             lease_data = [
                 ld.lease.to_dict()
                 for ld in lease_drivers
-                if ld.is_additional_driver == val
+                if ld.is_additional_driver == val and ld.lease.lease_status == LeaseStatus.ACTIVE.value
             ]
         else:
-            lease_data = [ld.lease.to_dict() for ld in lease_drivers]
+            lease_data = [ld.lease.to_dict() for ld in lease_drivers if ld.lease.lease_status == LeaseStatus.ACTIVE.value]
 
         drivers_list.append({
             "driver_details": {

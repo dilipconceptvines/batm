@@ -143,7 +143,8 @@ class InterimPaymentPdfService:
                     'EZPASS': 'EZPass Tolls',
                     'PVB': 'PVB Violations',
                     'TLC': 'TLC Tickets',
-                    'MISC': 'Miscellaneous Payments',
+                    'MISCELLANEOUS_EXPENSE': 'Miscellaneous Expenses',
+                    'MISCELLANEOUS_CREDIT': 'Miscellaneous Credits',
                     'TAXES': 'Taxes'
                 }
                 

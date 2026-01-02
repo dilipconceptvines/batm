@@ -55,6 +55,10 @@ def parse_vehicle_hackup_information(db: Session, df: pd.DataFrame):
                 logger.warning("No vehicle found for VIN: %s. Skipping.", vehicle_vin)
                 continue
 
+            if not medallion:
+                logger.warning("No medallion found for vehicle with VIN: %s. Skipping.", vehicle_vin)
+                continue
+
             vehicle_id = vehicle.id
 
             # Check if vehicle hackup already exists

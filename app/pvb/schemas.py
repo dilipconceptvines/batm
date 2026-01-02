@@ -24,6 +24,7 @@ class PVBViolationResponse(BaseModel):
     # Fields that get populated after association
     medallion_no: Optional[str] = None
     driver_id: Optional[str] = None
+    driver_name: Optional[str] = None
     lease_id: Optional[str] = None
     vin: Optional[str] = None
     
@@ -36,6 +37,7 @@ class PVBViolationResponse(BaseModel):
     reduction: Optional[Decimal] = None
     processing_fee: Optional[Decimal] = None
     amount: Optional[Decimal] = None
+    ledger_balance: Optional[Decimal] = None
     failure_reason: Optional[str] = None
     violation_code: Optional[str] = None
     violation_country: Optional[str] = None
@@ -101,6 +103,7 @@ class PVBReassignRequest(BaseModel):
     new_lease_id: int
     new_medallion_id: Optional[int] = None
     new_vehicle_id: Optional[int] = None
+    reason: Optional[str] = None
 
 
 class PVBManualAssociateRequest(BaseModel):

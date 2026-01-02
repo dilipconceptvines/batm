@@ -70,7 +70,7 @@ def list_ezpass_transactions(
     # Sorting
     sort_by: Optional[str] = Query(
         "transaction_datetime",
-        description="Field to sort by (transaction_datetime, transaction_id, plate_number, posting_date, amount, status, entry_plaza, exit_plaza, agency)."
+        description="Field to sort by (transaction_datetime, transaction_id, plate_number, posting_date, amount, status, entry_plaza, exit_plaza, driver_name, lease_id, ledger_balance)."
     ),
     sort_order: str = Query("desc", enum=["asc", "desc"], description="Sort order."),
     
@@ -148,6 +148,24 @@ def list_ezpass_transactions(
     driver_id: Optional[str] = Query(
         None,
         description="Filter by driver ID (comma-separated for multiple, supports partial match)."
+    ),
+    driver_name: Optional[str] = Query(
+        None,
+        description="Filter by driver name (comma-separated for multiple, supports partial match)."
+    ),
+    lease_id: Optional[str] = Query(
+        None,
+        description="Filter by lease ID (comma-separated for multiple, supports partial match)."
+    ),
+    from_ledger_balance: Optional[Decimal] = Query(
+        None,
+        ge=0,
+        description="Filter from ledger balance (inclusive)."
+    ),
+    to_ledger_balance: Optional[Decimal] = Query(
+        None,
+        ge=0,
+        description="Filter to ledger balance (inclusive)."
     ),
     status: Optional[str] = Query(
         None,
@@ -248,6 +266,10 @@ def list_ezpass_transactions(
             vin=vin,
             medallion_no=medallion_no,
             driver_id=driver_id,
+            driver_name=driver_name,
+            lease_id=lease_id,
+            from_ledger_balance=from_ledger_balance,
+            to_ledger_balance=to_ledger_balance,
             status=status,
             agency=agency,
             ezpass_class=ezpass_class,
@@ -269,6 +291,9 @@ def list_ezpass_transactions(
                 ),
                 vin=t.vehicle.vin if t.vehicle else None,
                 driver_id=t.driver.driver_id if t.driver else None,
+                driver_name=t.driver.full_name if t.driver else None,
+                lease_id=t.lease_id,
+                ledger_balance=None,  # TODO: Calculate total outstanding balance for driver/lease
                 tag_or_plate=t.tag_or_plate,
                 posting_date=t.posting_date,
                 status=t.status.value if t.status else None,
@@ -472,17 +497,24 @@ def reassign_ezpass_transactions(
     - Handle mid-lease driver changes
     
     **Restrictions:**
-    - Cannot reassign transactions already POSTED_TO_LEDGER
     - New lease must be an active lease
     - New lease must belong to the specified new driver (valid primary driver)
     - Both new driver and new lease must exist in the system
+    - All entries in bulk must originate from exactly one source lease
+    - Source entries must have valid driver/lease associations
     
     **Process:**
-    1. Validates new driver and new lease exist
-    2. Verifies new lease belongs to new driver
-    3. Updates transaction with new associations
-    4. Sets status to ASSOCIATED
-    5. Clears any previous failure_reason
+    1. Validates source entries have valid associations
+    2. Validates bulk source consistency (all from same lease)
+    3. Validates new driver and new lease exist
+    4. Verifies new lease belongs to new driver
+    5. Updates transaction associations and performs ledger operations as needed
+    6. Creates complete audit trail records
+    
+    **Supported Statuses:**
+    - IMPORTED: Simple association update
+    - ASSOCIATION_FAILED: Association update, status changed to IMPORTED
+    - POSTED_TO_LEDGER: Full financial responsibility reconstruction with ledger reversal/reposting
     
     **Use Cases:**
     - Driver X was incorrectly associated → reassign to correct Driver Y
@@ -495,7 +527,9 @@ def reassign_ezpass_transactions(
             new_driver_id=request.new_driver_id,
             new_lease_id=request.new_lease_id,
             new_medallion_id=request.new_medallion_id,
-            new_vehicle_id=request.new_vehicle_id
+            new_vehicle_id=request.new_vehicle_id,
+            user_id=current_user.id,
+            reason=request.reason
         )
         return JSONResponse(content=result, status_code=fast_status.HTTP_200_OK)
     except EZPassError as e:

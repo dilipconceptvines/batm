@@ -141,7 +141,10 @@ class PVBRepository:
         lease_id: Optional[str] = None,
         vin: Optional[str] = None,
         driver_id: Optional[str] = None,
+        driver_name: Optional[str] = None,
         medallion_no: Optional[str] = None,
+        from_ledger_balance: Optional[float] = None,
+        to_ledger_balance: Optional[float] = None,
         status: Optional[str] = None,
         source: Optional[str] = None,
         violation_code: Optional[str] = None,
@@ -251,6 +254,17 @@ class PVBRepository:
         if driver_id:
             query = apply_multi_filter(query, Driver.driver_id, driver_id)
 
+        if driver_name:
+            query = apply_multi_filter(query, Driver.full_name, driver_name)
+
+        if from_ledger_balance is not None:
+            # TODO: Implement ledger balance filtering once balance calculation is available
+            pass
+
+        if to_ledger_balance is not None:
+            # TODO: Implement ledger balance filtering once balance calculation is available
+            pass
+
         if medallion_no:
             query = apply_multi_filter(query, Medallion.medallion_number, medallion_no)
 
@@ -293,6 +307,7 @@ class PVBRepository:
             "issue_datetime": PVBViolation.issue_date,
             "medallion_no": Medallion.medallion_number,
             "driver_id": Driver.driver_id,
+            "driver_name": Driver.full_name,
             "lease_id": Lease.lease_id,
             "vin": Vehicle.vin,
             "status": PVBViolation.status,

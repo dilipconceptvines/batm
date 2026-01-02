@@ -15,8 +15,8 @@ from datetime import datetime
 from celery import chain
 from celery.result import AsyncResult
 
-from app.worker.app import app
-from app.utils.logger import get_logger
+from app.driver_payments.tasks import generate_weekly_dtrs_task
+from app.dtr.tasks import send_weekly_dtr_emails_task  # NEW IMPORT
 
 # Import all the individual task functions
 from app.leases.tasks import post_weekly_lease_fees_task
@@ -24,7 +24,9 @@ from app.loans.tasks import post_due_loan_installments_task
 from app.repairs.tasks import post_due_repair_installments_task
 from app.driver_payments.tasks import generate_weekly_dtrs_task
 from app.pvb.tasks import post_pvb_violations_to_ledger_task
-from app.dtr.tasks import send_weekly_dtr_emails_task  # NEW IMPORT
+from app.repairs.tasks import post_due_repair_installments_task
+from app.utils.logger import get_logger
+from app.worker.app import app
 
 logger = get_logger(__name__)
 
@@ -49,10 +51,10 @@ def sunday_financial_processing_chain():
     Returns:
         Chain result ID for monitoring
     """
-    logger.info("="*80)
+    logger.info("=" * 80)
     logger.info("SUNDAY FINANCIAL PROCESSING CHAIN STARTED")
     logger.info("Triggered on", datetime=datetime.now().isoformat())
-    logger.info("="*80)
+    logger.info("=" * 80)
 
     # Create the sequential chain
     # .s() creates a signature (immutable) - each task runs independently
@@ -72,7 +74,7 @@ def sunday_financial_processing_chain():
 
     logger.info("Chain dispatched with root task ID", result_id=result.id)
     logger.info("Monitor chain progress using this ID")
-    logger.info("="*80)
+    logger.info("=" * 80)
 
     return {
         "chain_id": result.id,
@@ -84,8 +86,8 @@ def sunday_financial_processing_chain():
             "post_due_loan_installments_task",
             "post_due_repair_installments_task",
             "generate_weekly_dtrs_task",
-            "send_weekly_dtr_emails_task"  # NEW TASK
-        ]
+            "send_weekly_dtr_emails_task",  # NEW TASK
+        ],
     }
 
 
@@ -94,15 +96,12 @@ def log_chain_completion():
     """
     Final task in the chain to log successful completion.
     """
-    logger.info("="*80)
+    logger.info("=" * 80)
     logger.info("SUNDAY FINANCIAL PROCESSING CHAIN COMPLETED SUCCESSFULLY")
     logger.info(f"Completed on: {datetime.now().isoformat()}")
-    logger.info("="*80)
+    logger.info("=" * 80)
 
-    return {
-        "status": "completed",
-        "end_time": datetime.now().isoformat()
-    }
+    return {"status": "completed", "end_time": datetime.now().isoformat()}
 
 
 @app.task(name="worker.check_chain_status")
@@ -123,7 +122,7 @@ def check_chain_status(chain_id: str):
         "status": result.status,
         "ready": result.ready(),
         "successful": result.successful() if result.ready() else None,
-        "failed": result.failed() if result.ready() else None
+        "failed": result.failed() if result.ready() else None,
     }
 
     if result.ready():
