@@ -47,6 +47,14 @@ class RepairRepository:
     def get_invoice_by_repair_id(self, repair_id: str) -> Optional[RepairInvoice]:
         """Fetches a single repair invoice by the system-generated Repair ID."""
         return self.db.query(RepairInvoice).filter(RepairInvoice.repair_id == repair_id).first()
+    
+    def get_invoice_by_invoice_number(self, invoice_number: str) -> Optional[RepairInvoice]:
+        """Fetches a single repair invoice by the invoice number."""
+        return self.db.query(RepairInvoice).filter(RepairInvoice.invoice_number == invoice_number).first()
+    
+    def get_invoice_by_case_no(self, case_no: str) -> Optional[RepairInvoice]:
+        """Fetches a single repair invoice by the case number."""
+        return self.db.query(RepairInvoice).filter(RepairInvoice.case_no == case_no).first()
 
     def get_last_repair_id_for_year(self, year: int) -> Optional[str]:
         """Finds the last used repair_id for a given year to determine the next sequence number."""
@@ -209,12 +217,16 @@ class RepairRepository:
             "amount": RepairInvoice.total_amount,
         }
         
-        sort_column = sort_column_map.get(sort_by, RepairInvoice.invoice_date)
-        if sort_order.lower() == "desc":
-            query = query.order_by(sort_column.desc())
+        if sort_by and sort_order:
+            sort_column = sort_column_map.get(sort_by, RepairInvoice.invoice_date)
+            if sort_order.lower() == "desc":
+                query = query.order_by(sort_column.desc())
+            else:
+                query = query.order_by(sort_column.asc())
         else:
-            query = query.order_by(sort_column.asc())
+            query = query.order_by(RepairInvoice.updated_on.desc() , RepairInvoice.created_on.desc())
 
+        # Apply pagination
         query = query.offset((page - 1) * per_page).limit(per_page)
 
         return query.all(), total_items

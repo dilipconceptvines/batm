@@ -47,7 +47,7 @@ class LedgerPostingResponse(LedgerPostingBase):
     """Detailed response for a single Ledger Posting, matching UI."""
 
     driver_name: Optional[str] = None
-    lease_id: Optional[int] = None
+    lease_id: Optional[str] = None
     vehicle_vin: Optional[str] = None
     medallion_no: Optional[str] = None
 
@@ -56,7 +56,7 @@ class LedgerBalanceResponse(LedgerBalanceBase):
     """Detailed response for a single Ledger Balance, matching UI."""
 
     driver_name: Optional[str] = None
-    lease_id: Optional[int] = None
+    lease_id: Optional[str] = None
     vehicle_vin: Optional[str] = None
 
 

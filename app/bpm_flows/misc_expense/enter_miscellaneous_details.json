@@ -45,14 +45,25 @@
       "minLength": 1,
       "maxLength": 100,
       "enum": [
-        "Cleaning",
-        "Lost Key",
-        "Damage Fee",
-        "Late Fee",
-        "Documentation Fee",
+        "Wheel Alignment",
+        "Gas",
+        "Tires - (Used)",
+        "Tires - (New)",
+        "Lost Time - (Repair)",
+        "Lost Time - (TLC Inspection)",
+        "Mile Run",
         "Towing",
-        "Maintenance",
-        "Other"
+        "Car Wash",
+        "Decals/Stickers",
+        "Lease Credit",
+        "Manual Trips",
+        "Other",
+        "Keys",
+        "Wheel Chair Ramp",
+        "Wheel Chair Belt",
+        "Chargebacks",
+        "Confiscated Car Fee",
+        "Reinspection Fee"
       ]
     },
     "amount": {

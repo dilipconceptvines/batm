@@ -276,34 +276,45 @@ def list_ezpass_transactions(
         )
 
         # Transform to response schema
-        response_items = [
-            EZPassTransactionResponse(
-                id=t.id,
-                transaction_id=t.transaction_id,
-                transaction_date=t.transaction_datetime,
-                transaction_time=t.transaction_datetime.time() if t.transaction_datetime else None,
-                entry_plaza=t.entry_plaza,
-                exit_plaza=t.exit_plaza,
-                ezpass_class=t.ezpass_class,
-                medallion_no=(
-                    t.medallion.medallion_number if t.medallion 
-                    else (t.vehicle.medallions.medallion_number if t.vehicle and hasattr(t.vehicle, 'medallions') and t.vehicle.medallions else "")
-                ),
-                vin=t.vehicle.vin if t.vehicle else None,
-                driver_id=t.driver.driver_id if t.driver else None,
-                driver_name=t.driver.full_name if t.driver else None,
-                lease_id=t.lease_id,
-                ledger_balance=None,  # TODO: Calculate total outstanding balance for driver/lease
-                tag_or_plate=t.tag_or_plate,
-                posting_date=t.posting_date,
-                status=t.status.value if t.status else None,
-                amount=t.amount,
-                failure_reason=t.failure_reason,
-                agency=t.agency,
-                created_on=t.created_on
+        response_items = []
+        for t in transactions:
+            # Get ledger balance for this transaction if it's posted
+            ledger_balance = None
+            if t.transaction_id:
+                try:
+                    balance_record = ezpass_service.ledger_repo.get_balance_by_reference_id(t.transaction_id)
+                    if balance_record:
+                        ledger_balance = float(balance_record.balance)
+                except Exception as e:
+                    logger.debug(f"No ledger balance found for transaction {t.transaction_id}: {e}")
+            
+            response_items.append(
+                EZPassTransactionResponse(
+                    id=t.id,
+                    transaction_id=t.transaction_id,
+                    transaction_date=t.transaction_datetime,
+                    transaction_time=t.transaction_datetime.time() if t.transaction_datetime else None,
+                    entry_plaza=t.entry_plaza,
+                    exit_plaza=t.exit_plaza,
+                    ezpass_class=t.ezpass_class,
+                    medallion_no=(
+                        t.medallion.medallion_number if t.medallion 
+                        else (t.vehicle.medallions.medallion_number if t.vehicle and hasattr(t.vehicle, 'medallions') and t.vehicle.medallions else "")
+                    ),
+                    vin=t.vehicle.vin if t.vehicle else None,
+                    driver_id=t.driver.driver_id if t.driver else None,
+                    driver_name=t.driver.full_name if t.driver else None,
+                    lease_id=t.lease.lease_id if t.lease else None,
+                    ledger_balance=ledger_balance,
+                    tag_or_plate=t.tag_or_plate,
+                    posting_date=t.posting_date,
+                    status=t.status.value if t.status else None,
+                    amount=t.amount,
+                    failure_reason=t.failure_reason,
+                    agency=t.agency,
+                    created_on=t.created_on
+                )
             )
-            for t in transactions
-        ]
 
         total_pages = math.ceil(total_items / per_page) if per_page > 0 else 0
 

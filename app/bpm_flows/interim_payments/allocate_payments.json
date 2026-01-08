@@ -29,15 +29,16 @@
           },
           "category": {
             "type": "string",
-            "description": "Category of the obligation being paid (Note: Interim payments cannot be applied to TAXES per specification)",
+            "description": "Category of the obligation being paid",
             "enum": [
               "LEASE", 
-              "REPAIRS", 
-              "LOANS", 
+              "REPAIR", 
+              "LOAN", 
               "EZPASS", 
               "PVB", 
               "TLC", 
-              "MISC"
+              "TAXES", 
+              "MISCELLANEOUS_EXPENSE"
             ],
             "examples": ["LEASE", "REPAIRS", "EZPASS", "PVB"]
           },

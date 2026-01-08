@@ -22,6 +22,13 @@ class VehicleStatus(str, PyEnum):
     ARCHIVED = "Archived"
     DE_HACK_UP_IN_PROGRESS = "De Hack-up In Progress"
 
+class VehicleType(str, PyEnum):
+    """All the vehicle types in the system"""
+    NonWavHybrid = "Non-WAV Hybrid"
+    NonWavGas = "Non-WAV Gas"
+    WavHybrid = "WAV Hybrid"
+    WavGas = "WAV Gas"
+
 
 class HackupStatus(str, PyEnum):
     """All the vehicle hackup statuses in the system"""
@@ -303,10 +310,11 @@ class VehicleLocation(str, PyEnum):
     BAT_GARAGE = "DSW Auto Repair (BAT Garage)"
     PARKING_LOT_1 = "Parking Lot 1"
     PARKING_LOT_2 = "Parking Lot 2"
-    HACKUP_VENDOR_A = "Hack-Up Vendor A"
-    HACKUP_VENDOR_B = "Hack-Up Vendor B"
-    HACKUP_VENDOR_C = "Hack-Up Vendor C"
-    HACKUP_VENDOR_D = "Hack-Up Vendor D"
+    MAACO = "Maaco"
+    METRO_SHOP = "Metro Shop"
+    TAXICAB_PRODUCTS = "Taxicab Products"
+    HUDSON_TOYOTA ="Hudson Toyota"
+    HILLSIDE_TOYOTA ="Hillside Toyota"
     OTHER = "Other"
 
 

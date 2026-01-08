@@ -17,6 +17,7 @@ import app.dtr.models
 import app.entities.models
 import app.esign.models
 import app.ezpass.models
+import app.exports.models  # Import export models
 import app.interim_payments.models
 import app.leases.models
 import app.ledger.models
@@ -45,6 +46,7 @@ from app.dtr.router import router as dtr_routes
 from app.entities.router import router as entity_routes
 from app.esign.router import router as esign_routes
 from app.ezpass.router import router as ezpass_routes
+from app.exports.router import router as exports_routes  # Import exports router
 from app.interim_payments.router import router as interim_payment_routes
 from app.leases.router import router as lease_routes
 
@@ -63,14 +65,21 @@ from app.uploads.router import router as upload_routes
 from app.users.router import router as user_routes
 from app.utils.logger import get_logger, setup_app_logging
 from app.vehicles.router import router as vehicle_routes
+from app.seeder_loader.router import router as data_loader_routes
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Method for importing all the bpm flows
+    Lifespan context manager for app startup and shutdown tasks
     """
+    # Import BPM flows
     import_bpm_flows()
+
+    # Import and register parsers
+    from app.seeder_loader.parser_registry import import_parsers
+    import_parsers()
+
     yield
 
 
@@ -140,6 +149,8 @@ bat_app.include_router(driver_payments_routes)
 bat_app.include_router(dtr_routes)
 bat_app.include_router(current_balances_routes)
 bat_app.include_router(deposits_routes)
+bat_app.include_router(data_loader_routes)
+bat_app.include_router(exports_routes)  # Add exports router
 
 
 # Root API to check if the server is up

@@ -210,39 +210,51 @@ def list_pvb_violations(
             to_reduce_to=to_reduce_to
         )
 
-        response_items = [
-            PVBViolationResponse(
-                id=v.id,
-                plate=v.plate,
-                state=v.state,
-                type=v.type,
-                summons=v.summons,
-                source=v.source,    
-                issue_datetime = datetime.combine(v.issue_date, v.issue_time) if v.issue_time and v.issue_date else None,
-                vin= v.vehicle.vin if v.vehicle else None,
-                lease_id=v.lease.lease_id if v.lease else None,
-                medallion_no=v.medallion.medallion_number if v.medallion else None,
-                driver_id=v.driver.driver_id if v.driver else None,
-                driver_name=v.driver.full_name if v.driver else None,
-                posting_date=v.posting_date,
-                status=v.status,
-                amount=v.amount_due,
-                fine=v.fine,
-                penalty=v.penalty,
-                interest=v.interest,
-                reduction=v.reduction,
-                processing_fee=v.processing_fee,
-                ledger_balance=None,  # TODO: Calculate total outstanding balance for driver/lease
-                failure_reason=v.failure_reason,
-                violation_code= v.violation_code,
-                violation_country= v.violation_country,
-                street_name = v.street_name,
-                disposition = v.disposition,
-                disposition_change_date = v.disposition_change_date,
-                note = v.note,
-                reduce_by = v.reduce_to
-            ) for v in violations
-        ]
+        response_items = []
+        for v in violations:
+            # Get ledger balance for this violation if it's posted
+            ledger_balance = None
+            if v.summons:
+                try:
+                    balance_record = pvb_service.ledger_repo.get_balance_by_reference_id(v.summons)
+                    if balance_record:
+                        ledger_balance = float(balance_record.balance)
+                except Exception as e:
+                    logger.debug(f"No ledger balance found for violation {v.summons}: {e}")
+            
+            response_items.append(
+                PVBViolationResponse(
+                    id=v.id,
+                    plate=v.plate,
+                    state=v.state,
+                    type=v.type,
+                    summons=v.summons,
+                    source=v.source,    
+                    issue_datetime = datetime.combine(v.issue_date, v.issue_time) if v.issue_time and v.issue_date else None,
+                    vin= v.vehicle.vin if v.vehicle else None,
+                    lease_id=v.lease.lease_id if v.lease else None,
+                    medallion_no=v.medallion.medallion_number if v.medallion else None,
+                    driver_id=v.driver.driver_id if v.driver else None,
+                    driver_name=v.driver.full_name if v.driver else None,
+                    posting_date=v.posting_date,
+                    status=v.status,
+                    amount=v.amount_due,
+                    fine=v.fine,
+                    penalty=v.penalty,
+                    interest=v.interest,
+                    reduction=v.reduction,
+                    processing_fee=v.processing_fee,
+                    ledger_balance=ledger_balance,
+                    failure_reason=v.failure_reason,
+                    violation_code= v.violation_code,
+                    violation_country= v.violation_country,
+                    street_name = v.street_name,
+                    disposition = v.disposition,
+                    disposition_change_date = v.disposition_change_date,
+                    note = v.note,
+                    reduce_by = v.reduce_to
+                )
+            )
         
         total_pages = math.ceil(total_items / per_page) if per_page > 0 else 0
 

@@ -50,6 +50,7 @@ class RepairInvoice(Base, AuditMixin):
     repair_id: Mapped[str] = mapped_column(String(50), unique=True, index=True, comment="System-generated unique internal ID for the repair (e.g., RPR-YYYY-#####).")
     invoice_number: Mapped[str] = mapped_column(String(255), index=True, comment="Actual invoice number from the workshop.")
     invoice_date: Mapped[date] = mapped_column(Date)
+    case_no: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     
     # --- Entity Links ---
     driver_id: Mapped[int] = mapped_column(Integer, ForeignKey("drivers.id"), index=True)

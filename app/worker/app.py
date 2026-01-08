@@ -22,6 +22,7 @@ import app.leases.models
 import app.medallions.models
 import app.users.models
 import app.vehicles.models
+import app.exports.models  # Import export models
 from app.notifications.registry import import_notification_jobs
 
 # Import all the notification jobs
@@ -48,6 +49,7 @@ app.autodiscover_tasks(
         "app.driver_payments",
         "app.leases",
         "app.drivers",
+        "app.exports",  # Added for async export tasks
         "app.notifications",
     ]
 )

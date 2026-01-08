@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 from io import BytesIO
 
 from jinja2 import Environment, FileSystemLoader
-from sqlalchemy import func, or_, case
+from sqlalchemy import func, or_, and_, case
 from sqlalchemy.orm import Session
 
 # Try importing WeasyPrint for PDF generation
@@ -109,8 +109,8 @@ class DTRPdfService:
 
         total = self.db.query(func.sum(CurbTrip.total_amount)).filter(
             CurbTrip.driver_id.in_(driver_ids),
-            CurbTrip.start_time >= start_dt,
-            CurbTrip.end_time <= end_dt,
+            CurbTrip.transaction_date >= start_dt,
+            CurbTrip.transaction_date <= end_dt,
             CurbTrip.payment_type == PaymentType.CREDIT_CARD
         ).scalar() or Decimal("0.00")
         
@@ -119,6 +119,10 @@ class DTRPdfService:
     def _get_tax_breakdown(self, dtr: DTR, driver_ids: List[int]) -> Dict[str, Any]:
         """
         Aggregates tax components (MTA, TIF, etc.) from CURB trips for specific drivers.
+        
+        Date criteria:
+        - Credit card trips: transaction_date within period
+        - Cash trips: start_time and end_time within period
         """
         start_dt = datetime.combine(dtr.week_start_date, datetime.min.time())
         end_dt = datetime.combine(dtr.week_end_date, datetime.max.time())
@@ -131,8 +135,20 @@ class DTRPdfService:
                 func.sum(case((CurbTrip.payment_type == PaymentType.CREDIT_CARD, 1), else_=0))
             ).filter(
                 CurbTrip.driver_id.in_(driver_ids),
-                CurbTrip.start_time >= start_dt,
-                CurbTrip.end_time <= end_dt,
+                or_(
+                    # Credit card trips: by transaction_date
+                    and_(
+                        CurbTrip.payment_type == PaymentType.CREDIT_CARD,
+                        CurbTrip.transaction_date >= start_dt,
+                        CurbTrip.transaction_date <= end_dt
+                    ),
+                    # Cash trips: by start_time and end_time
+                    and_(
+                        CurbTrip.payment_type == PaymentType.CASH,
+                        CurbTrip.start_time >= start_dt,
+                        CurbTrip.end_time <= end_dt
+                    )
+                ),
                 tax_column > 0
             ).first()
 
@@ -307,8 +323,8 @@ class DTRPdfService:
 
         trips = self.db.query(CurbTrip).filter(
             CurbTrip.driver_id.in_(driver_ids),
-            CurbTrip.start_time >= start_dt,
-            CurbTrip.end_time <= end_dt,
+            CurbTrip.start_time >= start_dt,  # ✅ CORRECT
+            CurbTrip.start_time <= end_dt,    # ✅ Changed for consistency
             CurbTrip.payment_type == PaymentType.CREDIT_CARD
         ).order_by(CurbTrip.start_time.asc()).all()
 

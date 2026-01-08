@@ -237,6 +237,7 @@ def get_driver_loan_details(
             notes=loan.notes,
             installments=installment_list,
             receipt_url=receipt_url,  # NEW: Include receipt URL
+            lease_id=loan.lease.lease_id if loan.lease else None
         )
     except HTTPException:
         raise

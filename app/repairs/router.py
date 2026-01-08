@@ -22,6 +22,8 @@ from app.repairs.schemas import (
     RepairInstallmentStatus,
     RepairInstallmentListResponse,
     PaginatedRepairInstallmentResponse,
+    RepairCalculationRequest,
+    RepairCalculationResponse,
 )
 from app.repairs.models import RepairInstallment , RepairInvoice
 from app.repairs.services import RepairService
@@ -48,8 +50,8 @@ def get_repair_service(db: Session = Depends(get_db)) -> RepairService:
 def list_repair_invoices(
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=100),
-    sort_by: Optional[str] = Query("date"),
-    sort_order: str = Query("desc", enum=["asc", "desc"]),
+    sort_by: Optional[str] = Query(None),
+    sort_order: Optional[str] = Query(None),
     repair_id: Optional[str] = Query(None),
     invoice_number: Optional[str] = Query(None),
     from_invoice_date: Optional[date] = Query(None),
@@ -139,6 +141,29 @@ def create_repair_invoice_case(
     except Exception as e:
         logger.error("Error creating repair invoice case: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Could not start a new repair invoice case.") from e
+
+
+@router.post("/calculate-installments", response_model=RepairCalculationResponse, summary="Calculate Repair Installments")
+def calculate_repair_installments(
+    request: RepairCalculationRequest,
+    repair_service: RepairService = Depends(get_repair_service),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Calculates the weekly installment schedule based on total amount and start week.
+    This does NOT create any database records.
+    """
+    try:
+        result = repair_service.calculate_payment_schedule(
+            total_amount=request.total_amount,
+            start_week=request.start_week
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Error calculating repair installments: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during calculation.")
 
 
 @router.get("/{repair_id}", response_model=RepairInvoiceDetailResponse, summary="Get Repair Invoice Details")

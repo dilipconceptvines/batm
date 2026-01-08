@@ -318,7 +318,7 @@ def create_repair_invoice_process(db: Session, case_no: str, step_data: Dict[str
             RepairInvoice.invoice_number == step_data["invoice_number"]
         ).first()
         
-        if existing_invoice:
+        if existing_invoice and existing_invoice.case_no != case_no:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invoice number {step_data['invoice_number']} already exists"

@@ -80,12 +80,24 @@ def get_db():
 
     Note: This does NOT automatically set the current user.
     Use get_db_with_current_user from app.core.dependencies instead for automatic audit tracking.
+
+    Supports dry_run mode: Set db.info["dry_run"] = True to rollback instead of commit.
     """
     db = SessionLocal()
     try:
         yield db
-        logger.debug("Committing DB transaction")
-        db.commit()
+
+        # Check if this is a dry run
+        if db.info.get("dry_run", False):
+            logger.debug("Dry run mode - rolling back transaction")
+            db.rollback()
+        else:
+            logger.debug("Committing DB transaction")
+            db.commit()
+    except Exception:
+        logger.error("Error in DB transaction, rolling back")
+        db.rollback()
+        raise
     finally:
         db.close()
 

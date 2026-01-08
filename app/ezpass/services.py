@@ -9,6 +9,7 @@ from typing import List, Optional, Dict
 from sqlalchemy.orm import Session
 
 from app.audit_trail.services import audit_trail_service
+from app.audit_trail.schemas import AuditTrailType
 from app.ezpass.exceptions import (
     AssociationError,
     CSVParseError,
@@ -704,34 +705,30 @@ class EZPassService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=None,
-                        step_id=None,
                         description=f"EZPass transaction reassigned: {transaction.transaction_id}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id,
-                        vehicle_id=new_vehicle_id or transaction.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=None,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "EZPASS_TRANSACTION",
                             "entry_id": transaction.id,
                             "entry_reference": transaction.transaction_id,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id,
+                            "vehicle_id": new_vehicle_id or transaction.vehicle_id,
+                            "lease_id": new_lease_id,
                             "source_lease_id": transaction.lease_id,
                             "source_driver_id": transaction.driver_id,
                             "target_lease_id": new_lease_id,
                             "target_driver_id": new_driver_id,
                             "reassignment_type": "IMPORTED_STATUS_UPDATE",
-                            "total_payable": None,  # Not applicable for non-posted entries
+                            "total_payable": None,
                             "collected_to_date": None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
 
                     self.associate_and_post_transactions()
@@ -768,34 +765,30 @@ class EZPassService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=None,
-                        step_id=None,
                         description=f"EZPass transaction reassigned: {transaction.transaction_id}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id,
-                        vehicle_id=new_vehicle_id or transaction.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=None,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "EZPASS_TRANSACTION",
                             "entry_id": transaction.id,
                             "entry_reference": transaction.transaction_id,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id,
+                            "vehicle_id": new_vehicle_id or transaction.vehicle_id,
+                            "lease_id": new_lease_id,
                             "source_lease_id": transaction.lease_id,
                             "source_driver_id": transaction.driver_id,
                             "target_lease_id": new_lease_id,
                             "target_driver_id": new_driver_id,
                             "reassignment_type": "ASSOCIATION_FAILED_TO_IMPORTED",
-                            "total_payable": None,  # Not applicable for non-posted entries
+                            "total_payable": None,
                             "collected_to_date": None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
 
                     self.associate_and_post_transactions()
@@ -881,7 +874,7 @@ class EZPassService:
                     # Step 2: Create new posting on new lease (same type as original, full TP)
                     if was_debit:
                         # Repost as obligation (DEBIT) on new lease
-                        new_posting = self.ledger_service.create_obligation(
+                        new_posting, balance = self.ledger_service.create_obligation(
                             category=PostingCategory.EZPASS,
                             amount=total_payable,  # Always use full TP
                             reference_id=transaction.transaction_id,
@@ -938,26 +931,21 @@ class EZPassService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=None,
-                        step_id=None,
                         description=f"EZPass transaction reassigned: {transaction.transaction_id}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id,
-                        vehicle_id=new_vehicle_id or transaction.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=None,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "EZPASS_TRANSACTION",
                             "entry_id": transaction.id,
                             "entry_reference": transaction.transaction_id,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
-                            "vehicle_id": transaction.vehicle_id,
-                            "medallion_id": transaction.medallion_id,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id,
+                            "vehicle_id": new_vehicle_id or transaction.vehicle_id,
+                            "lease_id": new_lease_id,
+                            "source_vehicle_id": transaction.vehicle_id,
+                            "source_medallion_id": transaction.medallion_id,
                             "source_lease_id": transaction.lease_id,
                             "source_driver_id": transaction.driver_id,
                             "target_lease_id": new_lease_id,
@@ -969,7 +957,8 @@ class EZPassService:
                             "new_posting_id": new_posting.id if 'new_posting' in locals() else None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
                 
                 else:

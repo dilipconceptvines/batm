@@ -3,6 +3,7 @@
 import enum
 from decimal import Decimal
 from datetime import datetime
+from typing import TYPE_CHECKING
 from sqlalchemy import (
     Column, Integer, String, Numeric, Date, DateTime, 
     ForeignKey, Enum, Boolean, JSON
@@ -10,13 +11,16 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from app.core.db import Base
 
+if TYPE_CHECKING:
+    from app.vehicles.models import Vehicle
+    from app.medallions.models import Medallion
+
 
 class DTRStatus(str, enum.Enum):
     """DTR Status Values"""
     DRAFT = "DRAFT"  # Pending charges still being posted
     FINALIZED = "FINALIZED"  # All charges confirmed, ready for payment
     PAID = "PAID"  # Payment processed
-
 
 class PaymentMethod(str, enum.Enum):
     """Payment Method Types"""
@@ -127,9 +131,9 @@ class DTR(Base):
     # Relationships
     lease = relationship("Lease", back_populates="dtrs")
     primary_driver = relationship("Driver", foreign_keys=[primary_driver_id], back_populates="dtrs")
-    vehicle = relationship("Vehicle", back_populates="dtrs")
-    medallion = relationship("Medallion", back_populates="dtrs")
-    ach_batch = relationship("app.driver_payments.models.ACHBatch", back_populates="dtrs")
+    vehicle = relationship("Vehicle", back_populates="dtrs", foreign_keys=[vehicle_id], viewonly=True)
+    medallion = relationship("Medallion", back_populates="dtrs", foreign_keys=[medallion_id], viewonly=True)
+    ach_batch = relationship("app.driver_payments.models.ACHBatch", back_populates="dtrs", foreign_keys=[ach_batch_id], viewonly=True)
     
     def __repr__(self):
         return f"<DTR {self.dtr_number} - Lease {self.lease_id} - {self.status}>"

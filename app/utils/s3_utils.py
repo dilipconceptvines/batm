@@ -187,15 +187,59 @@ class S3Utils:
             logger.error(f"An unexpected error occurred in get_file_metadata for key {key}: {e}", exc_info=True)
             return None
         
-    def list_files(self, prefix: str = "") -> list[str]:
+    def list_files(self, prefix: str = "", max_keys: Optional[int] = None, continuation_token: Optional[str] = None) -> Dict[str, Any]:
         """
-        List all files in S3 under a given prefix
+        List files in S3 under a given prefix with optional pagination
+
+        Args:
+            prefix: S3 prefix (folder path) to list files from
+            max_keys: Maximum number of keys to return (for pagination)
+            continuation_token: Token for fetching next page
+
+        Returns:
+            dict: Contains 'keys' (list of S3 keys), 'is_truncated' (bool), and 'next_continuation_token' (str or None)
+        """
+        try:
+            params = {
+                'Bucket': self.bucket_name,
+                'Prefix': prefix
+            }
+
+            if max_keys:
+                params['MaxKeys'] = max_keys
+
+            if continuation_token:
+                params['ContinuationToken'] = continuation_token
+
+            response = self.s3_client.list_objects_v2(**params)
+
+            file_keys = []
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    file_keys.append(obj['Key'])
+
+            return {
+                'keys': file_keys,
+                'is_truncated': response.get('IsTruncated', False),
+                'next_continuation_token': response.get('NextContinuationToken')
+            }
+        except ClientError as e:
+            logger.error(f"Error listing files from S3: {e}", exc_info=True)
+            return {
+                'keys': [],
+                'is_truncated': False,
+                'next_continuation_token': None
+            }
+
+    def list_all_files(self, prefix: str = "") -> list[str]:
+        """
+        List all files in S3 under a given prefix (no pagination limit)
 
         Args:
             prefix: S3 prefix (folder path) to list files from
 
         Returns:
-            list: List of S3 keys (file paths)
+            list: List of all S3 keys (file paths)
         """
         try:
             file_keys = []
@@ -212,5 +256,82 @@ class S3Utils:
             logger.error(f"Error listing files from S3: {e}", exc_info=True)
             return []
         
+
+    def list_folders_with_metadata(self, prefix: str = "", limit: int = 10) -> list[Dict[str, Any]]:
+        """
+        List folders under a prefix with metadata (latest modification date and file count).
+        Returns folders sorted by most recent activity (newest first).
+
+        Args:
+            prefix: S3 prefix (base path) to list folders from
+            limit: Maximum number of folders to return (default: 10)
+
+        Returns:
+            list: List of dicts with folder_name, last_modified, and file_count
+        """
+        try:
+            # Use paginator to get all objects
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=prefix)
+
+            # Dictionary to track folder info: {folder_name: {files: [metadata], count: int}}
+            folders_data = {}
+
+            for page in pages:
+                if 'Contents' not in page:
+                    continue
+
+                for obj in page['Contents']:
+                    key = obj['Key']
+
+                    # Extract folder name from key
+                    # Key format: "data-loaders/folder-name/file.xlsx"
+                    # Remove prefix and get folder name
+                    relative_path = key[len(prefix):] if key.startswith(prefix) else key
+
+                    # Skip if no folder structure (file at root level)
+                    if '/' not in relative_path:
+                        continue
+
+                    folder_name = relative_path.split('/')[0]
+
+                    # Skip empty folder names
+                    if not folder_name:
+                        continue
+
+                    # Initialize folder if not exists
+                    if folder_name not in folders_data:
+                        folders_data[folder_name] = {
+                            'last_modified': obj['LastModified'],
+                            'count': 0
+                        }
+
+                    # Update folder metadata
+                    folders_data[folder_name]['count'] += 1
+
+                    # Track the most recent modification date
+                    if obj['LastModified'] > folders_data[folder_name]['last_modified']:
+                        folders_data[folder_name]['last_modified'] = obj['LastModified']
+
+            # Convert to list and sort by last_modified (newest first)
+            folder_list = [
+                {
+                    'folder_name': folder_name,
+                    'last_modified': data['last_modified'],
+                    'file_count': data['count']
+                }
+                for folder_name, data in folders_data.items()
+            ]
+
+            # Sort by last_modified descending (newest first)
+            folder_list.sort(key=lambda x: x['last_modified'], reverse=True)
+
+            # Return only the requested number of folders
+            return folder_list[:limit]
+
+        except ClientError as e:
+            logger.error(f"Error listing folders from S3: {e}", exc_info=True)
+            return []
+
 
 s3_utils = S3Utils()

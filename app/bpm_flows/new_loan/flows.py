@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 
 # Entity mapper for case entity tracking
 entity_mapper = {
-    "DRIVER_LOAN": "driver_loans",
+    "DRIVER_LOAN": "driver_loan",  # Changed to lowercase to match actual case entity creation
     "DRIVER_LOAN_ID": "id",
 }
 
@@ -290,6 +290,60 @@ async def enter_loan_details_process(db: Session, case_no: str, step_data: Dict[
         # Get user_id from parameter, step_data, or use system user
         if user_id is None:
             user_id = step_data.get("created_by", 1)  # Default to system user ID 1
+        
+        # 🔧 FIX: Check if loan already exists for this case and clean it up
+        case_entity = bpm_service.get_case_entity(db, case_no=case_no)
+        existing_loan_id = None
+        if case_entity and case_entity.entity_name == entity_mapper["DRIVER_LOAN"]:
+            existing_loan_id = int(case_entity.identifier_value)
+            logger.info(f"Found existing loan {existing_loan_id} for case {case_no} - cleaning up before creating new loan")
+            
+            # Get existing loan
+            existing_loan = loan_svc.repo.get_loan_by_id(existing_loan_id)
+            if existing_loan:
+                logger.info(f"Voiding ledger postings and deleting existing loan {existing_loan.loan_id} and its schedule")
+                
+                # Void ledger postings for all installments of this loan (don't delete, void them)
+                from app.ledger.services import LedgerService
+                from app.ledger.repository import LedgerRepository
+                from app.ledger.models import LedgerPosting, PostingStatus
+                ledger_repo = LedgerRepository(db)
+                ledger_svc = LedgerService(ledger_repo)
+                
+                # Find all posted ledger postings for this loan's installments
+                # Installment reference_ids start with the loan_id (e.g., "DLN-2026-001-01", "DLN-2026-001-02")
+                loan_postings = (
+                    db.query(LedgerPosting)
+                    .filter(
+                        LedgerPosting.reference_id.startswith(f"{existing_loan.loan_id}-"),
+                        LedgerPosting.status == PostingStatus.POSTED
+                    )
+                    .all()
+                )
+                
+                for posting in loan_postings:
+                    try:
+                        ledger_svc.void_posting(
+                            posting_id=posting.id,
+                            reason=f"Voided due to loan recreation - {case_no}",
+                            user_id=user_id or 1
+                        )
+                        logger.info(f"Voided posting {posting.id} for loan installment {posting.reference_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to void posting {posting.id}: {e}")
+                
+                # Delete installments
+                for installment in existing_loan.installments:
+                    db.delete(installment)
+                
+                # Delete loan
+                db.delete(existing_loan)
+                
+                # Delete old case entity
+                db.delete(case_entity)
+                
+                db.commit()
+                logger.info(f"Successfully cleaned up existing loan {existing_loan.loan_id}")
         
         # Create loan and schedule (this method is synchronous, not async)
         loan = loan_svc.create_loan_and_schedule(

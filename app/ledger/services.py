@@ -62,9 +62,6 @@ class LedgerService:
         Returns:
             tuple: (LedgerPosting, LedgerBalance) - The created posting and balance objects
         """
-        if amount <= 0:
-            raise InvalidLedgerOperationError("Obligation amount must be positive.")
-
         try:
             posting = LedgerPosting(
                 category=category,
@@ -743,8 +740,8 @@ class LedgerService:
                 type=p.entry_type,
                 amount=p.amount,
                 driver_name=p.driver.full_name if p.driver else None,
-                lease_id=p.lease_id,
-                vehicle_vin=p.vin,
+                lease_id=p.lease.lease_id if p.lease else p.lease_id,
+                vehicle_vin=p.vehicle.vin if p.vehicle else None,
                 medallion_no=p.medallion.medallion_number if p.medallion else None,
                 reference_id=p.reference_id,
             )
@@ -769,8 +766,9 @@ class LedgerService:
                 status=b.status,
                 reference_id=b.reference_id,
                 driver_name=b.driver.full_name if b.driver else None,
-                lease_id=b.lease_id,
-                vehicle_vin=b.vin,
+                lease_id=b.lease.lease_id if b.lease else None,
+                vehicle_vin=b.vehicle.vin if b.vehicle else None,
+                medallion_no=b.medallion.medallion_number if b.medallion else None,
                 original_amount=b.original_amount,
                 prior_balance=b.prior_balance,
                 balance=b.balance,

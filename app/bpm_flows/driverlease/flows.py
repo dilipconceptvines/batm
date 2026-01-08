@@ -599,12 +599,12 @@ def set_financial_information_with_deposit(db: Session, case_no: str, step_data:
             raise ValueError("Lease not found for the given case")
 
         # Part 2: Handle lease configuration (existing DOV/LT/ST logic - UNCHANGED)
-        if lease.lease_type != step_data.get("lease_type"):
+        if lease.lease_type.upper() != step_data.get("lease_type"):
             raise ValueError(
                 f"Lease type doesn't match with this lease id {lease.lease_type}"
             )
 
-        lease_type = step_data.get("lease_type")
+        lease_type = step_data.get("lease_type").lower()
         if lease_type == LeaseType.DOV.value:
             data = DOVLease(**step_data)
             lease_service.handle_dov_lease(db, lease.id, data)

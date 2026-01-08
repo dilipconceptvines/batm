@@ -7,6 +7,7 @@ import numpy as np
 # Third party imports
 import pandas as pd
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.audit_trail.models import (
     AuditTrail,  # Import AuditTrail to resolve User.audit_trail relationship
@@ -18,6 +19,7 @@ from app.bpm.models import SLA  # Import SLA to resolve User.sla relationship
 # Local imports
 from app.core.config import settings
 from app.core.db import SessionLocal
+from app.core.data_loader_config import data_loader_settings
 from app.driver_payments.models import (
     DriverTransactionReceipt,  # Import for Driver relationships
 )
@@ -32,6 +34,11 @@ from app.medallions.models import Medallion
 from app.utils.general import get_safe_value
 from app.utils.logger import get_logger
 from app.vehicles.models import Vehicle
+from app.utils.s3_utils import s3_utils
+from app.seeder_loader.parser_registry import parser
+from app.seeder.parsing_result import ParseResult, apply_parse_result_to_df
+import tempfile
+import os
 
 logger = get_logger(__name__)
 SUPERADMIN_USER_ID = 1
@@ -116,221 +123,268 @@ def parse_boolean(value):
     return bool(value)
 
 
-def parse_dtrs(db: Session, df: pd.DataFrame):
+@parser(
+    name="dtrs",
+    sheet_names=[data_loader_settings.parser_dtrs_sheet],
+    version="1.0",
+    deprecated=False,
+    description="Process dtrs from Excel sheet"
+)
+def parse_dtrs(db: Session, df: pd.DataFrame) -> ParseResult:
     """Parse and load DTRs from dataframe into database."""
+    result = ParseResult(sheet_name=data_loader_settings.parser_dtrs_sheet)
+    created_dtrs = 0
+    updated_dtrs = 0
+    skipped_dtrs = 0
+
     try:
         # Clean column names and replace NaNs
         df.columns = df.columns.str.strip().str.lower()
         df = df.replace({np.nan: None})
 
-        # Operation counters
-        created_dtrs = 0
-        updated_dtrs = 0
-        skipped_dtrs = 0
+        for idx, row in df.iterrows():
+            try:
+                # Use get_safe_value() to safely fetch values from DataFrame rows
+                dtr_number = get_safe_value(row, "dtr_number")
+                receipt_number = get_safe_value(row, "receipt_number")
 
-        for _, row in df.iterrows():
-            # Use get_safe_value() to safely fetch values from DataFrame rows
-            dtr_number = get_safe_value(row, "dtr_number")
-            receipt_number = get_safe_value(row, "receipt_number")
+                # Skip rows missing mandatory fields
+                if not dtr_number or not receipt_number:
+                    logger.warning("Skipping row with missing dtr_number or receipt_number")
+                    result.record_failed(idx, "Missing dtr_number or receipt_number")
+                    skipped_dtrs += 1
+                    continue
 
-            # Skip rows missing mandatory fields
-            if not dtr_number or not receipt_number:
-                logger.warning("Skipping row with missing dtr_number or receipt_number")
-                skipped_dtrs += 1
-                continue
+                # Get foreign key references
+                medallion_no = get_safe_value(row, "medallion_no")
+                driver_license_no = get_safe_value(row, "driver_license_no")
+                lease_number = get_safe_value(row, "lease_number")
 
-            # Get foreign key references
-            medallion_no = get_safe_value(row, "medallion_no")
-            driver_license_no = get_safe_value(row, "driver_license_no")
-            lease_number = get_safe_value(row, "lease_number")
-
-            # Look up foreign key IDs
-            medallion = (
-                db.query(Medallion)
-                .filter(Medallion.medallion_number == medallion_no)
-                .first()
-            )
-
-            # Look up driver by TLC license number
-            # Join Driver with TLCLicense to find driver by license number
-            driver = (
-                db.query(Driver)
-                .join(TLCLicense, Driver.tlc_license_number_id == TLCLicense.id)
-                .filter(TLCLicense.tlc_license_number == driver_license_no)
-                .first()
-            )
-
-            # Look up lease by lease_id field (not lease_number)
-            lease = db.query(Lease).filter(Lease.lease_id == lease_number).first()
-
-            if not driver:
-                logger.warning(
-                    f"Driver with license {driver_license_no} not found. Skipping DTR {dtr_number}"
-                )
-                skipped_dtrs += 1
-                continue
-
-            if not lease:
-                logger.warning(
-                    f"Lease with number {lease_number} not found. Skipping DTR {dtr_number}"
-                )
-                skipped_dtrs += 1
-                continue
-
-            # Get vehicle ID from medallion if available
-            vehicle_id = None
-            medallion_id = None
-            if medallion:
-                medallion_id = medallion.id
-                vehicle = (
-                    db.query(Vehicle)
-                    .filter(Vehicle.medallion_id == medallion.id)
+                # Look up foreign key IDs
+                medallion = (
+                    db.query(Medallion)
+                    .filter(Medallion.medallion_number == medallion_no)
                     .first()
                 )
-                if vehicle:
-                    vehicle_id = vehicle.id
 
-            # Parse dates BEFORE creating DTR object
-            period_start_raw = get_safe_value(row, "period_start_date")
-            period_end_raw = get_safe_value(row, "period_end_date")
-            generation_date_raw = get_safe_value(row, "generation_date")
-
-            logger.debug(
-                f"Raw values for {dtr_number}: start={period_start_raw}, end={period_end_raw}, gen={generation_date_raw}"
-            )
-
-            period_start_date = parse_date(period_start_raw)
-            period_end_date = parse_date(period_end_raw)
-            generation_date = parse_datetime(generation_date_raw) or datetime.now()
-
-            if not period_start_date:
-                logger.warning(
-                    f"DTR {dtr_number}: period_start_date is None after parsing '{period_start_raw}'"
-                )
-            if not period_end_date:
-                logger.warning(
-                    f"DTR {dtr_number}: period_end_date is None after parsing '{period_end_raw}'"
+                # Look up driver by TLC license number
+                # Join Driver with TLCLicense to find driver by license number
+                driver = (
+                    db.query(Driver)
+                    .join(TLCLicense, Driver.tlc_license_number_id == TLCLicense.id)
+                    .filter(TLCLicense.tlc_license_number == driver_license_no)
+                    .first()
                 )
 
-            # Check for existing DTR
-            dtr = db.query(DTR).filter(DTR.dtr_number == dtr_number).first()
+                # Look up lease by lease_id field (not lease_number)
+                lease = db.query(Lease).filter(Lease.lease_id == lease_number).first()
 
-            if not dtr:
-                # Create new DTR with required fields
-                logger.info(f"Adding new DTR: {dtr_number}")
-                created_dtrs += 1
-            else:
-                # Update existing DTR
-                logger.info(f"Updating existing DTR: {dtr_number}")
-                dtr.period_start_date = period_start_date
-                dtr.period_end_date = period_end_date
-                dtr.generation_date = generation_date
-                updated_dtrs += 1
+                if not driver:
+                    logger.warning(
+                        f"Driver with license {driver_license_no} not found. Skipping DTR {dtr_number}"
+                    )
+                    result.record_failed(idx, f"Driver with license {driver_license_no} not found")
+                    skipped_dtrs += 1
+                    continue
 
-            dtr = DTR(
-                dtr_number=dtr_number,
-                receipt_number=receipt_number,
-                period_start_date=period_start_date,
-                period_end_date=period_end_date,
-                generation_date=generation_date,
-                created_by=SUPERADMIN_USER_ID,
-                created_on=datetime.now(),
-                lease_id=lease.id,
-                driver_id=driver.id,
-                vehicle_id=vehicle_id,
-                medallion_id=medallion_id,
-            )
-            db.add(dtr)
-            db.flush()
+                if not lease:
+                    logger.warning(
+                        f"Lease with number {lease_number} not found. Skipping DTR {dtr_number}"
+                    )
+                    result.record_failed(idx, f"Lease with number {lease_number} not found")
+                    skipped_dtrs += 1
+                    continue
 
-            # # Foreign keys
-            # dtr.lease_id = lease.id
-            # dtr.driver_id = driver.id
-            # dtr.vehicle_id = vehicle_id
-            # dtr.medallion_id = medallion_id
+                # Get vehicle ID from medallion if available
+                vehicle_id = None
+                medallion_id = None
+                if medallion:
+                    medallion_id = medallion.id
+                    vehicle = (
+                        db.query(Vehicle)
+                        .filter(Vehicle.medallion_id == medallion.id)
+                        .first()
+                    )
+                    if vehicle:
+                        vehicle_id = vehicle.id
 
-            # Status
-            status_str = get_safe_value(row, "status")
-            if status_str:
-                try:
-                    dtr.status = DTRStatus[status_str.upper()]
-                except KeyError:
-                    logger.warning(f"Invalid status {status_str}, defaulting to DRAFT")
+                # Parse dates BEFORE creating DTR object
+                period_start_raw = get_safe_value(row, "period_start_date")
+                period_end_raw = get_safe_value(row, "period_end_date")
+                generation_date_raw = get_safe_value(row, "generation_date")
+
+                logger.debug(
+                    f"Raw values for {dtr_number}: start={period_start_raw}, end={period_end_raw}, gen={generation_date_raw}"
+                )
+
+                period_start_date = parse_date(period_start_raw)
+                period_end_date = parse_date(period_end_raw)
+                generation_date = parse_datetime(generation_date_raw) or datetime.now()
+
+                if not period_start_date:
+                    logger.warning(
+                        f"DTR {dtr_number}: period_start_date is None after parsing '{period_start_raw}'"
+                    )
+                if not period_end_date:
+                    logger.warning(
+                        f"DTR {dtr_number}: period_end_date is None after parsing '{period_end_raw}'"
+                    )
+
+                # Check for existing DTR
+                dtr = db.query(DTR).filter(DTR.dtr_number == dtr_number).first()
+
+                is_new = False
+                if not dtr:
+                    # Create new DTR with required fields
+                    logger.info(f"Adding new DTR: {dtr_number}")
+                    is_new = True
+                else:
+                    # Update existing DTR
+                    logger.info(f"Updating existing DTR: {dtr_number}")
+                    dtr.period_start_date = period_start_date
+                    dtr.period_end_date = period_end_date
+                    dtr.generation_date = generation_date
+                    updated_dtrs += 1
+                    result.record_updated(idx)
+
+                if is_new:
+                     dtr = DTR(
+                        dtr_number=dtr_number,
+                        receipt_number=receipt_number,
+                        period_start_date=period_start_date,
+                        period_end_date=period_end_date,
+                        generation_date=generation_date,
+                        created_by=SUPERADMIN_USER_ID,
+                        created_on=datetime.now(),
+                        lease_id=lease.id,
+                        driver_id=driver.id,
+                        vehicle_id=vehicle_id,
+                        medallion_id=medallion_id,
+                    )
+                     db.add(dtr)
+                     created_dtrs += 1
+                     result.record_inserted(idx)
+                
+                db.flush()
+
+                # Status
+                status_str = get_safe_value(row, "status")
+                if status_str:
+                    try:
+                        dtr.status = DTRStatus[status_str.upper()]
+                    except KeyError:
+                        logger.warning(f"Invalid status {status_str}, defaulting to DRAFT")
+                        dtr.status = DTRStatus.DRAFT
+                else:
                     dtr.status = DTRStatus.DRAFT
-            else:
-                dtr.status = DTRStatus.DRAFT
 
-            # Earnings
-            dtr.gross_cc_earnings = parse_decimal(
-                get_safe_value(row, "gross_cc_earnings")
-            )
-            dtr.gross_cash_earnings = parse_decimal(
-                get_safe_value(row, "gross_cash_earnings")
-            )
-            dtr.total_gross_earnings = parse_decimal(
-                get_safe_value(row, "total_gross_earnings")
-            )
+                # Earnings
+                dtr.gross_cc_earnings = parse_decimal(
+                    get_safe_value(row, "gross_cc_earnings")
+                )
+                dtr.gross_cash_earnings = parse_decimal(
+                    get_safe_value(row, "gross_cash_earnings")
+                )
+                dtr.total_gross_earnings = parse_decimal(
+                    get_safe_value(row, "total_gross_earnings")
+                )
 
-            # Charges
-            dtr.lease_amount = parse_decimal(get_safe_value(row, "lease_amount"))
-            dtr.mta_tif_fees = parse_decimal(get_safe_value(row, "mta_tif_fees"))
-            dtr.ezpass_tolls = parse_decimal(get_safe_value(row, "ezpass_tolls"))
-            dtr.violation_tickets = parse_decimal(
-                get_safe_value(row, "violation_tickets")
-            )
-            dtr.tlc_tickets = parse_decimal(get_safe_value(row, "tlc_tickets"))
-            dtr.repairs = parse_decimal(get_safe_value(row, "repairs"))
-            dtr.driver_loans = parse_decimal(get_safe_value(row, "driver_loans"))
-            dtr.misc_charges = parse_decimal(get_safe_value(row, "misc_charges"))
+                # Charges
+                dtr.lease_amount = parse_decimal(get_safe_value(row, "lease_amount"))
+                dtr.mta_tif_fees = parse_decimal(get_safe_value(row, "mta_tif_fees"))
+                dtr.ezpass_tolls = parse_decimal(get_safe_value(row, "ezpass_tolls"))
+                dtr.violation_tickets = parse_decimal(
+                    get_safe_value(row, "violation_tickets")
+                )
+                dtr.tlc_tickets = parse_decimal(get_safe_value(row, "tlc_tickets"))
+                dtr.repairs = parse_decimal(get_safe_value(row, "repairs"))
+                dtr.driver_loans = parse_decimal(get_safe_value(row, "driver_loans"))
+                dtr.misc_charges = parse_decimal(get_safe_value(row, "misc_charges"))
 
-            # Totals
-            dtr.subtotal_charges = parse_decimal(
-                get_safe_value(row, "subtotal_charges")
-            )
-            dtr.prior_balance = parse_decimal(get_safe_value(row, "prior_balance"))
-            dtr.net_earnings = parse_decimal(get_safe_value(row, "net_earnings"))
-            dtr.total_due_to_driver = parse_decimal(
-                get_safe_value(row, "total_due_to_driver")
-            )
+                # Totals
+                dtr.subtotal_charges = parse_decimal(
+                    get_safe_value(row, "subtotal_charges")
+                )
+                dtr.prior_balance = parse_decimal(get_safe_value(row, "prior_balance"))
+                dtr.net_earnings = parse_decimal(get_safe_value(row, "net_earnings"))
+                dtr.total_due_to_driver = parse_decimal(
+                    get_safe_value(row, "total_due_to_driver")
+                )
 
-            # Additional driver flag
-            dtr.is_additional_driver_dtr = parse_boolean(
-                get_safe_value(row, "is_additional_driver_dtr")
-            )
+                # Additional driver flag
+                dtr.is_additional_driver_dtr = parse_boolean(
+                    get_safe_value(row, "is_additional_driver_dtr")
+                )
 
-            # Update timestamp
-            dtr.updated_by = SUPERADMIN_USER_ID
-            dtr.updated_on = datetime.now()
+                # Update timestamp
+                dtr.updated_by = SUPERADMIN_USER_ID
+                dtr.updated_on = datetime.now()
+                
+                db.flush()
 
-        db.commit()
+            except Exception as row_error:
+                logger.exception(f"Error parsing DTR row {idx}: {row_error}")
+                result.record_failed(idx, str(row_error))
+
         logger.info("✅ DTR data successfully processed.")
-        logger.info(
-            f"📊 Summary: {created_dtrs} created, {updated_dtrs} updated, {skipped_dtrs} skipped"
-        )
+        # logger.info(
+        #     f"📊 Summary: {created_dtrs} created, {updated_dtrs} updated, {skipped_dtrs} skipped"
+        # )
 
-        return {
-            "dtrs_created": created_dtrs,
-            "dtrs_updated": updated_dtrs,
-            "dtrs_skipped": skipped_dtrs,
-        }
+        return result
     except Exception as e:
-        db.rollback()
-        logger.error(f"Error parsing DTR data: {e}")
-        raise
-    finally:
-        db.close()
+        logger.exception(f"Critical failure in parser dtrs: {e}")
+        raise RuntimeError(f"Parser dtrs failed: {e}") from e
 
 
 if __name__ == "__main__":
-    import os
-
+    logger.info("Loading dtrs configuration")
     db_session = SessionLocal()
 
-    # Path to the CSV file
-    csv_path = os.path.join(os.path.dirname(__file__), "dtr_seed_data.csv")
+    tmp_file_path = None
+    try:
+        # Download file to temp
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+            tmp_file_path = tmp_file.name
+            
+        file_bytes = s3_utils.download_file(settings.bat_file_key)
+        if not file_bytes:
+             raise Exception("Failed to download file from S3")
+        
+        with open(tmp_file_path, 'wb') as f:
+            f.write(file_bytes)
+            
+        excel_file = pd.ExcelFile(tmp_file_path)
+        data_df = pd.read_excel(excel_file, "dtrs")
 
-    logger.info(f"Loading DTR data from: {csv_path}")
-    dtrs_df = pd.read_csv(csv_path)
+        result = parse_dtrs(db_session, data_df)
+        
+        # Apply results
+        updated_df = apply_parse_result_to_df(data_df, result)
 
-    parse_dtrs(db_session, dtrs_df)
-    db_session.close()
+        # Write back to temp file
+        with pd.ExcelWriter(
+            tmp_file_path,
+            engine="openpyxl",
+            mode="a",
+            if_sheet_exists="replace"
+        ) as writer:
+            updated_df.to_excel(writer, sheet_name="dtrs", index=False)
+            
+        # Upload back to S3
+        with open(tmp_file_path, 'rb') as f:
+            s3_utils.upload_file(f, settings.bat_file_key)
+
+        db_session.commit()
+        logger.info("Dtrs committed successfully")
+    except IntegrityError:
+        db_session.rollback()
+        logger.error("Session could not be committed due to integrity error")
+    except Exception as e:
+        db_session.rollback()
+        logger.error("Error processing dtrs: %s", e)
+        raise
+    finally:
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
+        db_session.close()

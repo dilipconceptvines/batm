@@ -296,7 +296,7 @@ class CurbService:
         Import trips from a single CURB account
         
         Fetches from BOTH endpoints:
-        1. GET_TRIPS_LOG10 - All trip data (CASH, credit card, etc.)
+        1. GET_TRIPS_LOG10 - CASH trips only
         2. Get_Trans_By_Date_Cab12 - Card transaction data
         
         Returns:
@@ -310,7 +310,7 @@ class CurbService:
         
         all_trips = []
         
-        # --- CALL 1: GET_TRIPS_LOG10 - Get all trips (CASH and credit cards) ---
+        # --- CALL 1: GET_TRIPS_LOG10 - Get CASH trips only ---
 
         try:
             logger.info(f"Fetching trips from GET_TRIPS_LOG10 for {account.account_name}")
@@ -319,10 +319,10 @@ class CurbService:
             # Store to S3 data lake
             self._store_to_s3(account, trips_xml, from_datetime, "trips")
             
-            # Parse trips (all payment types)
+            # Parse trips (CASH only)
             trips = self._parse_trips_xml(trips_xml, account.id)
             all_trips.extend(trips)
-            logger.info(f"GET_TRIPS_LOG10: Parsed {len(trips)} trips")
+            logger.info(f"GET_TRIPS_LOG10: Parsed {len(trips)} CASH trips")
             
         except Exception as e:
             logger.error(f"Failed to fetch GET_TRIPS_LOG10 for {account.account_name}: {e}")
@@ -375,10 +375,10 @@ class CurbService:
         """
         Parse CURB GET_TRIPS_LOG10 XML response
         
-        Extracts ALL payment types (CASH, credit card, private card, etc.)
+        Extracts CASH trips only (payment_type_code = "$")
         
         Returns:
-            List of trip dictionaries
+            List of CASH trip dictionaries
         """
         try:
             root = ET.fromstring(xml_response)
@@ -400,6 +400,10 @@ class CurbService:
                 # Map payment type from T attribute
                 payment_type_code = record.get("T", "")
                 payment_type = self._map_payment_type(payment_type_code)
+                
+                # Skip non-CASH trips
+                if payment_type != PaymentType.CASH:
+                    continue
                 
                 trip = {
                     "account_id": account_id,
@@ -446,7 +450,7 @@ class CurbService:
                 
                 trips.append(trip)
             
-            logger.info(f"Parsed {len(trips)} trips from GET_TRIPS_LOG10 XML")
+            logger.info(f"Parsed {len(trips)} CASH trips from GET_TRIPS_LOG10 XML")
             return trips
             
         except ET.ParseError as e:
@@ -487,10 +491,12 @@ class CurbService:
                 trip_date = self._get_element_text(tran, "TRIPDATE")
                 trip_time_start = self._get_element_text(tran, "TRIPTIMESTART")
                 trip_time_end = self._get_element_text(tran, "TRIPTIMEEND")
-                
+                transaction_date = self._get_element_text(tran, "DATETIME")
+
                 # Combine date and time
                 start_time = self._parse_transaction_datetime(trip_date, trip_time_start)
                 end_time = self._parse_transaction_datetime(trip_date, trip_time_end)
+                transaction_datetime = self._parse_datetime(transaction_date)
                 
                 # Map CC_TYPE to payment type
                 cc_type = self._get_element_text(tran, "CC_TYPE")
@@ -536,7 +542,7 @@ class CurbService:
                     "num_service": self._get_element_text(tran, "NUM_SERVICE", 1),
 
                     # Transaction Date
-                    "transaction_date": self._parse_datetime(self._get_element_text(tran, "DATETIME")),
+                    "transaction_date": transaction_datetime,
                 }
                 
                 transactions.append(transaction)
@@ -567,7 +573,7 @@ class CurbService:
         mapping = {
             "$": PaymentType.CASH,
             "C": PaymentType.CREDIT_CARD,
-            "P": PaymentType.CREDIT_CARD,  # Private cards treated as credit
+            "P": PaymentType.UNKNOWN,  # Private cards treated as credit
         }
         return mapping.get(type_code, PaymentType.UNKNOWN)
     
@@ -600,10 +606,35 @@ class CurbService:
             return datetime.now(timezone.utc)
         
     def _parse_datetime(self, date_str: str) -> datetime:
-        """Parse CURB datetime string: MM/DD/YYYY HH:MM:SS"""
+        """
+        Parse CURB datetime string
+        
+        Supports formats:
+        - MM/DD/YYYY HH:MM:SS
+        - MM/DD/YYYY HH:MM:SS:mmm (with milliseconds)
+        - MM/DD/YYYY HH:MM (without seconds)
+        """
+        if not date_str:
+            logger.warning("Empty datetime string provided, using current time")
+            return datetime.now(timezone.utc)
+        
+        # Try with milliseconds first
+        try:
+            return datetime.strptime(date_str, "%m/%d/%Y %H:%M:%S:%f").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+        
+        # Try without milliseconds
         try:
             return datetime.strptime(date_str, "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc)
-        except:
+        except ValueError:
+            pass
+        
+        # Try without seconds
+        try:
+            return datetime.strptime(date_str, "%m/%d/%Y %H:%M").replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.warning(f"Failed to parse datetime '{date_str}', using current time as fallback")
             return datetime.now(timezone.utc)
         
     def _map_trip_to_entities(self, trip: Dict) -> Dict:

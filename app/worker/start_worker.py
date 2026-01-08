@@ -22,10 +22,11 @@ def start_worker():
     argv = [
         "worker",
         "--loglevel=info",  # Loglevel (debug, info, warning, error, critical)
-        "--concurrency=3",  # Number of concurrent workers
+        "--concurrency=4",  # Number of concurrent workers (4 is balanced for mixed workload)
+        # Consider: 2-3 for fewer resources, 6-8 if you have 8+ CPU cores and 8GB+ RAM
         "--max-tasks-per-child=100",  # Number of tasks a worker can process before restarting
-        "--time-limit=1800",  # Time limit for a task in seconds (30 minutes)
-        "--soft-time-limit=1500",  # Soft time limit for a task in seconds (25 minutes)
+        "--time-limit=90000",  # Time limit for a task in seconds (25 hours for long imports)
+        "--soft-time-limit=86400",  # Soft time limit for a task in seconds (24 hours)
         "--prefetch-multiplier=1",  # Prefetch multiplier for the worker
     ]
 

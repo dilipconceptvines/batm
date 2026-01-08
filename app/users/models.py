@@ -140,7 +140,7 @@ class User(Base, AuditMixin):
     created_audit_trails: Mapped[List["AuditTrail"]] = relationship(
         "AuditTrail",
         back_populates="creator",
-        foreign_keys="[AuditTrail.created_by]",
+        foreign_keys="AuditTrail.created_by",
         overlaps="user"
     )
     case_reassignments: Mapped[List["CaseReassignment"]] = relationship(
@@ -150,6 +150,11 @@ class User(Base, AuditMixin):
     case_reassignments_at_assignment: Mapped[List["CaseReassignment"]] = relationship(
         back_populates="user_at_assignment",
         foreign_keys="CaseReassignment.user_id_at_assignment",
+    )
+    export_jobs: Mapped[List["ExportJob"]] = relationship(
+        "ExportJob",
+        back_populates="user",
+        foreign_keys="ExportJob.created_by",
     )
 
     @property

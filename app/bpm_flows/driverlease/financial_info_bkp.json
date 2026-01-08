@@ -1,0 +1,245 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "leaseType": {
+      "type": "string",
+      "enum": [
+        "dov",
+        "long-term",
+        "short-term",
+        "medallion-only"
+      ],
+      "title": "Lease Type"
+    },
+    "financialInformation": {
+      "type": "object",
+      "properties": {
+      },
+      "dependencies": {
+        "leaseType": {
+          "oneOf": [
+            {
+              "properties": {
+                "leaseType": {
+                  "enum": ["dov"]
+                },
+                "financialInformation": {
+                  "properties": {
+                    "management_recommendation": {
+                      "type": "number"
+                    },
+                    "med_lease": {
+                      "type": "number"
+                    },
+                    "med_tlc_maximum_amount":{
+                      "type": "number"
+                    },
+                    "veh_lease":{
+                      "type": "number"
+                    },
+                    "veh_tlc_maximum_amount":{
+                      "type": "number"
+                    },
+                    "lease_amount":{
+                      "type":"number"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "leaseType": {
+                  "enum": ["long-term"]
+                },
+                "financialInformation": {
+                  "properties": {
+                    "management_recommendation": {
+                      "type": "number"
+                    },
+                    "day_shift": {
+                      "type": "number"
+                    },
+                    "day_tlc_maximum_amount":{
+                      "type": "number"
+                    },
+                    "night_shift": {
+                      "type": "number"
+                    },
+                    "night_tlc_maximum_amount":{
+                      "type": "number"
+                    },
+                    "lease_amount":{
+                      "type":"number"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "leaseType": {
+                  "enum": ["short-term"]
+                },
+                "financialInformation": {
+                  "properties": {
+                    "1_week_or_longer": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "1_week_or_longer_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "day_of_week": {
+                      "type":"string",
+                      "enum": ["sun","mon","tus","wen","thu","fri","sat"]
+                    },
+                    "sun": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "sun_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "mon": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "mon_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "tus": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "tus_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "wen": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "wen_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "thu": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "thu_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "fri": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "fri_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "sat": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    },
+                    "sat_tlc_maximum_amount": {
+                      "day_shift":{
+                        "type":"number"
+                      },
+                      "night_shift":{
+                        "type":"number"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "leaseType": {
+                  "enum": ["medallion-only"]
+                },
+                "financialInformation": {
+                  "properties": {
+                    "weekly_lease_rate": {
+                      "type": "number"
+                    },
+                    "week_tlc_maximum_amount":{
+                      "type": "number"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

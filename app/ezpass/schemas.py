@@ -22,7 +22,7 @@ class EZPassTransactionResponse(BaseModel):
     medallion_no: Optional[str] = None
     driver_id: Optional[str] = None
     driver_name: Optional[str] = None
-    lease_id: Optional[int] = None
+    lease_id: Optional[str] = None
     plate_number: str = Field(..., alias="tag_or_plate")
     posting_date: Optional[datetime] = None
     status: str = None

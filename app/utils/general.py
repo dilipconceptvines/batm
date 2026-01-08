@@ -430,3 +430,24 @@ def clean_value(value: str, is_bool=False):
 
     # String field
     return v or None
+
+def parse_date(date_str):
+    """
+    Parses a date string into a datetime object.
+    If the string is invalid or empty, returns None.
+    """
+    if hasattr(date_str, "to_pydatetime"):
+        return date_str.to_pydatetime()
+
+    # string date
+    if isinstance(date_str, str):
+        try:
+            return pd.to_datetime(date_str).to_pydatetime()
+        except Exception:
+            return None
+
+    # already datetime
+    if isinstance(date_str, datetime):
+        return date_str
+
+    return None

@@ -674,7 +674,7 @@ async def process_payment_allocation(db: Session, case_no: str, step_data: Dict[
             
             # Verify category matches (prevent category/reference mismatch)
             allocation_category = alloc.get("category", "").upper()
-            if allocation_category != balance.category.value:
+            if allocation_category != balance.category.value.upper():
                 raise HTTPException(
                     status_code=400,
                     detail=f"Category mismatch for balance {balance_id}: allocation says '{allocation_category}' but balance is '{balance.category.value}'. Cannot proceed."

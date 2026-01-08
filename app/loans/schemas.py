@@ -48,7 +48,7 @@ class LoanInstallmentResponse(BaseModel):
     interest_amount: Decimal = Field(..., description="Interest portion of this installment")
     total_due: Decimal = Field(..., description="Total amount due for this installment")
     status: LoanInstallmentStatus = Field(..., description="Current status of this installment")
-    ledger_posting_id: Optional[int] = Field(None, description="ID of the corresponding ledger posting")
+    ledger_posting_id: Optional[str] = Field(None, description="ID of the corresponding ledger posting")
 
 
 class DriverLoanDetailResponse(BaseModel):
@@ -70,6 +70,7 @@ class DriverLoanDetailResponse(BaseModel):
     notes: Optional[str] = Field(None, description="Additional notes about the loan")
     installments: List[LoanInstallmentResponse] = Field(..., description="Full repayment schedule")
     receipt_url: Optional[str] = Field(None, description="Presigned URL for loan receipt PDF")  # NEW
+    lease_id: Optional[str] = Field(None, description="Associated lease ID")
 
 
 class LoanInstallmentListResponse(BaseModel):

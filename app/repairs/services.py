@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.bpm.services import bpm_service
 from app.core.db import SessionLocal
-from app.ledger.models import PostingCategory
+from app.ledger.models import PostingCategory , EntryType
 from app.ledger.services import LedgerService
 from app.ledger.repository import LedgerRepository
 from app.repairs.exceptions import (
@@ -82,24 +82,52 @@ class RepairService:
             repair_id = self._generate_next_repair_id()
 
             # 2. Create the master invoice record in DRAFT status
-            new_invoice = RepairInvoice(
-                repair_id=repair_id,
-                invoice_number=invoice_data["invoice_number"],
-                invoice_date=invoice_data["invoice_date"],
-                driver_id=invoice_data["driver_id"],
-                lease_id=invoice_data["lease_id"],
-                vehicle_id=invoice_data["vehicle_id"],
-                medallion_id=invoice_data["medallion_id"],
-                workshop_type=WorkshopType(invoice_data["workshop_type"]),
-                description=invoice_data.get("notes"),
-                total_amount=Decimal(invoice_data["total_amount"]),
-                start_week=invoice_data["start_week"],
-                status=RepairInvoiceStatus.DRAFT,
-                created_by=user_id,
-            )
-            self.repo.create_invoice(new_invoice)
+            new_invoice = self.repo.get_invoice_by_case_no(case_no)
+
+            if new_invoice:
+                new_invoice.invoice_number = invoice_data["invoice_number"]
+                new_invoice.invoice_date = invoice_data["invoice_date"]
+                new_invoice.case_no = case_no
+                new_invoice.driver_id = invoice_data["driver_id"]
+                new_invoice.lease_id = invoice_data["lease_id"]
+                new_invoice.vehicle_id = invoice_data["vehicle_id"]
+                new_invoice.medallion_id = invoice_data["medallion_id"]
+                new_invoice.workshop_type = WorkshopType(invoice_data["workshop_type"])
+                new_invoice.description = invoice_data.get("notes")
+                new_invoice.total_amount = Decimal(invoice_data["total_amount"])
+                new_invoice.start_week = invoice_data["start_week"]
+                new_invoice.status = RepairInvoiceStatus.DRAFT
+
+                self.db.flush()
+                
+            else:
+                new_invoice = RepairInvoice(
+                    repair_id=repair_id,
+                    invoice_number=invoice_data["invoice_number"],
+                    invoice_date=invoice_data["invoice_date"],
+                    case_no=case_no,
+                    driver_id=invoice_data["driver_id"],
+                    lease_id=invoice_data["lease_id"],
+                    vehicle_id=invoice_data["vehicle_id"],
+                    medallion_id=invoice_data["medallion_id"],
+                    workshop_type=WorkshopType(invoice_data["workshop_type"]),
+                    description=invoice_data.get("notes"),
+                    total_amount=Decimal(invoice_data["total_amount"]),
+                    start_week=invoice_data["start_week"],
+                    status=RepairInvoiceStatus.DRAFT,
+                    created_by=user_id,
+                )
+                self.repo.create_invoice(new_invoice)
 
             # 3. Generate the payment schedule
+
+            
+            installments = self.repo.get_installments_by_invoice(new_invoice.id)
+            if installments:
+                for installment in installments:
+                    self.db.delete(installment)
+                self.db.flush()
+
             self.generate_payment_schedule(new_invoice)
 
             # 4. Finalize invoice status to OPEN
@@ -122,6 +150,22 @@ class RepairService:
                     ledger_repo = LedgerRepository(self.db)
                     ledger_service = LedgerService(ledger_repo)
                     
+                    ledger = ledger_repo.get_posting_by_reference_id(first_installment.installment_id , is_last=True)
+                    if ledger and ledger.entry_type == EntryType.DEBIT.value:
+                        ledger , balance = ledger_service.create_obligation(
+                            category=PostingCategory.REPAIR,
+                            amount=ledger.amount,
+                            reference_id=first_installment.installment_id,
+                            driver_id=new_invoice.driver_id,
+                            entry_type=EntryType.CREDIT,
+                            lease_id=new_invoice.lease_id,
+                            vehicle_id=new_invoice.vehicle_id,
+                            medallion_id=new_invoice.medallion_id,
+                        )
+                        logger.info("Credit Ledger is created successfully")
+
+                    logger.info(f"Ledger data is {ledger}")
+
                     ledger_posting, balance = ledger_service.create_obligation(
                         category=PostingCategory.REPAIR,
                         amount=first_installment.principal_amount,
@@ -151,9 +195,13 @@ class RepairService:
                 # The installment can be posted later via scheduled task
 
             # 5. Link invoice to the BPM case
-            bpm_service.create_case_entity(
-                self.db, case_no, "repair_invoice", "id", str(new_invoice.id)
+            case_entity = bpm_service.get_case_entity(
+                self.db, case_no
             )
+            if not case_entity:
+                case_entity =bpm_service.create_case_entity(
+                    self.db, case_no, "repair_invoice", "id", str(new_invoice.id)
+                    )
             
             # NEW: 6. Generate receipt PDF and store in S3
             try:
@@ -246,6 +294,43 @@ class RepairService:
         except Exception as e:
             logger.error(f"Error generating payment schedule for {invoice.repair_id}: {e}", exc_info=True)
             raise PaymentScheduleGenerationError(f"Could not generate payment schedule: {e}")
+
+    def calculate_payment_schedule(
+        self, total_amount: Decimal, start_week: date
+    ) -> dict:
+        """
+        Calculates the weekly installment schedule without storing it.
+        """
+        if total_amount <= 0:
+            raise ValueError("Total amount must be positive.")
+
+        weekly_principal = self._get_weekly_principal(total_amount)
+        
+        remaining_balance = total_amount
+        current_start_date = start_week
+        installments = []
+        seq = 1
+
+        while remaining_balance > 0:
+            installment_amount = min(weekly_principal, remaining_balance)
+            
+            installments.append({
+                "seq": seq,
+                "week_start_date": current_start_date,
+                "week_end_date": current_start_date + timedelta(days=6),
+                "principal_amount": installment_amount,
+            })
+
+            remaining_balance -= installment_amount
+            current_start_date += timedelta(weeks=1)
+            seq += 1
+
+        return {
+            "total_amount": total_amount,
+            "weekly_installment_limit": weekly_principal,
+            "total_installments": len(installments),
+            "installments": installments
+        }
         
     def closed_repair(self):
         try:

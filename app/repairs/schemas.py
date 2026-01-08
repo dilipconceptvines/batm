@@ -40,6 +40,34 @@ class PaginatedRepairInvoiceResponse(BaseModel):
     page: int
     per_page: int
     total_pages: int
+
+
+class RepairCalculationRequest(BaseModel):
+    """
+    Request schema for calculating repair installments.
+    """
+    total_amount: Decimal
+    start_week: date
+
+
+class RepairCalculationInstallment(BaseModel):
+    """
+    Response schema for a single calculated installment.
+    """
+    seq: int
+    week_start_date: date
+    week_end_date: date
+    principal_amount: Decimal
+
+
+class RepairCalculationResponse(BaseModel):
+    """
+    Response schema for repair installment calculation.
+    """
+    total_amount: Decimal
+    weekly_installment_limit: Decimal
+    total_installments: int
+    installments: List[RepairCalculationInstallment]
     status_list: List[RepairInvoiceStatus] = Field(
         default_factory=lambda: list(RepairInvoiceStatus)
     )

@@ -10,6 +10,7 @@ from celery import shared_task
 from sqlalchemy.orm import Session
 
 from app.audit_trail.services import audit_trail_service
+from app.audit_trail.schemas import AuditTrailType
 from app.curb.models import CurbTrip
 from app.pvb.exceptions import (
     PVBAssociationError, ReassignmentError, PVBError,
@@ -44,6 +45,7 @@ class PVBService:
     def __init__(self, db: Session):
         self.db = db
         self.repo = PVBRepository(db)
+        self.ledger_repo = LedgerRepository(db)
 
     def process_uploaded_csv(self, file_stream: io.BytesIO, file_name: str, user_id: int):
         """
@@ -654,34 +656,32 @@ class PVBService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=violation.case_no,
-                        step_id=None,
                         description=f"PVB violation reassigned: {violation.summons}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id or new_lease.medallion_id,
-                        vehicle_id=new_vehicle_id or new_lease.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=violation.id,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "PVB_VIOLATION",
                             "entry_id": violation.id,
                             "entry_reference": violation.summons,
+                            "case_no": violation.case_no,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id or new_lease.medallion_id,
+                            "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                            "lease_id": new_lease_id,
+                            "pvb_id": violation.id,
                             "source_lease_id": old_lease_id,
                             "source_driver_id": old_driver_id,
                             "target_lease_id": new_lease_id,
                             "target_driver_id": new_driver_id,
                             "reassignment_type": "IMPORTED_STATUS_UPDATE",
-                            "total_payable": None,  # Not applicable for non-posted entries
+                            "total_payable": None,
                             "collected_to_date": None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
                     
                 elif violation.status == PVBViolationStatus.ASSOCIATION_FAILED:
@@ -707,34 +707,32 @@ class PVBService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=violation.case_no,
-                        step_id=None,
                         description=f"PVB violation reassigned: {violation.summons}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id or new_lease.medallion_id,
-                        vehicle_id=new_vehicle_id or new_lease.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=violation.id,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "PVB_VIOLATION",
                             "entry_id": violation.id,
                             "entry_reference": violation.summons,
+                            "case_no": violation.case_no,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id or new_lease.medallion_id,
+                            "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                            "lease_id": new_lease_id,
+                            "pvb_id": violation.id,
                             "source_lease_id": old_lease_id,
                             "source_driver_id": old_driver_id,
                             "target_lease_id": new_lease_id,
                             "target_driver_id": new_driver_id,
                             "reassignment_type": "ASSOCIATION_FAILED_TO_ASSOCIATED",
-                            "total_payable": None,  # Not applicable for non-posted entries
+                            "total_payable": None,
                             "collected_to_date": None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
                     
                 elif violation.status == PVBViolationStatus.ASSOCIATED:
@@ -758,34 +756,32 @@ class PVBService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=violation.case_no,
-                        step_id=None,
                         description=f"PVB violation reassigned: {violation.summons}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id or new_lease.medallion_id,
-                        vehicle_id=new_vehicle_id or new_lease.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=violation.id,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "PVB_VIOLATION",
                             "entry_id": violation.id,
                             "entry_reference": violation.summons,
+                            "case_no": violation.case_no,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id or new_lease.medallion_id,
+                            "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                            "lease_id": new_lease_id,
+                            "pvb_id": violation.id,
                             "source_lease_id": old_lease_id,
                             "source_driver_id": old_driver_id,
                             "target_lease_id": new_lease_id,
                             "target_driver_id": new_driver_id,
                             "reassignment_type": "ASSOCIATED_STATUS_UPDATE",
-                            "total_payable": None,  # Not applicable for non-posted entries
+                            "total_payable": None,
                             "collected_to_date": None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
                     
                 elif violation.status == PVBViolationStatus.POSTED_TO_LEDGER:
@@ -839,7 +835,7 @@ class PVBService:
                     # Step 2: Create new charge on new lease (DEBIT for full TP)
                     new_reference_id = f"REASSIGN-NEW-{violation.summons}"
                     
-                    new_posting = ledger_service.create_obligation(
+                    new_posting, balance = ledger_service.create_obligation(
                         category=PostingCategory.PVB,
                         amount=total_payable,  # Always use full TP
                         reference_id=new_reference_id,
@@ -874,26 +870,23 @@ class PVBService:
                     # Create audit trail record (Section 9.2)
                     audit_trail_service.create_audit_trail(
                         db=self.db,
-                        case_no=violation.case_no,
-                        step_id=None,
                         description=f"PVB violation reassigned: {violation.summons}",
-                        driver_id=new_driver_id,
-                        medallion_id=new_medallion_id or new_lease.medallion_id,
-                        vehicle_id=new_vehicle_id or new_lease.vehicle_id,
-                        lease_id=new_lease_id,
-                        medallion_owner_id=None,
-                        vehicle_owner_id=None,
-                        ledger_id=None,
-                        pvb_id=violation.id,
-                        correspondence_id=None,
+                        case=None,
+                        user=None,
                         meta_data={
                             "entry_type": "PVB_VIOLATION",
                             "entry_id": violation.id,
                             "entry_reference": violation.summons,
+                            "case_no": violation.case_no,
                             "batch_id": batch_id,
                             "batch_size": len(transaction_ids) if batch_id else 1,
-                            "vehicle_id": violation.vehicle_id,
-                            "medallion_id": violation.medallion_id,
+                            "driver_id": new_driver_id,
+                            "medallion_id": new_medallion_id or new_lease.medallion_id,
+                            "vehicle_id": new_vehicle_id or new_lease.vehicle_id,
+                            "lease_id": new_lease_id,
+                            "pvb_id": violation.id,
+                            "source_vehicle_id": violation.vehicle_id,
+                            "source_medallion_id": violation.medallion_id,
                             "source_lease_id": old_lease_id,
                             "source_driver_id": old_driver_id,
                             "target_lease_id": new_lease_id,
@@ -905,7 +898,8 @@ class PVBService:
                             "new_posting_id": new_posting.id if 'new_posting' in locals() else None,
                             "user_id": user_id,
                             "reason": reason
-                        }
+                        },
+                        audit_type=AuditTrailType.AUTOMATED
                     )
                 
                 else:

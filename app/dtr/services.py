@@ -148,10 +148,11 @@ class DTRService:
             net_earnings=dtr_data['net_earnings'],
             total_due_to_driver=dtr_data['total_due_to_driver'],
             
-            # Status
-            status=DTRStatus.FINALIZED if (force_final and not dtr_data['has_pending']) else DTRStatus.DRAFT,
-            has_pending_charges=dtr_data['has_pending'],
-            pending_charge_categories=dtr_data['pending_categories'],
+            # Status - Always FINALIZED
+            status=DTRStatus.FINALIZED,
+            has_pending_charges=False,  # Not tracking pending charges
+            pending_charge_categories=None,
+            finalized_at=datetime.now(),  # Set finalized timestamp immediately
             
             # Termination
             is_final_dtr=is_terminated,
@@ -380,13 +381,13 @@ class DTRService:
             .filter(
                 and_(
                     Trip.driver_id.in_(driver_ids),
-                    Trip.transaction_date >= start_dt,
-                    Trip.transaction_date <= end_dt,
+                    Trip.transaction_date >= start_dt,  # ✅ CORRECT - trip occurrence
+                    Trip.transaction_date <= end_dt,  # ✅ Include only trips imported by end of week
                     Trip.payment_type == PaymentType.CREDIT_CARD,
                 )
             )
             .scalar()
-        ) or Decimal('0.00')
+        )
 
         return Decimal(total)
     
@@ -398,53 +399,52 @@ class DTRService:
     ) -> Dict[str, Decimal]:
         """
         Calculate all tax components from CURB trips for all drivers.
-        
         Returns breakdown by tax type.
+        Uses trip occurrence date (start_time), not import date (transaction_date).
         """
         from app.curb.models import CurbTrip as Trip
 
-        # Use DB aggregates for each tax component. Field names on CurbTrip:
-        # surcharge, improvement_surcharge, congestion_fee, cbdt_fee, airport_fee
+        # Use start_time to filter trips based on when they actually occurred
         start_dt = datetime.combine(week_start, datetime.min.time())
         end_dt = datetime.combine(week_end, datetime.max.time())
 
         mta = self.db.query(func.coalesce(func.sum(Trip.surcharge), 0)).filter(
             and_(
                 Trip.driver_id.in_(driver_ids),
-                Trip.transaction_date >= start_dt,
-                Trip.transaction_date <= end_dt,
+                Trip.start_time >= start_dt,  # ✅ CORRECT
+                Trip.start_time <= end_dt,    # ✅ CORRECT
             )
         ).scalar() or Decimal('0.00')
 
         tif = self.db.query(func.coalesce(func.sum(Trip.improvement_surcharge), 0)).filter(
             and_(
                 Trip.driver_id.in_(driver_ids),
-                Trip.transaction_date >= start_dt,
-                Trip.transaction_date <= end_dt,
+                Trip.start_time >= start_dt,  # ✅ CORRECT
+                Trip.start_time <= end_dt,    # ✅ CORRECT
             )
         ).scalar() or Decimal('0.00')
 
         congestion = self.db.query(func.coalesce(func.sum(Trip.congestion_fee), 0)).filter(
             and_(
                 Trip.driver_id.in_(driver_ids),
-                Trip.transaction_date >= start_dt,
-                Trip.transaction_date <= end_dt,
+                Trip.start_time >= start_dt,  # ✅ CORRECT
+                Trip.start_time <= end_dt,    # ✅ CORRECT
             )
         ).scalar() or Decimal('0.00')
 
         cbdt = self.db.query(func.coalesce(func.sum(Trip.cbdt_fee), 0)).filter(
             and_(
                 Trip.driver_id.in_(driver_ids),
-                Trip.transaction_date >= start_dt,
-                Trip.transaction_date <= end_dt,
+                Trip.start_time >= start_dt,  # ✅ CORRECT
+                Trip.start_time <= end_dt,    # ✅ CORRECT
             )
         ).scalar() or Decimal('0.00')
 
         airport = self.db.query(func.coalesce(func.sum(Trip.airport_fee), 0)).filter(
             and_(
                 Trip.driver_id.in_(driver_ids),
-                Trip.transaction_date >= start_dt,
-                Trip.transaction_date <= end_dt,
+                Trip.start_time >= start_dt,  # ✅ CORRECT
+                Trip.start_time <= end_dt,    # ✅ CORRECT
             )
         ).scalar() or Decimal('0.00')
 

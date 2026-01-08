@@ -53,7 +53,7 @@ class DepositService:
         Raises:
             DepositValidationError: If required fields are missing or invalid
         """
-        required_fields = ['lease_id', 'required_amount', 'driver_tlc_license']
+        required_fields = ['lease_id', 'required_amount']
         for field in required_fields:
             if field not in deposit_data or deposit_data[field] is None:
                 raise DepositValidationError(f"Required field '{field}' is missing")
@@ -94,7 +94,7 @@ class DepositService:
         deposit = Deposit(
             deposit_id=deposit_id,
             lease_id=deposit_data['lease_id'],
-            driver_tlc_license=deposit_data['driver_tlc_license'],
+            driver_tlc_license=deposit_data.get('driver_tlc_license'),
             required_amount=required_amount,
             collected_amount=collected_amount,
             outstanding_amount=outstanding_amount,

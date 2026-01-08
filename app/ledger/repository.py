@@ -18,7 +18,10 @@ from app.ledger.models import (
     PostingStatus,
 )
 from app.medallions.models import Medallion
+from app.leases.models import Lease
+from app.vehicles.models import Vehicle
 from app.utils.logger import get_logger
+from app.utils.general import apply_multi_filter
 
 logger = get_logger(__name__)
 
@@ -55,16 +58,38 @@ class LedgerRepository:
             raise PostingNotFoundError(posting_id=posting_id)
         return posting
     
-    def get_posting_by_reference_id(self, reference_id: str) -> LedgerPosting:
+    def get_posting_by_reference_id(
+    self,
+    reference_id: str,
+    is_last: bool = False
+    ) -> LedgerPosting:
         """
         Fetches a single ledger posting by its reference_id.
+
+        - is_last=False → latest posting
+        - is_last=True  → oldest posting
+
         Raises PostingNotFoundError if not found.
         """
-        stmt = select(LedgerPosting).where(LedgerPosting.reference_id == reference_id).order_by(LedgerPosting.created_on.desc())
-        result = self.db.execute(stmt)
-        posting = result.scalars().first()
+
+        order_clause = (
+            LedgerPosting.created_on.asc()
+            if not is_last
+            else LedgerPosting.created_on.desc()
+        )
+
+        stmt = (
+            select(LedgerPosting)
+            .where(LedgerPosting.reference_id == reference_id)
+            .order_by(order_clause)
+            .limit(1)
+        )
+
+        posting = self.db.execute(stmt).scalar_one_or_none()
+
         if not posting:
-            raise PostingNotFoundError(reference_id=reference_id)
+            return None
+
         return posting
 
     def update_posting_status(
@@ -186,14 +211,18 @@ class LedgerRepository:
         page: Optional[int] = None,
         per_page: Optional[int] = None,
         sort_by: Optional[str] = None,
-        sort_order: str = "desc",
+        sort_order: Optional[str] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
+        posting_id: Optional[str] = None,
+        from_amount: Optional[str] = None,
+        to_amount: Optional[str] = None,
         status: Optional[PostingStatus] = None,
         category: Optional[PostingCategory] = None,
         entry_type: Optional[EntryType] = None,
+        reference_id: Optional[str] = None,
         driver_name: Optional[str] = None,
-        lease_id: Optional[int] = None,
+        lease_id: Optional[str] = None,
         vehicle_vin: Optional[str] = None,
         medallion_no: Optional[str] = None,
         include_all: bool = False,
@@ -210,40 +239,107 @@ class LedgerRepository:
             )
         )
 
+        join_driver = False
+        join_vehicle = False
+        join_medallion = False
+        join_lease = False
+
         # Apply filters
         if start_date:
             stmt = stmt.where(LedgerPosting.created_on >= start_date)
         if end_date:
             end_of_day = date(end_date.year, end_date.month, end_date.day)
             stmt = stmt.where(LedgerPosting.created_on <= end_of_day)
+        if posting_id:
+            stmt = apply_multi_filter(stmt, LedgerPosting.id, posting_id)
+        if from_amount:
+            stmt = stmt.where(LedgerPosting.amount >= from_amount)
+        if to_amount:
+            stmt =  stmt.where(LedgerPosting.amount <= to_amount)
         if status:
             stmt = stmt.where(LedgerPosting.status == status)
         if category:
             stmt = stmt.where(LedgerPosting.category == category)
         if entry_type:
             stmt = stmt.where(LedgerPosting.entry_type == entry_type)
+        
+        if reference_id:
+            stmt = apply_multi_filter(stmt, LedgerPosting.reference_id, reference_id)
+
         if lease_id:
-            stmt = stmt.where(LedgerPosting.lease_id == lease_id)
+            if not join_lease:
+                stmt = stmt.join(Lease, LedgerPosting.lease_id == Lease.id)
+                join_lease = True
+            stmt = apply_multi_filter(stmt, Lease.lease_id, lease_id)
+
         if vehicle_vin:
-            stmt = stmt.where(LedgerPosting.vin == vehicle_vin)
+            if not join_vehicle:
+                stmt = stmt.join(Vehicle, LedgerPosting.vehicle_id == Vehicle.id)
+                join_vehicle = True
+            stmt = apply_multi_filter(stmt, Vehicle.vin, vehicle_vin)
+
         if medallion_no:
-            stmt = stmt.where(Medallion.medallion_number.ilike(f"%{medallion_no}%"))
+            if not join_medallion:
+                stmt = stmt.join(Medallion, LedgerPosting.medallion_id == Medallion.id)
+                join_medallion = True
+            stmt = apply_multi_filter(stmt, Medallion.medallion_number, medallion_no)
         if driver_name:
-            stmt = stmt.join(Driver, LedgerPosting.driver_id == Driver.id).where(
-                or_(
-                    Driver.first_name.ilike(f"%{driver_name}%"),
-                    Driver.last_name.ilike(f"%{driver_name}%"),
-                    func.concat(Driver.first_name, " ", Driver.last_name).ilike(f"%{driver_name}%"),
-                )
-            )
+            if not join_driver:
+                stmt = stmt.join(Driver, LedgerPosting.driver_id == Driver.id)
+                join_driver = True
+            stmt = apply_multi_filter(stmt, Driver.full_name, driver_name)
 
         # Count total items
         count_stmt = select(func.count()).select_from(stmt.subquery())
         total_items = self.db.execute(count_stmt).scalar()
 
+        map_sorting = {
+            "posting_id": LedgerPosting.id,
+            "reference_id": LedgerPosting.reference_id,
+            "category": LedgerPosting.category,
+            "entry_type": LedgerPosting.entry_type,
+            "status": LedgerPosting.status,
+            "driver_id": LedgerPosting.driver_id,
+            "amount": LedgerPosting.amount,
+            "driver_name": Driver.full_name,
+            "vehicle_vin": Vehicle.vin,
+            "medallion_no": Medallion.medallion_number,
+            "lease_id": LedgerPosting.lease_id,
+            "date": LedgerPosting.created_on,
+        }
+
         # Apply sorting
         if sort_by:
-            order_column = getattr(LedgerPosting, sort_by, LedgerPosting.created_on)
+            order_column = map_sorting.get(sort_by, LedgerPosting.created_on)
+            if sort_by == "driver_name":
+                if not join_driver:
+                    stmt = stmt.join(Driver, LedgerPosting.driver_id == Driver.id)
+                    join_driver = True
+                order_column = Driver.full_name
+
+            elif sort_by == "driver_id":
+                if not join_driver:
+                    stmt = stmt.join(Driver, LedgerPosting.driver_id == Driver.id)
+                    join_driver = True
+                order_column = Driver.driver_id
+
+            elif sort_by == "vehicle_vin":
+                if not join_vehicle:
+                    stmt = stmt.join(Vehicle, LedgerPosting.vehicle_id == Vehicle.id)
+                    join_vehicle = True
+                order_column = Vehicle.vin
+
+            elif sort_by == "lease_id":
+                if not join_lease:
+                    stmt = stmt.join(Lease, LedgerPosting.lease_id == Lease.id)
+                    join_lease = True
+                order_column = Lease.lease_id
+            elif sort_by == "medallion_no":
+                if not join_medallion:
+                    stmt = stmt.join(Medallion, LedgerPosting.medallion_id == Medallion.id)
+                    join_medallion = True
+                order_column = Medallion.medallion_number
+
             if sort_order == "asc":
                 stmt = stmt.order_by(order_column.asc())
             else:
@@ -266,9 +362,18 @@ class LedgerRepository:
         page: Optional[int] = None,
         per_page: Optional[int] = None,
         sort_by: Optional[str] = None,
-        sort_order: str = "desc",
+        sort_order: Optional[str] = None,
+        balance_id: Optional[str] = None,
+        reference_id: Optional[str] = None,
+        from_original_amount: Optional[float] = None,
+        to_original_amount: Optional[float] = None,
+        from_prior_balance: Optional[float] = None,
+        to_prior_balance: Optional[float] = None,
+        from_balance: Optional[float] = None,
+        to_balance: Optional[float] = None,
         driver_name: Optional[str] = None,
-        lease_id: Optional[int] = None,
+        lease_id: Optional[str] = None,
+        vehicle_vin: Optional[str] = None,
         status: Optional[BalanceStatus] = None,
         category: Optional[PostingCategory] = None,
         include_all: bool = False,
@@ -281,38 +386,116 @@ class LedgerRepository:
             .options(
                 joinedload(LedgerBalance.driver),
                 joinedload(LedgerBalance.vehicle),
+                joinedload(LedgerBalance.lease),
+                joinedload(LedgerBalance.medallion),
             )
         )
 
+        join_lease = False
+        join_vehicle = False
+        join_driver = False
+
         # Apply filters
         if lease_id:
-            stmt = stmt.where(LedgerBalance.lease_id == lease_id)
+            if not join_lease:
+                stmt = stmt.join(Lease, LedgerBalance.lease_id == Lease.id)
+                join_lease = True            
+            stmt = apply_multi_filter(stmt, Lease.lease_id, lease_id)
+
         if status:
             stmt = stmt.where(LedgerBalance.status == status)
+
         if category:
             stmt = stmt.where(LedgerBalance.category == category)
+
+        if balance_id:
+            stmt = apply_multi_filter(stmt, LedgerBalance.id, balance_id)
+
+        if reference_id:
+            stmt = apply_multi_filter(stmt, LedgerBalance.reference_id, reference_id)
+
+        if from_original_amount:
+            stmt = stmt.where(LedgerBalance.original_amount >= from_original_amount)
+
+        if to_original_amount:
+            stmt = stmt.where(LedgerBalance.original_amount <= to_original_amount)
+
+        if from_prior_balance:
+            stmt = stmt.where(LedgerBalance.prior_balance >= from_prior_balance)
+
+        if to_prior_balance:
+            stmt = stmt.where(LedgerBalance.prior_balance <= to_prior_balance)
+
+        if from_balance:
+            stmt = stmt.where(LedgerBalance.balance >= from_balance)
+
+        if to_balance:
+            stmt = stmt.where(LedgerBalance.balance <= to_balance)
+
         if driver_name:
-            stmt = stmt.join(Driver, LedgerBalance.driver_id == Driver.id).where(
-                or_(
-                    Driver.first_name.ilike(f"%{driver_name}%"),
-                    Driver.last_name.ilike(f"%{driver_name}%"),
-                    func.concat(Driver.first_name, " ", Driver.last_name).ilike(f"%{driver_name}%"),
-                )
-            )
+            if not join_driver:
+                stmt = stmt.join(Driver, LedgerBalance.driver_id == Driver.id)
+                join_driver = True
+            stmt = apply_multi_filter(stmt, Driver.full_name, driver_name)
+
+        if vehicle_vin:
+            if not join_vehicle:
+                stmt = stmt.join(Vehicle, LedgerBalance.vehicle_id == Vehicle.id)
+                join_vehicle = True
+            stmt = apply_multi_filter(stmt, Vehicle.vin, vehicle_vin)
 
         # Count total items
         count_stmt = select(func.count()).select_from(stmt.subquery())
         total_items = self.db.execute(count_stmt).scalar()
 
+        sorting_map = {
+            "balance_id": LedgerBalance.id,
+            "reference_id": LedgerBalance.reference_id,
+            "category": LedgerBalance.category,
+            "status": LedgerBalance.status,
+            "driver_id": LedgerBalance.driver_id,
+            "original_amount": LedgerBalance.original_amount,
+            "balance": LedgerBalance.balance,
+            "prior_balance": LedgerBalance.prior_balance,
+            "driver_name": Driver.full_name,
+            "vehicle_vin": Vehicle.vin,
+            "lease_id": LedgerBalance.lease_id,
+            "created_on": LedgerBalance.created_on,
+        }
+
         # Apply sorting
-        if sort_by:
-            order_column = getattr(LedgerBalance, sort_by, LedgerBalance.created_on)
+        if sort_by and sort_order:
+            order_column = sorting_map.get(sort_by, LedgerBalance.created_on)
+            if sort_by == "driver_name":
+                if not join_driver:
+                    stmt = stmt.join(Driver, LedgerBalance.driver_id == Driver.id)
+                    join_driver = True
+                order_column = Driver.full_name
+
+            elif sort_by == "driver_id":
+                if not join_driver:
+                    stmt = stmt.join(Driver, LedgerBalance.driver_id == Driver.id)
+                    join_driver = True
+                order_column = Driver.driver_id
+
+            elif sort_by == "vehicle_vin":
+                if not join_vehicle:
+                    stmt = stmt.join(Vehicle, LedgerBalance.vehicle_id == Vehicle.id)
+                    join_vehicle = True
+                order_column = Vehicle.vin
+
+            elif sort_by == "lease_id":
+                if not join_lease:
+                    stmt = stmt.join(Lease, LedgerBalance.lease_id == Lease.id)
+                    join_lease = True
+                order_column = Lease.lease_id
+
             if sort_order == "asc":
                 stmt = stmt.order_by(order_column.asc())
             else:
                 stmt = stmt.order_by(order_column.desc())
         else:
-            stmt = stmt.order_by(LedgerBalance.created_on.desc())
+            stmt = stmt.order_by(LedgerBalance.updated_on.desc() , LedgerBalance.created_on.desc())
 
         # Apply pagination unless include_all is True
         if not include_all and page and per_page:
