@@ -378,21 +378,42 @@ class LedgerService:
     def _notify_balance_paid(self, reference_id: str, category: PostingCategory):
         """
         Notify source modules when a balance is fully paid.
-        This enables status synchronization.
+        This enables status synchronization across all payment categories.
         """
         try:
             if category == PostingCategory.REPAIR:
                 from app.repairs.services import RepairService
                 repair_service = RepairService(self.repo.db)
                 repair_service.mark_installment_paid(reference_id)
-                
+
             elif category == PostingCategory.LOAN:
                 from app.loans.services import LoanService
                 loan_service = LoanService(self.repo.db)
                 loan_service.mark_installment_paid(reference_id)
-                
-            # Add other categories as needed (EZPASS, PVB, TLC, etc.)
-            
+
+            elif category == PostingCategory.EZPASS:
+                from app.ezpass.services import EZPassService
+                ezpass_service = EZPassService(self.repo.db)
+                ezpass_service.mark_transaction_paid(reference_id)
+
+            elif category == PostingCategory.PVB:
+                from app.pvb.services import PVBService
+                pvb_service = PVBService(self.repo.db)
+                pvb_service.mark_violation_paid(reference_id)
+
+            elif category == PostingCategory.TLC:
+                from app.tlc.services import TLCService
+                tlc_service = TLCService(self.repo.db)
+                tlc_service.mark_violation_paid(reference_id)
+
+            elif category == PostingCategory.MISCELLANEOUS_EXPENSE:
+                from app.misc_expenses.services import MiscellaneousExpenseService
+                misc_service = MiscellaneousExpenseService(self.repo.db)
+                misc_service.mark_expense_recovered(reference_id)
+
+            # Note: MISCELLANEOUS_CREDIT, DEPOSIT, TAXES, EARNINGS, etc. don't need status updates
+            # They are either contra-accounts or managed by separate systems
+
         except Exception as e:
             # Don't fail the payment if notification fails
             logger.error(

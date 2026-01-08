@@ -181,3 +181,72 @@ class TLCService:
 
         except Exception as e:
             raise TLCLedgerPostingError(violation.summons_no, str(e)) from e
+
+    def mark_violation_paid(self, summons_no: str) -> None:
+        """
+        Called by LedgerService when a TLC violation balance reaches zero.
+        TLC violations remain in POSTED status after payment.
+        This notification is for audit logging purposes only.
+
+        Args:
+            summons_no: The violation reference ID (summons number)
+        """
+        try:
+            violation = self.repo.get_violation_by_summons(summons_no)
+            if not violation:
+                logger.warning(
+                    "TLC violation not found for payment notification",
+                    summons_no=summons_no
+                )
+                return
+
+            logger.info(
+                "TLC violation balance paid",
+                summons_no=summons_no,
+                driver_id=violation.driver_id,
+                total_payable=float(violation.total_payable),
+                status=violation.status.value
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error processing TLC payment notification",
+                summons_no=summons_no,
+                error=str(e),
+                exc_info=True
+            )
+            raise
+
+    def mark_violation_reopened(self, summons_no: str) -> None:
+        """
+        Called by LedgerService when a payment is voided and balance is reopened.
+        TLC violations remain in POSTED status.
+        This notification is for audit logging purposes only.
+
+        Args:
+            summons_no: The violation reference ID (summons number)
+        """
+        try:
+            violation = self.repo.get_violation_by_summons(summons_no)
+            if not violation:
+                logger.warning(
+                    "TLC violation not found for reopening notification",
+                    summons_no=summons_no
+                )
+                return
+
+            logger.info(
+                "TLC violation balance reopened (payment voided)",
+                summons_no=summons_no,
+                driver_id=violation.driver_id,
+                total_payable=float(violation.total_payable)
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error processing TLC reopening notification",
+                summons_no=summons_no,
+                error=str(e),
+                exc_info=True
+            )
+            raise

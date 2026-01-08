@@ -1090,12 +1090,81 @@ class EZPassService:
             start_date=start_date,
             end_date=end_date,
         )
-        
+
         return {
             **logs,
             "available_log_types": AVAILABLE_LOG_TYPES,
             "available_log_statuses": AVAILABLE_LOG_STATUSES,
         }
+
+    def mark_transaction_paid(self, transaction_id: str) -> None:
+        """
+        Called by LedgerService when an EZPass transaction balance reaches zero.
+        EZPass transactions remain in POSTED_TO_LEDGER status after payment.
+        This notification is for audit logging purposes only.
+
+        Args:
+            transaction_id: The transaction reference ID (Lane Txn ID)
+        """
+        try:
+            transaction = self.repo.get_transaction_by_transaction_id(transaction_id)
+            if not transaction:
+                logger.warning(
+                    "EZPass transaction not found for payment notification",
+                    transaction_id=transaction_id
+                )
+                return
+
+            logger.info(
+                "EZPass transaction balance paid",
+                transaction_id=transaction_id,
+                driver_id=transaction.driver_id,
+                amount=float(transaction.amount),
+                status=transaction.status.value
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error processing EZPass payment notification",
+                transaction_id=transaction_id,
+                error=str(e),
+                exc_info=True
+            )
+            raise
+
+    def mark_transaction_reopened(self, transaction_id: str) -> None:
+        """
+        Called by LedgerService when a payment is voided and balance is reopened.
+        EZPass transactions remain in POSTED_TO_LEDGER status.
+        This notification is for audit logging purposes only.
+
+        Args:
+            transaction_id: The transaction reference ID (Lane Txn ID)
+        """
+        try:
+            transaction = self.repo.get_transaction_by_transaction_id(transaction_id)
+            if not transaction:
+                logger.warning(
+                    "EZPass transaction not found for reopening notification",
+                    transaction_id=transaction_id
+                )
+                return
+
+            logger.info(
+                "EZPass transaction balance reopened (payment voided)",
+                transaction_id=transaction_id,
+                driver_id=transaction.driver_id,
+                amount=float(transaction.amount)
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error processing EZPass reopening notification",
+                transaction_id=transaction_id,
+                error=str(e),
+                exc_info=True
+            )
+            raise
 
 
 

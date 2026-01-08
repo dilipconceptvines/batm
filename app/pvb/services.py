@@ -1123,6 +1123,75 @@ class PVBService:
             logger.error(f"Error retrieving PVB logs: {e}", exc_info=True)
             raise e
 
+    def mark_violation_paid(self, summons: str) -> None:
+        """
+        Called by LedgerService when a PVB violation balance reaches zero.
+        PVB violations remain in POSTED_TO_LEDGER status after payment.
+        This notification is for audit logging purposes only.
+
+        Args:
+            summons: The violation reference ID (summons number)
+        """
+        try:
+            violation = self.repo.get_violation_by_summons(summons)
+            if not violation:
+                logger.warning(
+                    "PVB violation not found for payment notification",
+                    summons=summons
+                )
+                return
+
+            logger.info(
+                "PVB violation balance paid",
+                summons=summons,
+                driver_id=violation.driver_id,
+                amount_due=float(violation.amount_due),
+                status=violation.status.value
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error processing PVB payment notification",
+                summons=summons,
+                error=str(e),
+                exc_info=True
+            )
+            raise
+
+    def mark_violation_reopened(self, summons: str) -> None:
+        """
+        Called by LedgerService when a payment is voided and balance is reopened.
+        PVB violations remain in POSTED_TO_LEDGER status.
+        This notification is for audit logging purposes only.
+
+        Args:
+            summons: The violation reference ID (summons number)
+        """
+        try:
+            violation = self.repo.get_violation_by_summons(summons)
+            if not violation:
+                logger.warning(
+                    "PVB violation not found for reopening notification",
+                    summons=summons
+                )
+                return
+
+            logger.info(
+                "PVB violation balance reopened (payment voided)",
+                summons=summons,
+                driver_id=violation.driver_id,
+                amount_due=float(violation.amount_due)
+            )
+
+        except Exception as e:
+            logger.error(
+                "Error processing PVB reopening notification",
+                summons=summons,
+                error=str(e),
+                exc_info=True
+            )
+            raise
+
 # --- Celery Tasks ---
 
 @shared_task(name="pvb.associate_violations")
