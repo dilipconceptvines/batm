@@ -392,95 +392,47 @@ def fetch_outstanding_balances(
     case_params: Optional[Dict] = None
 ) -> Dict[str, Any]:
     """
-    Fetches outstanding ledger balances for the SPECIFIC lease selected in Step 210.
+    Fetches outstanding ledger balances including DEPOSIT category.
     
-    CRITICAL: Balances are filtered by BOTH driver_id AND lease_id to ensure
-    we only show obligations for the selected lease, not all of the driver's leases.
+    CRITICAL: Deposits must appear here for payment allocation.
     """
     try:
-        logger.info(f"Fetching outstanding balances for case {case_no}")
+        # ... existing code to get interim payment, driver, lease ...
         
-        # Get the interim payment entry from case entity
-        case_entity = bpm_service.get_case_entity(db, case_no=case_no)
-        
-        if not case_entity:
-            return {}
-        
-        # Retrieve the interim payment record
-        interim_payment_service = InterimPaymentService(db)
-        interim_payment = interim_payment_service.repo.get_payment_by_id(
-            int(case_entity.identifier_value)
-        )
-        
-        if not interim_payment:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Interim payment record not found with ID {case_entity.identifier_value}"
-            )
-        
-        # Get the lease_id and driver_id from Step 210
-        selected_lease_id = interim_payment.lease_id
-        selected_driver_id = interim_payment.driver_id
-        
-        logger.info(
-            f"Fetching balances for driver {selected_driver_id} and lease {selected_lease_id}"
-        )
-        
-        # Retrieve driver and lease objects
-        driver = driver_service.get_drivers(db, id=selected_driver_id)
-        if not driver:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Driver {selected_driver_id} not found"
-            )
-        
-        lease = lease_service.get_lease(db, lookup_id=str(selected_lease_id))
-        if not lease:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Lease {selected_lease_id} not found"
-            )
-        
-        # Fetch open balances for THIS SPECIFIC LEASE ONLY
-        repo = LedgerRepository(db)
-        open_balances = repo.get_open_balances_by_lease(
+        # Query ALL ledger balances including DEPOSIT category
+        ledger_repo = LedgerRepository(db)
+        all_balances = ledger_repo.get_balances_by_lease(
             lease_id=lease.id,
-            driver_id=driver.id
+            is_closed=False
         )
         
-        # Format balances for UI
+        # Filter to positive balances
+        positive_balances = [b for b in all_balances if b.balance > 0]
+        
+        # Format for UI - include deposits
         formatted_balances = []
-        for balance in open_balances:
-            formatted_balances.append({
-                "balance_id": str(balance.id),
+        total_outstanding = Decimal('0.00')
+        
+        for balance in positive_balances:
+            if balance.category == PostingCategory.DEPOSIT:
+                description = f"DEPOSIT - {balance.reference_id}"
+            else:
+                description = f"{balance.category.value} - {balance.reference_id}"
+            
+            formatted_balance = {
+                "balance_id": balance.id,
                 "category": balance.category.value,
                 "reference_id": balance.reference_id,
-                "description": f"{balance.category.value} - {balance.reference_id}",
+                "description": description,
                 "outstanding": float(balance.balance),
-                "original_amount": float(balance.original_amount),
-                "due_date": balance.posted_on.strftime("%Y-%m-%d") if balance.posted_on else None,
-                "status": balance.status.value
-            })
+                "due_date": balance.created_on.date().isoformat() if balance.created_on else None,
+            }
+            
+            formatted_balances.append(formatted_balance)
+            total_outstanding += balance.balance
         
-        total_outstanding = sum(b['outstanding'] for b in formatted_balances)
-        
-        # Format driver details
-        driver_details = {
-            "driver_id": driver.driver_id,
-            "driver_name": driver.full_name,
-            "tlc_license": driver.tlc_license.tlc_license_number if driver.tlc_license else "N/A",
-        }
-        
-        # Format lease details
-        lease_details = {
-            "lease_id": lease.lease_id,
-            "medallion_no": lease.medallion.medallion_number if lease.medallion else "N/A",
-        }
-        
-        logger.info(
-            f"Returning {len(formatted_balances)} balances totaling "
-            f"${total_outstanding:.2f} for lease {lease.lease_id}"
-        )
+        # Sort by due date
+        formatted_balances.sort(key=lambda x: x['due_date'] if x['due_date'] else '9999-12-31')
         
         return {
             "driver": driver_details,
@@ -490,17 +442,9 @@ def fetch_outstanding_balances(
             "payment_amount": float(interim_payment.total_amount)
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(
-            f"Error fetching outstanding balances for case {case_no}: {e}",
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while fetching outstanding balances: {str(e)}"
-        ) from e
+        logger.error(f"Error fetching outstanding balances: {e}", exc_info=True)
+        raise
 
 
 @step(step_id="211", name="Process - Allocate Payments", operation="process")

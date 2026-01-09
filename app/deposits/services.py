@@ -41,11 +41,23 @@ class DepositService:
 
     def create_deposit(self, db: Session, deposit_data: dict) -> Deposit:
         """
-        Creates a new deposit record with validation and calculations.
+        Creates a new deposit record during lease creation.
+        
+        SIMPLIFIED: Only captures required_amount. No collection at creation.
+        All payments must be made through interim payments.
 
         Args:
             db: Database session
             deposit_data: Dictionary containing deposit information
+                Required keys:
+                    - lease_id: int
+                    - required_amount: Decimal
+                Optional keys:
+                    - driver_tlc_license: str
+                    - vehicle_vin: str
+                    - vehicle_plate: str
+                    - lease_start_date: date
+                    - notes: str
 
         Returns:
             Created Deposit instance
@@ -53,34 +65,17 @@ class DepositService:
         Raises:
             DepositValidationError: If required fields are missing or invalid
         """
+        # Validate required fields
         required_fields = ['lease_id', 'required_amount']
         for field in required_fields:
             if field not in deposit_data or deposit_data[field] is None:
                 raise DepositValidationError(f"Required field '{field}' is missing")
 
-        # Validate amounts
+        # Validate amount
         required_amount = Decimal(str(deposit_data['required_amount']))
-        collected_amount = Decimal(str(deposit_data.get('collected_amount', 0)))
 
-        if required_amount <= 0:
-            raise DepositValidationError("Required amount must be positive")
-
-        if collected_amount < 0:
-            raise DepositValidationError("Collected amount cannot be negative")
-
-        if collected_amount > required_amount:
-            raise DepositValidationError("Collected amount cannot exceed required amount")
-
-        # Calculate outstanding amount
-        outstanding_amount = required_amount - collected_amount
-
-        # Determine status
-        if collected_amount == 0:
-            status = DepositStatus.PENDING
-        elif collected_amount < required_amount:
-            status = DepositStatus.PARTIALLY_PAID
-        else:
-            status = DepositStatus.PAID
+        if required_amount < 0:
+            raise DepositValidationError("Required amount cannot be negative")
 
         # Generate deposit ID
         deposit_id = self.generate_deposit_id(deposit_data['lease_id'])
@@ -91,14 +86,26 @@ class DepositService:
             raise DepositValidationError(f"Deposit already exists for lease {deposit_data['lease_id']}")
 
         # Create deposit instance
+        # ALWAYS starts with collected_amount = 0, status = PENDING (or PAID if required = 0)
+        collected_amount = Decimal('0.00')
+        outstanding_amount = required_amount
+        
+        # Determine initial status
+        if required_amount == 0:
+            status = DepositStatus.PAID  # Waived deposit
+        else:
+            status = DepositStatus.PENDING
+
         deposit = Deposit(
             deposit_id=deposit_id,
             lease_id=deposit_data['lease_id'],
             driver_tlc_license=deposit_data.get('driver_tlc_license'),
             required_amount=required_amount,
-            collected_amount=collected_amount,
+            collected_amount=collected_amount,  # Always 0 at creation
             outstanding_amount=outstanding_amount,
             deposit_status=status,
+            initial_collection_amount=None,  # Set when first payment made
+            collection_method=None,  # Set when first payment made
             vehicle_vin=deposit_data.get('vehicle_vin'),
             vehicle_plate=deposit_data.get('vehicle_plate'),
             lease_start_date=deposit_data.get('lease_start_date'),
@@ -108,7 +115,7 @@ class DepositService:
         # Save to database
         created_deposit = self.repo.create(deposit)
         logger.info(
-            "Created new deposit",
+            "Created new deposit (no collection at creation)",
             deposit_id=created_deposit.deposit_id,
             lease_id=created_deposit.lease_id,
             required_amount=float(created_deposit.required_amount),
@@ -126,13 +133,15 @@ class DepositService:
         notes: Optional[str] = None
     ) -> Deposit:
         """
-        Updates deposit collection with additional payment.
+        Updates deposit collection with payment from interim payment.
+        
+        This is the ONLY way deposits are collected per client requirements.
 
         Args:
             db: Database session
             deposit_id: Unique deposit identifier
             additional_amount: Amount being collected
-            collection_method: How the payment was collected
+            collection_method: How the payment was collected (from interim payment)
             notes: Optional notes about the collection
 
         Returns:
@@ -141,6 +150,7 @@ class DepositService:
         Raises:
             DepositNotFoundError: If deposit doesn't exist
             InvalidDepositOperationError: If deposit is not in collectible state
+            DepositValidationError: If validation fails
         """
         if additional_amount <= 0:
             raise DepositValidationError("Additional amount must be positive")
@@ -156,16 +166,24 @@ class DepositService:
                 f"Cannot collect payment for deposit in {deposit.deposit_status.value} status"
             )
 
+        # Validate amount doesn't exceed outstanding
+        if additional_amount > deposit.outstanding_amount:
+            raise DepositValidationError(
+                f"Payment amount ${additional_amount} exceeds outstanding deposit amount ${deposit.outstanding_amount}"
+            )
+
         # Update amounts
         deposit.collected_amount += additional_amount
         deposit.outstanding_amount = deposit.required_amount - deposit.collected_amount
 
-        # Update collection details
+        # Set initial_collection_amount on FIRST payment only
         if not deposit.initial_collection_amount:
             deposit.initial_collection_amount = additional_amount
+
+        # Update collection method (track most recent method)
         deposit.collection_method = collection_method
 
-        # Update status
+        # Update status based on new collected amount
         if deposit.collected_amount >= deposit.required_amount:
             deposit.deposit_status = DepositStatus.PAID
             deposit.outstanding_amount = Decimal('0.00')
@@ -186,10 +204,11 @@ class DepositService:
         # Save changes
         updated_deposit = self.repo.update(deposit)
         logger.info(
-            "Updated deposit collection",
+            "Updated deposit collection via interim payment",
             deposit_id=deposit_id,
             additional_amount=float(additional_amount),
             new_collected=float(deposit.collected_amount),
+            new_outstanding=float(deposit.outstanding_amount),
             new_status=deposit.deposit_status.value
         )
 
@@ -206,41 +225,42 @@ class DepositService:
 
         Args:
             db: Database session
-            lease_id: Lease identifier
-            termination_date: Date when lease was terminated
+            lease_id: Lease ID being terminated
+            termination_date: Date of termination
 
         Returns:
             Updated Deposit instance
 
         Raises:
             DepositNotFoundError: If deposit doesn't exist
-            InvalidDepositOperationError: If deposit is not in valid state for hold
         """
-        # Get deposit
         deposit = self.repo.get_by_lease_id(lease_id)
         if not deposit:
             raise DepositNotFoundError(lease_id=lease_id)
 
-        # Validate deposit can be put on hold
-        if deposit.deposit_status != DepositStatus.PAID:
-            raise InvalidDepositOperationError(
-                f"Cannot initiate hold for deposit in {deposit.deposit_status.value} status"
+        # Allow holding even if not fully paid (partial deposits can still be held)
+        if deposit.deposit_status not in [DepositStatus.PAID, DepositStatus.PARTIALLY_PAID]:
+            logger.warning(
+                "Holding deposit that has not been collected",
+                deposit_id=deposit.deposit_id,
+                current_status=deposit.deposit_status.value,
+                collected_amount=float(deposit.collected_amount)
             )
 
-        # Calculate hold expiry date (30 days after termination)
+        # Calculate hold expiry date (30 days from termination)
         hold_expiry_date = termination_date + timedelta(days=30)
 
         # Update deposit
+        deposit.deposit_status = DepositStatus.HELD
         deposit.lease_termination_date = termination_date
         deposit.hold_expiry_date = hold_expiry_date
-        deposit.deposit_status = DepositStatus.HELD
 
         # Save changes
         updated_deposit = self.repo.update(deposit)
         logger.info(
-            "Initiated hold period for deposit",
+            "Initiated deposit hold period",
             deposit_id=deposit.deposit_id,
-            lease_id=lease_id,
+            collected_amount=float(deposit.collected_amount),
             termination_date=termination_date.isoformat(),
             hold_expiry_date=hold_expiry_date.isoformat()
         )

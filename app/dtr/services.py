@@ -514,6 +514,7 @@ class DTRService:
                 LeaseSchedule.lease_id == lease.id,
                 LeaseSchedule.period_start_date <= week_start,
                 LeaseSchedule.period_end_date >= week_end,
+                LeaseSchedule.is_active == True
             )
         ).first()
 

@@ -384,7 +384,7 @@ class RepairService:
                         results.append(InstallmentPostingResult(
                         installment_id=installment_id,
                         success=False,
-                        error_message=f"Installment {installment_id} not found"
+                        message=f"Installment {installment_id} not found"
                         ))
                         failed_count += 1
 
@@ -396,7 +396,7 @@ class RepairService:
                         results.append(InstallmentPostingResult(
                             installment_id=installment.installment_id,
                             success=False,
-                            error_message=f"Installment status is {installment.status.value}, must be SCHEDULES"
+                            message=f"Installment status is {installment.status.value}, must be SCHEDULES"
                         ))
                         failed_count += 1
                         continue
@@ -405,16 +405,7 @@ class RepairService:
                         results.append(InstallmentPostingResult(
                             installment_id=installment.installment_id,
                             success=False,
-                            error_message=f"Parent invoice status is {installment.invoice.status.value}, must be OPEN"
-                        ))
-                        failed_count += 1
-                        continue
-
-                    if installment.week_start_date > datetime.utcnow().date():
-                        results.append(InstallmentPostingResult(
-                            installment_id=installment.installment_id,
-                            success=False,
-                            error_message=f"Installment date {installment.week_start_date} is in the future"
+                            message=f"Parent invoice status is {installment.invoice.status.value}, must be OPEN"
                         ))
                         failed_count += 1
                         continue
@@ -439,8 +430,9 @@ class RepairService:
                     results.append(InstallmentPostingResult(
                         installment_id=installment.installment_id,
                         success=True,
-                        ledger_posting_ref=ledger_posting.id,
-                        posted_on=posted_on
+                        ledger_posting_id=ledger_posting.id,
+                        posted_on=posted_on,
+                        message=f"Installment {installment.installment_id} posted successfully"
                     ))
                     posted_count += 1
 
@@ -452,7 +444,7 @@ class RepairService:
                     results.append(InstallmentPostingResult(
                         installment_id=installment.installment_id,
                         success=False,
-                        error_message=f"Error posting installment to ledger: {e}"
+                        message=f"Error posting installment to ledger: {e}"
                     ))
                     failed_count += 1
                     logger.error(f"Error posting installment to ledger: {e}", exc_info=True)

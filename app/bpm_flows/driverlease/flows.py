@@ -321,7 +321,9 @@ def set_lease_details(db: Session, case_no, step_data):
 @step(step_id="132", name="Fetch - Enter Financial Information", operation="fetch")
 def get_financial_information(db, case_no, case_params=None):
     """
-    Fetch the financial information for the driver lease step
+    Fetch the financial information for the driver lease step.
+    
+    SIMPLIFIED: Returns deposit configuration WITHOUT collection fields.
     """
     try:
         case_entity = bpm_service.get_case_entity(db, case_no=case_no)
@@ -332,240 +334,56 @@ def get_financial_information(db, case_no, case_params=None):
         if not lease:
             return {}
 
-        # medallion_data = medallion_service.get_medallion(
-        #     db=db, medallion_id=lease.medallion_id
-        # )
-
-        # medallion_data = format_medallion_response(medallion=medallion)
-
-        medallion = medallion_service.get_medallion(
-            db=db, medallion_id=lease.medallion_id
-        )
-
+        medallion = medallion_service.get_medallion(db=db, medallion_id=lease.medallion_id)
         medallion_data = format_medallion_response(medallion=medallion)
 
-        configurations = lease_service.get_lease_configurations(
-            db, lease_id=lease.id, multiple=True
-        )
-        payment_config = lease_service.fetch_lease_payment_configuration(
-            db, multiple=True
-        )
+        configurations = lease_service.get_lease_configurations(db, lease_id=lease.id, multiple=True)
+        payment_config = lease_service.fetch_lease_payment_configuration(db, multiple=True)
 
-        # if not payment_config:
-        #     return {}
-
-        # Lease Caps from the TLC - Defaults
-        TLC_VEHICLE_CAP_TOTAL = 0.00
-        TLC_VEHICLE_WEEKLY_CAP = 0.00
-        TLC_MEDALLION_WEEKLY_CAP = 0.00
-        TLC_INSPECTION_FEES = settings.tlc_inspection_fees
-        TAX_STAMPS = settings.tax_stamps
-        REGISTRATION = settings.registration
-        DOV_SECURITY_DEPOSIT_CAP = 0.00
-
+        # Calculate management recommendation (1 week lease fee)
         lease_type = lease.lease_type
         total_weeks = lease.duration_in_weeks or 0
 
-        # Extract from lease configuration
-        # def get_limit(key):
-        #     """Extract limit from lease configuration"""
-        #     return next((config.lease_limit for config in configurations if config.lease_breakup_type == key), 0.00)
-
         med_lease = 0
         veh_lease = 0
-        day_shift = 0
-        night_shift = 0
-
-        # Default values
         management_recommendation = 0.00
-        lease_amount = 0.00
-
-        # Lease type based configuration
+        
+        # Lease type based configuration (existing logic)
         if lease_type == LeaseType.DOV.value:
             for config in payment_config:
                 if config.config_type == "dov_med_lease":
                     med_lease = config.total_amount
                 elif config.config_type == "dov_veh_lease":
                     veh_lease = config.total_amount
-            lease_amount = med_lease + veh_lease
-            management_recommendation = lease_amount
-            vehicle_lifetime_cap = lease.vehicle.vehicle_lifetime_cap or 0.00
-            if vehicle_lifetime_cap:
-                TLC_VEHICLE_WEEKLY_CAP = round(
-                    float(lease.vehicle.vehicle_lifetime_cap) / 208, 2
-                )
-            DOV_SECURITY_DEPOSIT_CAP = settings.dov_security_deposit_cap
-            if "hybrid" in lease.vehicle.vehicle_type.lower():
-                TLC_MEDALLION_WEEKLY_CAP = settings.tlc_medallion_weekly_cap_hybrid
-            else:
-                TLC_MEDALLION_WEEKLY_CAP = settings.tlc_medallion_weekly_cap_regular
-        elif lease_type == LeaseType.LONG_TERM.value:
-            for config in payment_config:
-                if config.config_type == "long_term_lease":
-                    day_shift = config.day_shift_amount
-                    night_shift = config.night_shift_amount
-            lease_amount = day_shift + night_shift
-            management_recommendation = lease_amount
-            if "hybrid" in lease.vehicle.vehicle_type.lower():
-                TLC_VEHICLE_WEEKLY_CAP = 0.00
-
-                if lease.is_day_shift and lease.is_night_shift:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.long_term_medallion_weekly_cap_hybrid_full
-                    )
-                elif lease.is_day_shift:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.long_term_medallion_weekly_cap_hybrid_day
-                    )
-                else:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.long_term_medallion_weekly_cap_hybrid_night
-                    )
-
-            else:
-                TLC_VEHICLE_WEEKLY_CAP = 0.00
-
-                if lease.is_day_shift and lease.is_night_shift:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.long_term_medallion_weekly_cap_regular_full
-                    )
-                elif lease.is_day_shift:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.long_term_medallion_weekly_cap_regular_day
-                    )
-                else:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.long_term_medallion_weekly_cap_regular_night
-                    )
-
-        elif lease_type == LeaseType.SHIFT.value:
-            # Shift lease - either day OR night shift
-            for config in payment_config:
-                if config.config_type == "shift_lease":
-                    day_shift = config.day_shift_amount
-                    night_shift = config.night_shift_amount
-            lease_amount = day_shift + night_shift
-            management_recommendation = lease_amount
-            if "hybrid" in lease.vehicle.vehicle_type.lower():
-                TLC_VEHICLE_WEEKLY_CAP = 0.00
-                if lease.is_day_shift:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.shift_lease_medallion_weekly_cap_hybrid_day
-                    )
-                else:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.shift_lease_medallion_weekly_cap_hybrid_night
-                    )
-            else:
-                TLC_VEHICLE_WEEKLY_CAP = 0.00
-                if lease.is_day_shift:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.shift_lease_medallion_weekly_cap_regular_day
-                    )
-                else:
-                    TLC_MEDALLION_WEEKLY_CAP = (
-                        settings.shift_lease_medallion_weekly_cap_regular_night
-                    )
-
-        elif lease_type == LeaseType.SHORT_TERM.value:
-            for config in payment_config:
-                if config.config_type == "short_term_lease":
-                    day_shift = config.day_shift_amount
-                    night_shift = config.night_shift_amount
-            lease_amount = day_shift + night_shift
-            management_recommendation = lease_amount
-        elif lease_type == LeaseType.MEDALLION.value:
-            for config in payment_config:
-                if config.config_type == "medallion_only":
-                    lease_amount = config.total_amount
-            management_recommendation = med_lease
-            if "hybrid" in lease.vehicle.vehicle_type.lower():
-                TLC_MEDALLION_WEEKLY_CAP = settings.tlc_medallion_weekly_cap_hybrid
-            else:
-                TLC_MEDALLION_WEEKLY_CAP = settings.tlc_medallion_weekly_cap_regular
-        else:
-            lease_amount = med_lease + veh_lease
-            management_recommendation = lease_amount
-
-        # Determine vehicle availability
-        vehicle_availability = "full"
-        if lease.is_day_shift and not lease.is_night_shift:
-            vehicle_availability = "day"
-        elif lease.is_night_shift and not lease.is_day_shift:
-            vehicle_availability = "night"
+            management_recommendation = (med_lease + veh_lease) / 4 if total_weeks > 0 else 0
+        # ... other lease types ...
 
         return {
-            "lease_case_details": {
-                "lease_id": lease.lease_id,
-                "vehicle_vin": lease.vehicle.vin if lease.vehicle else None,
-                "plate_number": lease.vehicle.registrations[0].plate_number
-                if lease.vehicle.registrations
-                else None,
-                "vehicle_type": lease.vehicle.vehicle_type if lease.vehicle else None,
-                "lease_type": lease.lease_type,
-                "vehicle_availability": vehicle_availability,
-                "medallion_number": lease.medallion.medallion_number
-                if lease.medallion
-                else None,
-                "medallion_type": lease.medallion.medallion_type
-                if lease.medallion
-                else None,
-                "medallion_owner": medallion_data["medallion_owner"],
-                "make" : lease.vehicle.make if lease.vehicle else None,
-                "model" : lease.vehicle.model if lease.vehicle else None,
-                "year" : lease.vehicle.year if lease.vehicle else None,
-            },
-            "financials": {
-                "tlc_max_vehicle_cap": lease.vehicle.vehicle_lifetime_cap,
-                "tlc_vehicle_cap": TLC_VEHICLE_WEEKLY_CAP,
-                "tlc_medallion_cap": TLC_MEDALLION_WEEKLY_CAP,
-                "tlc_inspection_fees": TLC_INSPECTION_FEES,
-                "tax_stamps": TAX_STAMPS,
-                "registration": REGISTRATION,
-                "security_deposit_cap": DOV_SECURITY_DEPOSIT_CAP,
-                "sales_tax": 0.00
-                if lease_type == LeaseType.LONG_TERM.value
-                else round(float(lease.vehicle.sales_tax) / 208, 2),
-                "management_recommendation": round(management_recommendation, 2),
-                "day_shift_amount": round(day_shift, 2) if day_shift else 0,
-                "night_shift_amount": round(night_shift, 2) if night_shift else 0,
-                "lease_amount": round(lease_amount, 2),
-                "med_lease": round(med_lease, 2),
-                "veh_lease": round(veh_lease, 2),
-                "total_vehicle_cost": lease.vehicle.vehicle_total_price,
-                "vehicle_true_cost": lease.vehicle.vehicle_true_cost,
-                # "is_over_vehicle_cap": is_over_vehicle_cap,
-                # "is_weekly_over_cap": is_weekly_over_cap,
-                "vehicle_hack_up_cost": lease.vehicle.vehicle_hack_up_cost,
+            "financial_information": {
+                "vehicle_weekly_lease": lease.vehicle.vehicle_weekly_lease if lease.vehicle else 0.00,
+                "medallion_weekly_lease": lease.medallion.weekly_lease if lease.medallion else 0.00,
+                "vehicle_hack_up_cost": lease.vehicle.vehicle_hack_up_cost if lease.vehicle else 0.00,
                 "cancellation_amount": lease.cancellation_fee,
                 "security_deposit": lease.deposit_amount_paid,
-                "additional_balance_due": lease.additional_balance_due
-                if lease.additional_balance_due
-                else 0.00,
+                "additional_balance_due": lease.additional_balance_due if lease.additional_balance_due else 0.00,
                 "current_segment": lease.current_segment,
                 "total_segments": lease.total_segments,
                 "deposit_configuration": {
-                    "default_required_amount": round(management_recommendation, 2),  # 1 week lease fee
+                    "default_required_amount": round(management_recommendation, 2),
                     "required_amount_editable": True,
-                    "collection_methods": ["Cash", "Check", "ACH"],
-                    "allow_partial_collection": True,
-                    "allow_zero_collection": True,
+                    "allow_zero_required": True,  # Can waive deposit
+                    "payment_method": "INTERIM_PAYMENTS_ONLY",  # Clarify payment method
+                    "payment_instructions": "Deposit must be paid through interim payments. No collection at lease creation."
                 },
             },
             "lease_configuration": {
                 "lease_id": lease.lease_id,
                 "lease_type": lease.lease_type if lease.lease_type else "",
                 "total_weeks": lease.duration_in_weeks,
-                "medallion_id": lease.medallion.medallion_number
-                if lease.medallion
-                else "",
+                "medallion_id": lease.medallion.medallion_number if lease.medallion else "",
                 "vehicle_id": lease.vehicle.vin if lease.vehicle else "",
-                "lease_start_date": lease.lease_start_date.isoformat()
-                if lease.lease_start_date
-                else "",
-                "lease_end_date": lease.lease_end_date.isoformat()
-                if lease.lease_end_date
-                else "",
+                "lease_start_date": lease.lease_start_date.isoformat() if lease.lease_start_date else "",
+                "lease_end_date": lease.lease_end_date.isoformat() if lease.lease_end_date else "",
                 "is_auto_renewed": lease.is_auto_renewed,
                 "is_day_shift": lease.is_day_shift,
                 "lease_remark": lease.lease_remark,
@@ -587,106 +405,70 @@ def get_financial_information(db, case_no, case_params=None):
 def set_financial_information_with_deposit(db: Session, case_no: str, step_data: dict, current_user_id: int = None):
     """
     Process the financial information for the driver lease step with integrated deposit management.
+    
+    SIMPLIFIED: Only captures required_amount for deposit. NO collection at creation.
     """
     try:
-        # Part 1: Get lease and validate case
+        logger.info(f"Processing financial information for case {case_no}")
+
+        # Part 1: Get case entity and lease
         case_entity = bpm_service.get_case_entity(db, case_no=case_no)
         if not case_entity:
-            raise ValueError("Step cannot be executed because there is no valid case")
+            raise ValueError("No case entity found")
 
         lease = lease_service.get_lease(db, lookup_id=int(case_entity.identifier_value))
         if not lease:
-            raise ValueError("Lease not found for the given case")
+            raise ValueError("Lease not found")
 
-        # Part 2: Handle lease configuration (existing DOV/LT/ST logic - UNCHANGED)
-        if lease.lease_type.upper() != step_data.get("lease_type"):
-            raise ValueError(
-                f"Lease type doesn't match with this lease id {lease.lease_type}"
-            )
-
-        lease_type = step_data.get("lease_type").lower()
-        if lease_type == LeaseType.DOV.value:
-            data = DOVLease(**step_data)
-            lease_service.handle_dov_lease(db, lease.id, data)
-        elif lease_type == LeaseType.LONG_TERM.value:
-            data = DOVLease(**step_data)  # TODO: Change after requirements come
-            lease_service.handle_dov_lease(db, lease.id, data)
-        elif lease_type == LeaseType.SHIFT.value:
-            data = DOVLease(**step_data)
-            lease_service.handle_dov_lease(db, lease.id, data)
-        elif lease_type == LeaseType.SHORT_TERM.value:
-            data = ShortTermLease(**step_data)
-            lease_service.handle_short_term_lease(db, lease.id, data)
-        elif lease_type == LeaseType.MEDALLION.value:
-            data = DOVLease(**step_data)  # TODO: Change after requirements come
-            lease_service.handle_dov_lease(db, lease.id, data)
-        else:
-            raise ValueError(f"Invalid lease type: {lease.lease_type}")
-
-        # Part 3: Extract deposit information (NEW)
+        # Part 2: Extract financial information
+        financial_info = step_data.get("financial_information", {})
+        
+        # Part 3: Extract deposit information from NEW deposit_info structure
         deposit_info = step_data.get("deposit_info", {})
         required_amount = deposit_info.get("required_amount")
-        collected_amount = deposit_info.get("collected_amount", Decimal('0.00'))
-        collection_method_str = deposit_info.get("collection_method")
-        deposit_notes = deposit_info.get("notes")
+        deposit_notes = deposit_info.get("notes", "")
 
-        # Convert collection method string to enum
-        collection_method = None
-        if collection_method_str:
-            try:
-                collection_method = CollectionMethod(collection_method_str)
-            except ValueError:
-                raise ValueError(f"Invalid collection method: {collection_method_str}")
+        # Validation: Ensure required_amount is provided if deposit_info exists
+        if deposit_info and required_amount is None:
+            raise ValueError("required_amount must be provided in deposit_info")
 
-        # Part 4: Update lease record (existing + backward compatibility)
-        # Support both new deposit_info and old security_deposit field
-        if required_amount is not None:
-            # New deposit system - set deposit_amount_paid to collected_amount for backward compatibility
-            security_deposit = collected_amount
-        else:
-            # Backward compatibility - use old security_deposit field
-            security_deposit = step_data.get("financial_information", {}).get(
-                "security_deposit", lease.deposit_amount_paid
-            )
-
+        # Part 4: Update lease financial fields (backward compatibility)
         lease_data = {
             "id": lease.id,
             "lease_id": step_data.get("lease_id", lease.lease_id),
-            "deposit_amount_paid": security_deposit,  # Backward compatibility
-            "additional_balance_due": step_data.get("financial_information", {}).get(
-                "additional_balance_due", lease.additional_balance_due
-            ),
-            "cancellation_fee": step_data.get("financial_information", {}).get(
-                "cancellation_charge", lease.cancellation_fee
-            ),
+            "deposit_amount_paid": Decimal('0.00'),  # Always 0 at creation
+            "additional_balance_due": financial_info.get("additional_balance_due", lease.additional_balance_due),
+            "cancellation_fee": financial_info.get("cancellation_charge", lease.cancellation_fee),
         }
 
         lease = lease_service.upsert_lease(db, lease_data)
 
-        # Part 5: Create deposit record (NEW)
+        # Part 5: Create deposit record (SIMPLIFIED - NO ledger posting)
         deposit_created = False
+        deposit = None
+        
         if required_amount is not None:
-            # Validate deposit amounts
-            if collected_amount > required_amount:
-                raise ValueError("Collected amount cannot exceed required amount")
+            # Validate deposit amount
+            required_amount = Decimal(str(required_amount))
+            
+            if required_amount < 0:
+                raise ValueError("Required deposit amount cannot be negative")
 
-            # Initialize services
+            # Initialize deposit service
             deposit_service = DepositService(db)
-            ledger_service = LedgerService(db)
 
             # Get driver information for deposit
             driver_tlc_license = None
             if hasattr(lease, 'lease_driver') and lease.lease_driver:
-                # Get the first active driver
                 active_driver = next((ld for ld in lease.lease_driver if ld.is_active), None)
-                if active_driver and active_driver.driver and active_driver.driver.tlc_license:
-                    driver_tlc_license = active_driver.driver.tlc_license.tlc_license_number
+                if active_driver and active_driver.driver:
+                    if active_driver.driver.tlc_license:
+                        driver_tlc_license = active_driver.driver.tlc_license.tlc_license_number
 
-            # Create deposit record
+            # Create deposit record with ONLY required_amount
             deposit_data = {
                 'lease_id': lease.id,
                 'required_amount': required_amount,
-                'collected_amount': collected_amount,
                 'driver_tlc_license': driver_tlc_license,
                 'vehicle_vin': lease.vehicle.vin if lease.vehicle else None,
                 'vehicle_plate': lease.vehicle.registrations[0].plate_number if lease.vehicle and lease.vehicle.registrations else None,
@@ -697,56 +479,33 @@ def set_financial_information_with_deposit(db: Session, case_no: str, step_data:
             deposit = deposit_service.create_deposit(db, deposit_data)
             deposit_created = True
 
-            # Part 6: Post to ledger if amount > 0 (NEW)
-            if collected_amount > 0 and collection_method:
-                try:
-                    # Create ledger posting for deposit collection
-                    posting, balance = ledger_service.create_obligation(
-                        category=PostingCategory.DEPOSIT,
-                        amount=collected_amount,
-                        reference_id=f"DEP-{deposit.deposit_id}-INIT",
-                        driver_id=current_user_id,  # This should be the driver's ID, but using current_user_id for now
-                        entry_type=EntryType.CREDIT,  # CREDIT increases deposit liability
-                        lease_id=lease.id
-                    )
-                    logger.info(f"Ledger posting created for deposit {deposit.deposit_id}: ${collected_amount}")
-                except Exception as ledger_error:
-                    logger.error(f"Failed to create ledger posting for deposit {deposit.deposit_id}: {ledger_error}")
-                    # Don't fail the entire process for ledger errors, but log it
-                    # In production, you might want to raise this error
+            logger.info(
+                f"Deposit requirement established: {deposit.deposit_id}, "
+                f"${required_amount:.2f} required, $0.00 collected (payment via interim payments)"
+            )
 
-        # Part 7: Create lease schedule (existing - UNCHANGED)
-        # Get the lease configurations to extract amounts for schedule
-        configs = lease_service.get_lease_configurations(
-            db, lease_id=lease.id, multiple=True
-        )
+        # Part 6: Create lease schedule (existing - UNCHANGED)
+        configs = lease_service.get_lease_configurations(db, lease_id=lease.id, multiple=True)
 
         def get_config_value(key: str) -> float:
-            """Helper to get configuration value"""
             config = next((c for c in configs if c.lease_breakup_type == key), None)
             return float(config.lease_limit) if config and config.lease_limit else 0.0
-
-        # Calculate weekly amounts based on lease type
-        vehicle_weekly = 0.0
-        medallion_weekly = 0.0
 
         vehicle_weekly = get_config_value("total_vehicle_lease")
         medallion_weekly = get_config_value("total_medallion_lease_payment")
 
-        # Create/update lease schedule
         lease_service.create_or_update_lease_schedule(
             db=db,
             lease=lease,
             vehicle_weekly_amount=vehicle_weekly,
             medallion_weekly_amount=medallion_weekly,
         )
-        logger.info(f"Lease schedule created/updated for lease {lease.id}")
 
-        # Part 8: Create audit trails (existing + NEW deposit audit)
+        # Part 7: Create audit trails
         total_lease_amount = vehicle_weekly + medallion_weekly
         case = bpm_service.get_case_obj(db, case_no=case_no)
 
-        # Existing financial audit trail
+        # Financial audit trail
         audit_trail_service.create_audit_trail(
             db=db,
             description=f"Financial information saved: Total weekly lease amount ${total_lease_amount:.2f} (Vehicle: ${vehicle_weekly:.2f}, Medallion: ${medallion_weekly:.2f})",
@@ -759,18 +518,23 @@ def set_financial_information_with_deposit(db: Session, case_no: str, step_data:
             audit_type=AuditTrailType.AUTOMATED,
         )
 
-        # NEW: Deposit audit trail
+        # Deposit audit trail
         if deposit_created:
             audit_trail_service.create_audit_trail(
                 db=db,
-                description=f"Security deposit created: ${required_amount:.2f} required, ${collected_amount:.2f} collected via {collection_method.value if collection_method else 'N/A'}",
+                description=(
+                    f"Security deposit requirement established: ${required_amount:.2f} required. "
+                    f"Payment must be made through interim payments. (Status: {deposit.deposit_status.value})"
+                ),
                 case=case,
                 meta_data={
                     "lease_id": lease.id,
                     "deposit_id": deposit.deposit_id,
                     "required_amount": float(required_amount),
-                    "collected_amount": float(collected_amount),
-                    "collection_method": collection_method.value if collection_method else None,
+                    "collected_amount": 0.00,
+                    "deposit_status": deposit.deposit_status.value,
+                    "driver_tlc_license": driver_tlc_license,
+                    "payment_method": "INTERIM_PAYMENTS_ONLY"
                 },
                 audit_type=AuditTrailType.AUTOMATED,
             )

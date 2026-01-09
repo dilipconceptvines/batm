@@ -134,8 +134,10 @@ class InstallmentPostingResult(BaseModel):
     """Result of posting a single installment to the ledger."""
     installment_id: str
     success: bool
-    ledger_posting_id: Optional[int] = None
+    ledger_posting_id: Optional[str] = None
     message: Optional[str] = None
+    posted_on: Optional[datetime] = None
+
 
 
 

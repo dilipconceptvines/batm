@@ -601,31 +601,32 @@ class DTRPdfService:
             )
             net_earnings = cc_earnings - subtotal
 
-            # 3. Build Page Context
-            page_data = {
-                "driver_name": f"{driver.first_name} {driver.last_name}".upper(),
-                "tlc_license": driver.tlc_license.tlc_license_number if driver.tlc_license else "N/A",
-                
-                # Account Balance
-                "cc_earnings_fmt": self._format_currency(cc_earnings),
-                "taxes_fmt": taxes_data['total_amount'],
-                "ezpass_fmt": ezpass_data['total'],
-                "pvb_fmt": pvb_data['total'],
-                "subtotal_fmt": self._format_currency(subtotal),
-                "net_earnings_fmt": self._format_currency(net_earnings),
-                "total_due_fmt": self._format_currency(max(net_earnings, Decimal(0))),
+            if cc_earnings > Decimal(0):
+                # 3. Build Page Context
+                page_data = {
+                    "driver_name": f"{driver.first_name} {driver.last_name}".upper(),
+                    "tlc_license": driver.tlc_license.tlc_license_number if driver.tlc_license else "N/A",
+                    
+                    # Account Balance
+                    "cc_earnings_fmt": self._format_currency(cc_earnings),
+                    "taxes_fmt": taxes_data['total_amount'],
+                    "ezpass_fmt": ezpass_data['total'],
+                    "pvb_fmt": pvb_data['total'],
+                    "subtotal_fmt": self._format_currency(subtotal),
+                    "net_earnings_fmt": self._format_currency(net_earnings),
+                    "total_due_fmt": self._format_currency(max(net_earnings, Decimal(0))),
 
-                # Details
-                "taxes_rows": taxes_data['rows'],
-                "taxes_total_trips": taxes_data['total_trips'] or 0,
-                "taxes_total_cash": taxes_data['total_cash'] or 0,
-                "taxes_total_cc": taxes_data['total_cc'] or 0,
-                "ezpass_rows": ezpass_data['rows'],
-                "pvb_rows": pvb_data['rows'],
-                "trip_log_cols": trip_logs,
-                "alerts": alerts
-            }
-            pages.append(page_data)
+                    # Details
+                    "taxes_rows": taxes_data['rows'],
+                    "taxes_total_trips": taxes_data['total_trips'] or 0,
+                    "taxes_total_cash": taxes_data['total_cash'] or 0,
+                    "taxes_total_cc": taxes_data['total_cc'] or 0,
+                    "ezpass_rows": ezpass_data['rows'],
+                    "pvb_rows": pvb_data['rows'],
+                    "trip_log_cols": trip_logs,
+                    "alerts": alerts
+                }
+                pages.append(page_data)
         
         return pages
 

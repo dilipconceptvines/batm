@@ -241,6 +241,7 @@ def get_repair_invoice_details(
                 else "N/A"
             ),
             "year": invoice.vehicle.year if invoice.vehicle else "N/A",
+            "plate_no": invoice.vehicle.registrations[0].plate_number if invoice.vehicle and invoice.vehicle.registrations else "N/A",
         }
 
         lease_details = {

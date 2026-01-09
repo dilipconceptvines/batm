@@ -360,7 +360,7 @@ class LedgerService:
                 LeaseSchedule.lease_id == lease_id,
                 LeaseSchedule.installment_status.in_(['Due', 'Upcoming', 'Pending'])
             )
-            .order_by(LeaseSchedule.week_start_date.asc())
+            .order_by(LeaseSchedule.period_start_date.asc())
             .limit(10)  # Process up to 10 future installments
             .all()
         )
@@ -401,7 +401,7 @@ class LedgerService:
                     lease_id=lease_id,
                     vehicle_id=balance.vehicle_id,
                     medallion_id=balance.medallion_id,
-                    description=f"Excess interim payment prepayment via {payment_method} - Week {installment.week_start_date}",
+                    description=f"Excess interim payment prepayment via {payment_method} - Week {installment.period_start_date}",
                     payment_source="INTERIM_PAYMENT_EXCESS",
                     payment_method=payment_method
                 )
@@ -422,7 +422,7 @@ class LedgerService:
                 
                 logger.info(
                     f"Applied ${payment_for_installment} excess to lease installment {installment.id}",
-                    week=str(installment.week_start_date),
+                    week=str(installment.period_start_date),
                     remaining_balance=float(new_balance),
                     remaining_excess=float(remaining_excess)
                 )
@@ -438,7 +438,7 @@ class LedgerService:
                     LedgerBalance.status == BalanceStatus.OPEN,
                     LedgerBalance.balance > 0
                 )
-                .order_by(LedgerBalance.posted_on.asc())
+                .order_by(LedgerBalance.created_on.asc())
                 .all()
             )
             
@@ -704,7 +704,7 @@ class LedgerService:
             original_amount=Decimal(str(installment.installment_amount)),
             balance=Decimal(str(installment.installment_amount)),
             status=BalanceStatus.OPEN,
-            posted_on=datetime.now(timezone.utc)
+            created_on=datetime.now(timezone.utc)
         )
         
         self.repo.db.add(balance)
