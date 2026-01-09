@@ -1,13 +1,16 @@
 ### app/interim_payments/repository.py
 
 from datetime import date, datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.drivers.models import Driver
-from app.interim_payments.models import InterimPayment
+from app.interim_payments.models import (
+    InterimPayment, InterimPaymentAllocation,
+    PaymentStatus
+)
 from app.leases.models import Lease
 from app.medallions.models import Medallion
 from app.utils.logger import get_logger
@@ -170,3 +173,106 @@ class InterimPaymentRepository:
                         categories.add(allocation['category'])
         
         return sorted(list(categories))
+    
+    def get_allocations_by_category(
+        self,
+        category: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None
+    ) -> List[InterimPaymentAllocation]:
+        """
+        Query allocations by category for reporting.
+        FIXED: Now uses structured table instead of JSON
+        """
+        query = self.db.query(InterimPaymentAllocation).filter(
+            InterimPaymentAllocation.category == category
+        )
+        
+        if start_date:
+            query = query.join(InterimPayment).filter(
+                InterimPayment.payment_date >= start_date
+            )
+        
+        if end_date:
+            query = query.join(InterimPayment).filter(
+                InterimPayment.payment_date <= end_date
+            )
+        
+        return query.all()
+    
+    def get_allocations_by_reference_id(
+        self,
+        reference_id: str
+    ) -> List[InterimPaymentAllocation]:
+        """
+        Find all interim payments applied to a specific obligation.
+        FIXED: Now queryable via structured table
+        """
+        return self.db.query(InterimPaymentAllocation).filter(
+            InterimPaymentAllocation.reference_id == reference_id
+        ).all()
+
+
+    def get_payment_statistics(
+        self,
+        start_date: date,
+        end_date: date
+    ) -> Dict[str, Any]:
+        """
+        Generate statistics for interim payments within date range.
+        FIXED: Uses structured allocations for accurate reporting
+        """
+        from sqlalchemy import func
+        
+        # Total payments and amount
+        payment_stats = self.db.query(
+            func.count(InterimPayment.id).label('total_payments'),
+            func.sum(InterimPayment.total_amount).label('total_amount')
+        ).filter(
+            InterimPayment.payment_date >= start_date,
+            InterimPayment.payment_date <= end_date,
+            InterimPayment.status == PaymentStatus.ACTIVE
+        ).first()
+        
+        # Breakdown by category
+        category_breakdown = self.db.query(
+            InterimPaymentAllocation.category,
+            func.count(InterimPaymentAllocation.id).label('count'),
+            func.sum(InterimPaymentAllocation.allocated_amount).label('total')
+        ).join(InterimPayment).filter(
+            InterimPayment.payment_date >= start_date,
+            InterimPayment.payment_date <= end_date,
+            InterimPayment.status == PaymentStatus.ACTIVE
+        ).group_by(InterimPaymentAllocation.category).all()
+        
+        # Breakdown by payment method
+        method_breakdown = self.db.query(
+            InterimPayment.payment_method,
+            func.count(InterimPayment.id).label('count'),
+            func.sum(InterimPayment.total_amount).label('total')
+        ).filter(
+            InterimPayment.payment_date >= start_date,
+            InterimPayment.payment_date <= end_date,
+            InterimPayment.status == PaymentStatus.ACTIVE
+        ).group_by(InterimPayment.payment_method).all()
+        
+        return {
+            'total_payments': payment_stats.total_payments or 0,
+            'total_amount': float(payment_stats.total_amount or 0),
+            'by_category': [
+                {
+                    'category': cat.category,
+                    'count': cat.count,
+                    'total': float(cat.total)
+                }
+                for cat in category_breakdown
+            ],
+            'by_payment_method': [
+                {
+                    'method': method.payment_method.value,
+                    'count': method.count,
+                    'total': float(method.total)
+                }
+                for method in method_breakdown
+            ]
+        }

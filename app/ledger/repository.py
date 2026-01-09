@@ -185,6 +185,44 @@ class LedgerRepository:
 
         result = self.db.execute(stmt)
         return list(result.scalars().all())
+
+    def get_open_balances_by_lease(
+        self, lease_id: int, driver_id: Optional[int] = None
+    ) -> List[LedgerBalance]:
+        """
+        Fetches all OPEN balances for a given lease. If driver_id is provided,
+        filters balances for that driver and lease. Results are ordered by
+        category priority and created_on (oldest first within each category).
+        """
+        # Reuse the same category ordering as get_open_balances_for_driver
+        category_order = case(
+            (LedgerBalance.category == PostingCategory.TAXES, 1),
+            (LedgerBalance.category == PostingCategory.EZPASS, 2),
+            (LedgerBalance.category == PostingCategory.LEASE, 3),
+            (LedgerBalance.category == PostingCategory.PVB, 4),
+            (LedgerBalance.category == PostingCategory.TLC, 5),
+            (LedgerBalance.category == PostingCategory.REPAIR, 6),
+            (LedgerBalance.category == PostingCategory.LOAN, 7),
+            (LedgerBalance.category == PostingCategory.MISCELLANEOUS_EXPENSE, 8),
+            (LedgerBalance.category == PostingCategory.MISCELLANEOUS_CREDIT, 8),
+            (LedgerBalance.category == PostingCategory.DEPOSIT, 9),
+            else_=99,
+        )
+
+        stmt = (
+            select(LedgerBalance)
+            .where(
+                LedgerBalance.lease_id == lease_id,
+                LedgerBalance.status == BalanceStatus.OPEN,
+            )
+            .order_by(category_order, LedgerBalance.created_on)
+        )
+
+        if driver_id:
+            stmt = stmt.where(LedgerBalance.driver_id == driver_id)
+
+        result = self.db.execute(stmt)
+        return list(result.scalars().all())
     
     def get_balance_by_lease_and_category(
         self, 

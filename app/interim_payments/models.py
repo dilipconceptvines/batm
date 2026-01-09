@@ -1,4 +1,4 @@
-### app/interim_payments/models.py
+# app/interim_payments/models.py
 
 from datetime import datetime
 from decimal import Decimal
@@ -24,6 +24,7 @@ class PaymentMethod(str, PyEnum):
     """Enumeration for the payment method used."""
     CASH = "Cash"
     CHECK = "Check"
+    ACH = "ACH"
     DRIVER_CREDIT = "driver_credit"
 
 
@@ -88,24 +89,83 @@ class InterimPayment(Base, AuditMixin):
     # --- Relationships ---
     driver: Mapped["Driver"] = relationship()
     lease: Mapped["Lease"] = relationship()
-    voider: Mapped[Optional["User"]] = relationship(foreign_keys=[voided_by])
+    voided_by_user: Mapped[Optional["User"]] = relationship(
+        foreign_keys=[voided_by], 
+        lazy="select"
+    )
 
-    def to_dict(self):
-        """Converts the InterimPayment object to a dictionary."""
-        return {
-            "id": self.id,
-            "payment_id": self.payment_id,
-            "case_no": self.case_no,
-            "driver_id": self.driver_id,
-            "lease_id": self.lease_id,
-            "payment_date": self.payment_date.isoformat() if self.payment_date else None,
-            "total_amount": float(self.total_amount) if self.total_amount is not None else 0.0,
-            "payment_method": self.payment_method.value,
-            "notes": self.notes,
-            "allocations": self.allocations,
-            "status": self.status.value if self.status else None,
-            "voided_at": self.voided_at.isoformat() if self.voided_at else None,
-            "voided_by": self.voided_by,
-            "void_reason": self.void_reason,
-            "created_on": self.created_on.isoformat() if self.created_on else None,
-        }
+    allocation_records: Mapped[list["InterimPaymentAllocation"]] = relationship(
+        back_populates="interim_payment",
+        cascade="all, delete-orphan",
+        lazy="select"
+    )
+
+
+class InterimPaymentAllocation(Base, AuditMixin):
+    """
+    Structured storage for interim payment allocations.
+    Replaces the JSON field for better querying and reporting.
+    """
+    __tablename__ = "interim_payment_allocations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    
+    interim_payment_id: Mapped[int] = mapped_column(
+        Integer, 
+        ForeignKey("interim_payments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Foreign key to interim_payments"
+    )
+    
+    ledger_balance_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("ledger_balances.id"),
+        nullable=False,
+        index=True,
+        comment="Foreign key to ledger_balances"
+    )
+    
+    category: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+        comment="Category of obligation (LEASE, REPAIR, LOAN, etc)"
+    )
+    
+    reference_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Reference ID of the original obligation"
+    )
+    
+    allocated_amount: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2),
+        nullable=False,
+        comment="Amount allocated to this obligation"
+    )
+    
+    balance_before: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 2),
+        nullable=True,
+        comment="Balance before this allocation"
+    )
+    
+    balance_after: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(10, 2),
+        nullable=True,
+        comment="Balance after this allocation"
+    )
+    
+    # Relationships
+    interim_payment: Mapped["InterimPayment"] = relationship(
+        back_populates="allocation_records",
+        lazy="select"
+    )
+    
+    ledger_balance: Mapped["LedgerBalance"] = relationship(
+        foreign_keys=[ledger_balance_id],
+        lazy="select"
+    )
+    
