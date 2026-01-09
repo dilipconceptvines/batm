@@ -112,6 +112,32 @@ class LedgerRepository:
         self.db.refresh(balance)
         logger.info("Created new LedgerBalance", balance_id=balance.id, category=balance.category, amount=balance.balance)
         return balance
+    
+    def get_balances_by_lease(
+        self,
+        lease_id: int,
+        is_closed: Optional[bool] = None
+    ) -> List[LedgerBalance]:
+        """
+        Get all ledger balances for a specific lease.
+        
+        FIX #6: Added method to support fetching all balances including deposits
+        
+        Args:
+            lease_id: The lease ID to filter by
+            is_closed: Filter by closed status (None = all, True = closed only, False = open only)
+        
+        Returns:
+            List of LedgerBalance objects
+        """
+        query = self.db.query(LedgerBalance).filter(
+            LedgerBalance.lease_id == lease_id
+        )
+        
+        if is_closed is not None:
+            query = query.filter(LedgerBalance.is_closed == is_closed)
+        
+        return query.all()
 
     def get_balance_by_reference_id(self, reference_id: str) -> Optional[LedgerBalance]:
         """

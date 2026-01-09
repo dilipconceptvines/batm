@@ -9,12 +9,14 @@ from sqlalchemy.orm import Session
 
 from app.bpm.services import bpm_service
 from app.core.db import SessionLocal
-from app.ledger.models import PostingCategory
+from app.ledger.models import PostingCategory, EntryType, LedgerPosting, PostingStatus
 from app.ledger.repository import LedgerRepository
 from app.ledger.services import LedgerService
 from app.loans.exceptions import (
     InvalidLoanOperationError,
     LoanScheduleGenerationError,
+    LoanValidationError,
+    LoanNotFoundError
 )
 from app.loans.models import (
     DriverLoan,
@@ -48,6 +50,278 @@ class LoanService:
     def __init__(self, db: Session):
         self.db = db
         self.repo = LoanRepository(db)
+        self.ledger_repo = LedgerRepository(db)
+
+    def create_loan(
+        self,
+        db: Session,
+        loan_data: dict,
+        user_id: int
+    ) -> DriverLoan:
+        """
+        Create a new loan with ledger integration.
+        
+        Called by: BPM flow for loan creation
+        
+        Args:
+            db: Database session
+            loan_data: Dictionary containing loan details
+                Required: driver_id, lease_id, loan_amount, loan_type
+            user_id: ID of user creating the loan
+        
+        Returns:
+            Created Loan instance
+        """
+        try:
+            # Validate required fields
+            required_fields = ['driver_id', 'lease_id', 'loan_amount', 'loan_type']
+            for field in required_fields:
+                if field not in loan_data:
+                    raise LoanValidationError(f"Missing required field: {field}")
+            
+            # Generate loan ID
+            loan_id = self._generate_loan_id(loan_data.get('lease_id'))
+            
+            # Create loan instance
+            loan = DriverLoan(
+                loan_id=loan_id,
+                driver_id=loan_data['driver_id'],
+                lease_id=loan_data['lease_id'],
+                principal_amount=Decimal(str(loan_data['loan_amount'])),
+                loan_type=loan_data['loan_type'],
+                description=loan_data.get('description'),
+                loan_date=loan_data.get('loan_date', datetime.now().date()),
+                status=LoanStatus.OPEN,
+                notes=loan_data.get('notes'),
+                created_by=user_id,
+                created_on=datetime.now()
+            )
+            
+            # Save loan to database
+            created_loan = self.repo.create_loan(loan)
+            
+            # Create ledger posting
+
+            ledger_service = LedgerService(self.ledger_repo)
+            posting, balance = ledger_service.create_obligation(
+                category=PostingCategory.LOAN,
+                amount=created_loan.principal_amount,
+                reference_id=created_loan.loan_id,
+                driver_id=created_loan.driver_id,
+                entry_type=EntryType.DEBIT,
+                lease_id=created_loan.lease_id,
+            )
+            
+            logger.info(
+                f"Loan created successfully",
+                loan_id=created_loan.loan_id,
+                amount=float(created_loan.principal_amount),
+                posting_id=posting.id
+            )
+            
+            return created_loan
+            
+        except Exception as e:
+            logger.error(f"Failed to create loan: {e}", exc_info=True)
+            raise
+    
+    def update_loan(
+        self,
+        db: Session,
+        loan_id: str,
+        update_data: dict,
+        user_id: int
+    ) -> DriverLoan:
+        """
+        Update an existing loan with proper ledger handling.
+        
+        CRITICAL: When amount changes, this method:
+        1. Voids ALL old POSTED ledger postings
+        2. Updates the loan record
+        3. Creates new ledger posting with updated amount
+        
+        Called by: BPM flow for loan editing
+        
+        Args:
+            db: Database session
+            loan_id: Unique loan identifier
+            update_data: Dictionary with fields to update
+            user_id: ID of user making the update
+        
+        Returns:
+            Updated Loan instance
+        """
+        try:
+            # Step 1: Get existing loan (by system loan_id)
+            existing_loan = self.repo.get_loan_by_loan_id(loan_id)
+            if not existing_loan:
+                raise LoanNotFoundError(f"Loan {loan_id} not found")
+            
+            logger.info(f"Updating loan {loan_id}", update_data=update_data)
+            
+            # Step 2: Check if amount is changing
+            old_amount = existing_loan.principal_amount
+            # Accept either 'principal_amount' or legacy 'loan_amount' in update payload
+            new_amount = update_data.get('principal_amount', update_data.get('loan_amount'))
+            
+            amount_changed = False
+            if new_amount is not None:
+                new_amount = Decimal(str(new_amount))
+                if new_amount != old_amount:
+                    amount_changed = True
+                    logger.info(
+                        f"Loan amount changing",
+                        loan_id=loan_id,
+                        old_amount=float(old_amount),
+                        new_amount=float(new_amount)
+                    )
+            
+            # Step 3: VOID old ledger postings if amount changed
+            if amount_changed:
+                voided_count = self._void_old_loan_postings(
+                    loan_id=loan_id,
+                    old_amount=old_amount,
+                    new_amount=new_amount,
+                    user_id=user_id
+                )
+                logger.info(f"Voided {voided_count} old posting(s) for loan {loan_id}")
+            
+            # Step 4: Update loan record - build updates dict and persist via repository
+            updates: Dict[str, object] = {}
+            for key, value in update_data.items():
+                if hasattr(existing_loan, key) and key != 'loan_id':  # Don't update ID
+                    updates[key] = value
+
+            updates['updated_on'] = datetime.now()
+
+            # Persist updates via repository (expects PK id and dict)
+            self.repo.update_loan(existing_loan.id, updates)
+            self.db.flush()
+            updated_loan = self.repo.get_loan_by_id(existing_loan.id)
+            
+            # Step 5: Create new ledger posting if amount changed
+            if amount_changed:
+                posting_id = self._create_new_loan_posting(
+                    loan_id=loan_id,
+                    amount=new_amount,
+                    driver_id=existing_loan.driver_id,
+                    lease_id=existing_loan.lease_id,
+                    description=existing_loan.description or existing_loan.loan_type
+                )
+                logger.info(
+                    f"Created new ledger posting for updated loan",
+                    loan_id=loan_id,
+                    posting_id=posting_id,
+                    amount=float(new_amount)
+                )
+            
+            logger.info(f"Loan {loan_id} updated successfully")
+            return updated_loan
+            
+        except LoanNotFoundError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to update loan {loan_id}: {e}", exc_info=True)
+            raise
+    
+    def _void_old_loan_postings(
+        self,
+        loan_id: str,
+        old_amount: Decimal,
+        new_amount: Decimal,
+        user_id: int
+    ) -> int:
+        """
+        Void all POSTED ledger postings for this loan.
+        
+        Returns:
+            Number of postings voided
+        """
+        ledger_service = LedgerService(self.ledger_repo)
+        
+        # Find all POSTED ledger postings for this loan
+        old_postings = self.db.query(LedgerPosting).filter(
+            LedgerPosting.reference_id == loan_id,
+            LedgerPosting.category == PostingCategory.LOAN,
+            LedgerPosting.status == PostingStatus.POSTED,
+            LedgerPosting.entry_type == EntryType.DEBIT
+        ).all()
+        
+        voided_count = 0
+        for posting in old_postings:
+            try:
+                ledger_service.void_posting(
+                    posting_id=posting.id,
+                    reason=f"Loan amount updated from ${old_amount} to ${new_amount}",
+                    user_id=user_id
+                )
+                logger.info(
+                    f"Voided ledger posting",
+                    posting_id=posting.id,
+                    loan_id=loan_id,
+                    amount=float(posting.amount)
+                )
+                voided_count += 1
+            except Exception as e:
+                logger.error(
+                    f"Failed to void posting {posting.id}: {e}",
+                    exc_info=True
+                )
+                raise
+        
+        return voided_count
+    
+    def _create_new_loan_posting(
+        self,
+        loan_id: str,
+        amount: Decimal,
+        driver_id: int,
+        lease_id: int,
+        description: str
+    ) -> int:
+        """
+        Create new ledger posting for updated loan.
+        
+        Returns:
+            ID of created posting
+        """
+        ledger_service = LedgerService(LedgerRepository(self.db))
+        
+        posting, balance = ledger_service.create_obligation(
+            category=PostingCategory.LOAN,
+            amount=amount,
+            reference_id=loan_id,
+            driver_id=driver_id,
+            entry_type=EntryType.DEBIT,
+            lease_id=lease_id,
+        )
+        
+        return posting.id
+    
+    def _generate_loan_id(self, lease_id: int) -> str:
+        """
+        Generate unique loan ID.
+        Format: DLN-{lease_id}-{sequence}
+        """
+        # Get count of existing loans for this lease
+        existing_count = self.db.query(DriverLoan).filter(
+            DriverLoan.lease_id == lease_id
+        ).count()
+        
+        sequence = str(existing_count + 1).zfill(2)
+        return f"DLN-{lease_id}-{sequence}"
+    
+    def get_loan(self, loan_id: str) -> Optional[DriverLoan]:
+        """Get loan by system loan_id"""
+        return self.repo.get_loan_by_loan_id(loan_id)
+
+    def get_loans_by_lease(self, lease_id: int) -> List[DriverLoan]:
+        """Get all loans for a lease"""
+        return self.db.query(DriverLoan).filter(DriverLoan.lease_id == lease_id).all()
+
+    def get_loans_by_driver(self, driver_id: int) -> List[DriverLoan]:
+        """Get all loans for a driver"""
+        return self.db.query(DriverLoan).filter(DriverLoan.driver_id == driver_id).all()
 
     def _generate_next_loan_id(self) -> str:
         """Generates a unique Loan ID in the format DLN-YYYY-###."""
@@ -266,7 +540,8 @@ class LoanService:
         """
         logger.info("Starting task to post due loan installments to ledger.")
         db = SessionLocal()
-        ledger_service = LedgerService(db)
+        ledger_repo = LedgerRepository(db)
+        ledger_service = LedgerService(ledger_repo)
         repo = LoanRepository(db)
         
         posted_count, failed_count = 0, 0
@@ -343,7 +618,7 @@ class LoanService:
                     results.append(InstallmentPostingResult(
                         installment_id=installment_id,
                         success=False,
-                        error_message=f"Installment {installment_id} not found"
+                        message=f"Installment {installment_id} not found"
                     ))
                     failed_count += 1
 
@@ -355,7 +630,7 @@ class LoanService:
                     results.append(InstallmentPostingResult(
                         installment_id=installment.installment_id,
                         success=False,
-                        error_message=f"Installment status is {installment.status.value}, must be SCHEDULES"
+                        message=f"Installment status is {installment.status.value}, must be SCHEDULED"
                     ))
                     failed_count += 1
                     continue
@@ -365,7 +640,7 @@ class LoanService:
                     results.append(InstallmentPostingResult(
                         installment_id=installment.installment_id,
                         success=False,
-                        error_message="Parent loan status is {installment.loan.status.value}, must be OPEN"
+                        message=f"Parent loan status is {installment.loan.status.value}, must be OPEN"
                     ))
 
                     failed_count += 1
@@ -375,8 +650,10 @@ class LoanService:
                     results.append(InstallmentPostingResult(
                         installment_id=installment.installment_id,
                         success=False,
-                        error_message=f"Installment date {installment.week_start_date} is in the future"
+                        message=f"Installment date {installment.week_start_date} is in the future"
                     ))
+                    failed_count += 1
+                    continue
 
                 # Create obligation in ledger
                 ledger_posting, balance = ledger_service.create_obligation(
@@ -400,7 +677,7 @@ class LoanService:
                 results.append(InstallmentPostingResult(
                     installment_id=installment.installment_id,
                     success=True,
-                    logger_posting_id=ledger_posting.id,
+                    ledger_posting_id=str(ledger_posting.id),
                     posted_on=posted_on
                 ))
                 successful_count += 1
@@ -414,7 +691,7 @@ class LoanService:
                 results.append(InstallmentPostingResult(
                     installment_id=installment.installment_id,
                     success=False,
-                    error_message=f"Ledger posting error: {str(e)}"
+                    message=f"Ledger posting error: {str(e)}"
                 ))
 
                 failed_count += 1
