@@ -239,7 +239,7 @@ class Case(Base, AuditMixin):
     # Relationship to CaseStepConfig
     case_step_config = relationship("CaseStepConfig")
     role = relationship("Role")
-
+    
     # Relationship to AuditTrail
     audit_trail = relationship("AuditTrail", back_populates="case")
 

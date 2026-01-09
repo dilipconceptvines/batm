@@ -184,6 +184,8 @@ class Settings(BaseSettings):
     common_signature_file: str = ""
 
     dov_security_deposit_cap: float = 0.00
+    dov_total_weeks: int = 0
+    
     long_term_medallion_weekly_cap_regular_full: float = 0.00
     long_term_medallion_weekly_cap_hybrid_full: float = 0.00
 

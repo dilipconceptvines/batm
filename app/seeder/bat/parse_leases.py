@@ -16,7 +16,7 @@ from app.vehicles.schemas import VehicleStatus
 from app.medallions.models import Medallion
 from app.utils.general import get_safe_value , parse_date
 from app.leases.services import lease_service
-from app.utils.general import calculate_dov_lease_fields, calculate_long_term_lease_fields , calculate_medallion_only_lease_fields , calculate_shift_lease_fields
+from app.leases.utils import calculate_dov_lease_fields, calculate_long_term_lease_fields , calculate_medallion_only_lease_fields , calculate_shift_lease_fields
 from app.leases.services import lease_service
 from app.leases.schemas import LeaseType
 from app.seeder.parsing_result import ParseResult, apply_parse_result_to_df

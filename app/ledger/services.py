@@ -719,24 +719,84 @@ class LedgerService:
     def _notify_balance_reopened(self, reference_id: str, category: PostingCategory):
         """
         Notify source modules when a payment is voided and balance is reopened.
+        
+        Args:
+            reference_id: The reference ID of the balance being reopened
+            category: The posting category
         """
         try:
             if category == PostingCategory.REPAIR:
                 from app.repairs.services import RepairService
                 repair_service = RepairService(self.repo.db)
                 repair_service.mark_installment_reopened(reference_id)
+                logger.info(
+                    "Notified repair service of balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
                 
             elif category == PostingCategory.LOAN:
                 from app.loans.services import LoanService
                 loan_service = LoanService(self.repo.db)
                 loan_service.mark_installment_reopened(reference_id)
+                logger.info(
+                    "Notified loan service of balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
                 
-            # Add other categories as needed
+            elif category == PostingCategory.EZPASS:
+                from app.ezpass.services import EZPassService
+                ezpass_service = EZPassService(self.repo.db)
+                ezpass_service.mark_transaction_reopened(reference_id)
+                logger.info(
+                    "Notified EZPass service of balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
+                
+            elif category == PostingCategory.PVB:
+                from app.pvb.services import PVBService
+                pvb_service = PVBService(self.repo.db)
+                pvb_service.mark_violation_reopened(reference_id)
+                logger.info(
+                    "Notified PVB service of balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
+                
+            elif category == PostingCategory.TLC:
+                from app.tlc.services import TLCService
+                tlc_service = TLCService(self.repo.db)
+                tlc_service.mark_violation_reopened(reference_id)
+                logger.info(
+                    "Notified TLC service of balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
+                
+            elif category == PostingCategory.MISCELLANEOUS_EXPENSE:
+                from app.misc_expenses.services import MiscellaneousExpenseService
+                misc_service = MiscellaneousExpenseService(self.repo.db)
+                misc_service.mark_expense_reopened(reference_id)
+                logger.info(
+                    "Notified miscellaneous expense service of balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
             
+            else:
+                # Categories that don't need notification (TAXES, DEPOSIT, LEASE, etc.)
+                logger.debug(
+                    "No notification needed for category on balance reopening",
+                    reference_id=reference_id,
+                    category=category.value
+                )
+                
         except Exception as e:
-            # Don't fail the void if notification fails
+            # Don't fail the void if notification fails - log and continue
             logger.error(
-                f"Failed to notify source module about reopened balance",
+                "Failed to notify source module about reopened balance",
                 reference_id=reference_id,
                 category=category.value,
                 error=str(e),

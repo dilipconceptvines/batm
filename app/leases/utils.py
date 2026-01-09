@@ -4,6 +4,7 @@
 import json
 import re
 from datetime import date, datetime, timedelta, timezone
+from typing import Optional , Dict
 
 from dateutil.rrule import DAILY, WEEKLY, rrule
 from sqlalchemy.orm import Session
@@ -909,3 +910,165 @@ def get_all_lease_documents(db: Session, lease, lease_drivers):
                 all_documents.append(doc_dict)
 
     return all_documents
+
+
+def calculate_long_term_lease_fields(total_lease_amount: float , vehicle_lifetime_cap: float , vehicle_sales_tax: float) -> Dict[str, Optional[float]]:
+    """
+    Calculate detailed lease breakdown fields based on total weekly lease amount.
+
+    Args:
+        total_lease_amount (float): The total weekly lease amount (e.g., 1150.00)
+    
+    Returns:
+        Dict[str, Optional[float]]: A dictionary of all lease-related fields.
+    """
+
+    # Fixed fees (from configuration)
+    registration = settings.registration
+    tlc_inspection_fees = settings.tlc_inspection_fees
+    tax_stamps = settings.tax_stamps
+
+    # Derived medallion lease component
+    med_lease = round(total_lease_amount - (registration + tlc_inspection_fees + tax_stamps), 2)
+
+    # Build response dictionary
+    return {
+        "tlc_vehicle_lifetime_cap": vehicle_lifetime_cap,
+        "amount_collected": 0.0,
+        "lease_amount": round(total_lease_amount, 2),
+        "med_lease": med_lease,
+        "med_tlc_maximum_amount": 0.0,
+        "veh_lease": 0.0,
+        "veh_sales_tax": vehicle_sales_tax,
+        "tlc_inspection_fees": tlc_inspection_fees,
+        "tax_stamps": tax_stamps,
+        "registration": registration,
+        "veh_tlc_maximum_amount": 0.0,
+        "total_vehicle_lease": 0.0,
+        "total_medallion_lease_payment": round(total_lease_amount, 2)
+    }
+
+
+def calculate_shift_lease_fields(total_lease_amount: float , vehicle_lifetime_cap: float , vehicle_sales_tax: float) -> Dict[str, Optional[float]]:
+    """
+    Calculate detailed shift lease breakdown fields based on total weekly lease amount.
+    
+    Args:
+        total_lease_amount (float): The total weekly lease amount (e.g., 630.00)
+    
+    Returns:
+        Dict[str, Optional[float]]: A dictionary containing lease-related computed fields.
+    """
+
+    # Fixed fees (from configuration)
+    registration = settings.registration
+    tlc_inspection_fees = settings.tlc_inspection_fees
+    tax_stamps = settings.tax_stamps
+
+    # Derived medallion lease component
+    med_lease = round(total_lease_amount - (registration + tlc_inspection_fees + tax_stamps), 2)
+
+    # Build response dictionary
+    return {
+        "tlc_vehicle_lifetime_cap": vehicle_lifetime_cap,
+        "amount_collected": 0.0,
+        "lease_amount": round(total_lease_amount, 2),
+        "med_lease": med_lease,
+        "med_tlc_maximum_amount": 0.0,
+        "veh_lease": 0.0,
+        "veh_sales_tax": vehicle_sales_tax,
+        "tlc_inspection_fees": tlc_inspection_fees,
+        "tax_stamps": tax_stamps,
+        "registration": registration,
+        "veh_tlc_maximum_amount": 0.0,
+        "total_vehicle_lease": 0.0,
+        "total_medallion_lease_payment": round(total_lease_amount, 2)
+    }
+
+
+def calculate_medallion_only_lease_fields(total_lease_amount: float , vehicle_lifetime_cap: float , vehicle_sales_tax: float) -> Dict[str, Optional[float]]:
+    """
+    Calculate detailed medallion-only lease breakdown fields based on total weekly lease amount.
+
+    Args:
+        total_lease_amount (float): The total weekly lease amount (e.g., 900.00)
+    
+    Returns:
+        Dict[str, Optional[float]]: A dictionary containing computed lease fields.
+    """
+
+    # Fixed fees (from configuration)
+    registration = settings.registration
+    tlc_inspection_fees = settings.tlc_inspection_fees
+    tax_stamps = settings.tax_stamps
+
+    # Derived medallion lease component
+    med_lease = round(total_lease_amount - (registration + tlc_inspection_fees + tax_stamps), 2)
+
+    # Build response dictionary
+    return {
+        "tlc_vehicle_lifetime_cap": vehicle_lifetime_cap,
+        "amount_collected": 0.0,
+        "lease_amount": round(total_lease_amount, 2),
+        "med_lease": med_lease,
+        "med_tlc_maximum_amount": 0.0,
+        "veh_lease": vehicle_lifetime_cap,
+        "veh_sales_tax": vehicle_sales_tax,
+        "tlc_inspection_fees": tlc_inspection_fees,
+        "tax_stamps": tax_stamps,
+        "registration": registration,
+        "veh_tlc_maximum_amount": 0.0,
+        "total_vehicle_lease": 0.0,
+        "total_medallion_lease_payment": round(total_lease_amount, 2)
+    }
+
+def calculate_dov_lease_fields(
+    total_lease_amount: float,
+    vehicle_lifetime_cap: float,
+    vehicle_sales_tax: float
+) -> Dict[str, Optional[float]]:
+    """
+    Calculate DOV Lease related financial fields based on total weekly lease amount.
+
+    Args:
+        total_lease_amount (float): Total weekly lease amount (e.g., 1150.00)
+        vehicle_lifetime_cap (float): TLC lifetime vehicle cap (e.g., 42900.00)
+        vehicle_sales_tax (float): Weekly vehicle sales tax (e.g., 12.31)
+
+    Returns:
+        dict: Calculated DOV lease fields
+    """
+
+    # --- Fixed BAT Fees ---
+    registration = settings.registration
+    tlc_inspection_fees = settings.tlc_inspection_fees
+    tax_stamps = settings.tax_stamps
+
+
+    sales_tax = vehicle_sales_tax/settings.dov_total_weeks
+    vehicle_lease = vehicle_lifetime_cap/settings.dov_total_weeks
+
+    veh_lease = vehicle_lease-sales_tax
+
+    extra_fees = (registration + tlc_inspection_fees + tax_stamps)
+
+    med_lease = round(total_lease_amount - (vehicle_lease + extra_fees), 2)
+    med_tlc_maximum_amount = round(total_lease_amount - vehicle_lease, 2)
+
+
+    # --- Return structured data ---
+    return {
+        "tlc_vehicle_lifetime_cap": round(vehicle_lifetime_cap, 2),
+        "amount_collected": 0.0,
+        "lease_amount": round(total_lease_amount, 2),
+        "med_lease": round(med_lease, 2),
+        "med_tlc_maximum_amount": round(med_tlc_maximum_amount, 2),
+        "veh_lease": round(veh_lease, 2),
+        "veh_sales_tax": round(sales_tax, 2),
+        "tlc_inspection_fees": round(tlc_inspection_fees, 2),
+        "tax_stamps": round(tax_stamps, 2),
+        "registration": round(registration, 2),
+        "veh_tlc_maximum_amount": round(vehicle_lease, 2),
+        "total_vehicle_lease": round(vehicle_lease, 2),
+        "total_medallion_lease_payment": round(med_tlc_maximum_amount, 2),
+    }

@@ -22,6 +22,10 @@ from app.seeder.bpm.parse_case_step_config_paths import parse_case_step_config_p
 from app.seeder.bpm.parse_case_first_step_config import parse_case_first_step_config
 # from app.seeder.bpm.process_slas import process_sla_assignments
 
+from app.bpm.models import *
+from app.audit_trail.models import *
+from app.exports.models import *
+
 logger = get_logger(__name__)
 
 # Ordered list of sheet parsers
